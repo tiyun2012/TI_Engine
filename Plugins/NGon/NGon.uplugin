@@ -1,0 +1,23 @@
+{
+    "FileVersion": 3,
+    "Version": 2,
+    "VersionName": "0.2.0",
+    "FriendlyName": "N-Gon",
+    "Description": "Preview authored polygons, edges, vertices and scalar heatmaps from raw FBX or static meshes.",
+    "Category": "Modeling",
+    "EnabledByDefault": true,
+    "CanContainContent": false,
+    "Modules": [
+        {
+            "Name": "NGon",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "MeshModelingToolset",
+            "Enabled": true
+        }
+    ]
+}
