@@ -6,6 +6,7 @@
 #include "EditorViewportClient.h"
 #include "Engine/StaticMesh.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "HAL/FileManager.h"
 #include "IDesktopPlatform.h"
 #include "InputCoreTypes.h"
@@ -15,8 +16,12 @@
 #include "NGonPreviewScene.h"
 #include "PropertyCustomizationHelpers.h"
 #include "SceneView.h"
+#include "CanvasItem.h"
+#include "CanvasTypes.h"
 #include "Tools/EdModeInteractiveToolsContext.h"
+#include "BaseGizmos/TransformGizmoUtil.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SSlider.h"
 #include "Widgets/Layout/SBorder.h"
@@ -65,6 +70,7 @@ public:
                 ToolsContext && ToolsContext->ToolManager)
             {
                 PreviewOwner->SetOverlayMaterials(ToolsContext->ToolManager.Get());
+                PreviewOwner->SetupGizmo(ToolsContext->GizmoManager.Get(), ToolsContext->ToolManager.Get());
             }
         }
     }
@@ -72,7 +78,7 @@ public:
     void ProcessClick(FSceneView& View, HHitProxy* HitProxy, FKey Key,
         EInputEvent Event, uint32 HitX, uint32 HitY) override
     {
-        if (Key == EKeys::LeftMouseButton && !IsAltPressed())
+        if (Key == EKeys::LeftMouseButton && !IsAltPressed() && !IsCtrlPressed())
         {
             if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
             {
@@ -83,8 +89,137 @@ public:
         FEditorViewportClient::ProcessClick(View, HitProxy, Key, Event, HitX, HitY);
     }
 
+    bool InputKey(const FInputKeyEventArgs& EventArgs) override
+    {
+        if (EventArgs.Event == IE_Pressed && EventArgs.Key == EKeys::Escape && PreviewOwner->IsSoftTransformActive())
+        {
+            PreviewOwner->CancelSoftTransform();
+            return true;
+        }
+        if (EventArgs.Key == EKeys::LeftMouseButton && EventArgs.Viewport)
+        {
+            const int32 MouseX = EventArgs.Viewport->GetMouseX();
+            const int32 MouseY = EventArgs.Viewport->GetMouseY();
+            if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
+            {
+                MarqueeStart = FVector2D(MouseX, MouseY);
+                MarqueeCurrent = MarqueeStart;
+                bMarqueeActive = false;
+                bMarqueePending = true;
+            }
+            else if (EventArgs.Event == IE_Released && bMarqueeActive)
+            {
+                if (PreviewOwner->IsSoftTransformActive())
+                {
+                    bMarqueeActive = false;
+                    bMarqueePending = false;
+                }
+                else
+                {
+                FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags).SetRealtimeUpdate(IsRealtime()));
+                if (FSceneView* View = CalcSceneView(&ViewFamily))
+                {
+                    const FBox2D Rect(MarqueeStart, MarqueeCurrent);
+                    const bool bFullyContained = MarqueeCurrent.X >= MarqueeStart.X;
+                    if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin()) Pinned->BoxSelect(*View, Rect, IsShiftPressed(), bFullyContained);
+                }
+                bMarqueeActive = false;
+                bMarqueePending = false;
+                return true;
+                }
+            }
+            else if (EventArgs.Event == IE_Released)
+            {
+                bMarqueePending = false;
+            }
+            else if (EventArgs.Event == IE_Pressed && IsCtrlPressed() && !IsAltPressed())
+            {
+                FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags).SetRealtimeUpdate(IsRealtime()));
+                if (FSceneView* View = CalcSceneView(&ViewFamily))
+                {
+                    if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+                    {
+                        const int32 Id = Pinned->Pick(*View, FVector2D(MouseX, MouseY), IsShiftPressed());
+                        if (Pinned->GetSelectionMode() == ENGonElement::Edge && Id != INDEX_NONE)
+                        {
+                            Pinned->SelectEdgeLoop(Id, IsShiftPressed());
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
+        {
+            if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+            {
+                if (EventArgs.Key == EKeys::One)
+                {
+                    Pinned->SetSelectionMode(ENGonElement::Vertex);
+                    return true;
+                }
+                if (EventArgs.Key == EKeys::Two)
+                {
+                    Pinned->SetSelectionMode(ENGonElement::Edge);
+                    return true;
+                }
+                if (EventArgs.Key == EKeys::Three)
+                {
+                    Pinned->SetSelectionMode(ENGonElement::Face);
+                    return true;
+                }
+                if (EventArgs.Key == EKeys::H)
+                {
+                    Pinned->ToggleHeatmap();
+                    return true;
+                }
+                if (EventArgs.Key == EKeys::F)
+                {
+                    Pinned->FrameMesh();
+                    return true;
+                }
+            }
+        }
+        return FEditorViewportClient::InputKey(EventArgs);
+    }
+
+    void MouseMove(FViewport* InViewport, int32 X, int32 Y) override
+    {
+        if (!PreviewOwner->IsSoftTransformActive() && bMarqueePending && (bMarqueeActive || (InViewport && MarqueeStart != FVector2D(X, Y) &&
+            (FMath::Abs(X - MarqueeStart.X) + FMath::Abs(Y - MarqueeStart.Y) > 5.0))))
+        {
+            MarqueeCurrent = FVector2D(X, Y);
+            bMarqueeActive = true;
+            if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin()) Pinned->Invalidate();
+        }
+        FEditorViewportClient::MouseMove(InViewport, X, Y);
+    }
+
+    void Draw(FViewport* InViewport, FCanvas* Canvas) override
+    {
+        FEditorViewportClient::Draw(InViewport, Canvas);
+        if (bMarqueeActive && Canvas)
+        {
+            const FVector2D Min(FMath::Min(MarqueeStart.X, MarqueeCurrent.X), FMath::Min(MarqueeStart.Y, MarqueeCurrent.Y));
+            const FVector2D Size(FMath::Abs(MarqueeCurrent.X - MarqueeStart.X), FMath::Abs(MarqueeCurrent.Y - MarqueeStart.Y));
+            FCanvasBoxItem Box(Min, Size);
+            Box.SetColor(FLinearColor(0.15f, 0.65f, 1.0f, 0.85f));
+            Box.LineThickness = 2.0f;
+            Canvas->DrawItem(Box);
+        }
+    }
+
+    ~FNGonViewportClient() override
+    {
+        PreviewOwner->TeardownGizmo();
+    }
+
 private:
     TWeakPtr<SNGonViewport> Widget;
+    FVector2D MarqueeStart = FVector2D::ZeroVector;
+    FVector2D MarqueeCurrent = FVector2D::ZeroVector;
+    bool bMarqueeActive = false;
+    bool bMarqueePending = false;
 };
 }
 
@@ -145,9 +280,31 @@ void SNGonViewport::SetSelectionMode(ENGonElement Element)
     }
 }
 
-void SNGonViewport::Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd)
+void SNGonViewport::ToggleHeatmap()
 {
-    PreviewScene->Pick(SelectionMode, View, Cursor, bAdd);
+    bHeatmapVisible = !bHeatmapVisible;
+    PreviewScene->SetHeatmapVisible(bHeatmapVisible);
+}
+
+void SNGonViewport::SetHeatmapVisible(bool bVisible)
+{
+    bHeatmapVisible = bVisible;
+    PreviewScene->SetHeatmapVisible(bVisible);
+}
+
+int32 SNGonViewport::Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd)
+{
+    return PreviewScene->Pick(SelectionMode, View, Cursor, bAdd);
+}
+
+void SNGonViewport::BoxSelect(const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained)
+{
+    PreviewScene->BoxSelect(SelectionMode, View, ScreenRect, bAdd, bFullyContained);
+}
+
+bool SNGonViewport::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
+{
+    return PreviewScene->SelectEdgeLoop(StartEdgeId, bAdd);
 }
 
 void SNGonPreview::Construct(const FArguments& InArgs)
@@ -207,6 +364,10 @@ void SNGonPreview::Construct(const FArguments& InArgs)
         + SVerticalBox::Slot().AutoHeight().Padding(8, 3)
         [
             MakeControls()
+        ]
+        + SVerticalBox::Slot().AutoHeight().Padding(8, 2)
+        [
+            MakeSoftSelectionControls()
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(8, 2, 8, 7)
         [
@@ -292,10 +453,11 @@ TSharedRef<SWidget> SNGonPreview::MakeControls()
         + SWrapBox::Slot()
         [
             SNew(SCheckBox)
+            .IsChecked_Lambda([this] { return Viewport->IsHeatmapVisible() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
             .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
             {
                 bShowHeatmap = State == ECheckBoxState::Checked;
-                Viewport->Preview().SetHeatmapVisible(bShowHeatmap);
+                Viewport->SetHeatmapVisible(bShowHeatmap);
             })
             [
                 SNew(STextBlock).Text(LOCTEXT("Heatmap", "Heatmap"))
@@ -318,7 +480,7 @@ TSharedRef<SWidget> SNGonPreview::MakeSliders()
             [
                 SNew(SSlider)
                 .MinValue(-0.5f).MaxValue(0.5f)
-                .IsEnabled_Lambda([this] { return bShowHeatmap; })
+                .IsEnabled_Lambda([this] { return Viewport->IsHeatmapVisible(); })
                 .Value_Lambda([this] { return HeatBias; })
                 .OnValueChanged_Lambda([this](float Value)
                 {
@@ -346,7 +508,148 @@ TSharedRef<SWidget> SNGonPreview::MakeSliders()
         ]
         + SWrapBox::Slot()
         [
-            SNew(STextBlock).Text(LOCTEXT("Controls", "Shift-click to add to selection  ·  Alt + drag to orbit"))
+            SNew(STextBlock).Text(LOCTEXT("Controls", "1 vertex  ·  2 edge  ·  3 face  ·  H heatmap  ·  F frame  ·  Shift-click/add marquee  ·  Ctrl-click edge loop  ·  Alt + drag orbit"))
+        ];
+}
+
+void SNGonPreview::ApplySoftSelectionSettings()
+{
+    FNGonSoftSelectionSettings Settings;
+    Settings.bEnabled = bSoftSelection;
+    Settings.Radius = FMath::Max(0.0f, SoftRadius);
+    Settings.Metric = SoftMetric;
+    Settings.Connectivity = SoftConnectivity;
+    Settings.SurfaceBlend = FMath::Clamp(static_cast<double>(SoftSurfaceBlend), 0.0, 1.0);
+    Viewport->Preview().SetSoftTransformMode(SoftMode);
+    Viewport->Preview().SetSoftSelection(Settings);
+}
+
+TSharedRef<SWidget> SNGonPreview::MakeSoftSelectionControls()
+{
+    return SNew(SWrapBox)
+        .UseAllottedSize(true)
+        .InnerSlotPadding(FVector2D(10, 4))
+        + SWrapBox::Slot()
+        [
+            SNew(SCheckBox)
+            .IsChecked_Lambda([this] { return bSoftSelection ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+            {
+                bSoftSelection = State == ECheckBoxState::Checked;
+                ApplySoftSelectionSettings();
+            })
+            [ SNew(STextBlock).Text(LOCTEXT("SoftSelection", "Soft Selection")) ]
+        ]
+        + SWrapBox::Slot()
+        [ SNew(STextBlock).Text(LOCTEXT("SoftRadius", "Radius")) ]
+        + SWrapBox::Slot()
+        [
+            SNew(SBox).WidthOverride(145)
+            [
+                SNew(SSlider)
+                .MinValue(1.0f).MaxValue(500.0f)
+                .Value_Lambda([this] { return SoftRadius; })
+                .OnValueChanged_Lambda([this](float Value)
+                {
+                    SoftRadius = Value;
+                    ApplySoftSelectionSettings();
+                })
+            ]
+        ]
+        + SWrapBox::Slot()
+        [ SNew(STextBlock).Text(LOCTEXT("SoftMetric", "Metric")) ]
+        + SWrapBox::Slot()
+        [
+            SNew(SComboButton)
+            .OnGetMenuContent_Lambda([this]
+            {
+                FMenuBuilder Menu(true, nullptr);
+                const auto AddMetric = [this, &Menu](ENGonSoftMetric Metric, const TCHAR* Label)
+                {
+                    Menu.AddMenuEntry(FText::FromString(Label), FText(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Metric] { SoftMetric = Metric; ApplySoftSelectionSettings(); })));
+                };
+                AddMetric(ENGonSoftMetric::EdgeSurface, TEXT("Edge Surface"));
+                AddMetric(ENGonSoftMetric::FaceSurface, TEXT("Face Surface"));
+                AddMetric(ENGonSoftMetric::Volume, TEXT("Volume"));
+                AddMetric(ENGonSoftMetric::Hybrid, TEXT("Hybrid"));
+                return Menu.MakeWidget();
+            })
+            .ButtonContent()
+            [ SNew(STextBlock).Text_Lambda([this]
+                {
+                    switch (SoftMetric)
+                    {
+                    case ENGonSoftMetric::FaceSurface: return LOCTEXT("MetricFace", "Face Surface");
+                    case ENGonSoftMetric::Volume: return LOCTEXT("MetricVolume", "Volume");
+                    case ENGonSoftMetric::Hybrid: return LOCTEXT("MetricHybrid", "Hybrid");
+                    default: return LOCTEXT("MetricEdge", "Edge Surface");
+                    }
+                }) ]
+        ]
+        + SWrapBox::Slot()
+        [ SNew(STextBlock).Text(LOCTEXT("SoftConnectivity", "Mask")) ]
+        + SWrapBox::Slot()
+        [
+            SNew(SComboButton)
+            .OnGetMenuContent_Lambda([this]
+            {
+                FMenuBuilder Menu(true, nullptr);
+                const auto AddMask = [this, &Menu](ENGonSoftConnectivity Mask, const TCHAR* Label)
+                {
+                    Menu.AddMenuEntry(FText::FromString(Label), FText(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Mask] { SoftConnectivity = Mask; ApplySoftSelectionSettings(); })));
+                };
+                AddMask(ENGonSoftConnectivity::SameIsland, TEXT("Same Island"));
+                AddMask(ENGonSoftConnectivity::Unrestricted, TEXT("Unrestricted"));
+                AddMask(ENGonSoftConnectivity::FloodWithinRadius, TEXT("Flood Within Radius"));
+                return Menu.MakeWidget();
+            })
+            .ButtonContent()
+            [ SNew(STextBlock).Text_Lambda([this]
+                {
+                    switch (SoftConnectivity)
+                    {
+                    case ENGonSoftConnectivity::Unrestricted: return LOCTEXT("MaskNone", "Unrestricted");
+                    case ENGonSoftConnectivity::FloodWithinRadius: return LOCTEXT("MaskFlood", "Flood Within Radius");
+                    default: return LOCTEXT("MaskIsland", "Same Island");
+                    }
+                }) ]
+        ]
+        + SWrapBox::Slot()
+        [ SNew(STextBlock).Text(LOCTEXT("SoftBlend", "Blend")) ]
+        + SWrapBox::Slot()
+        [
+            SNew(SBox).WidthOverride(110)
+            [
+                SNew(SSlider)
+                .MinValue(0.0f).MaxValue(1.0f)
+                .IsEnabled_Lambda([this] { return bSoftSelection && SoftMetric == ENGonSoftMetric::Hybrid; })
+                .Value_Lambda([this] { return SoftSurfaceBlend; })
+                .OnValueChanged_Lambda([this](float Value) { SoftSurfaceBlend = Value; ApplySoftSelectionSettings(); })
+            ]
+        ]
+        + SWrapBox::Slot()
+        [ SNew(STextBlock).Text(LOCTEXT("SoftMode", "Mode")) ]
+        + SWrapBox::Slot()
+        [
+            SNew(SCheckBox)
+            .IsChecked_Lambda([this] { return SoftMode == ENGonSoftTransformMode::LiveFalloff ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+            {
+                SoftMode = State == ECheckBoxState::Checked ? ENGonSoftTransformMode::LiveFalloff : ENGonSoftTransformMode::Fixed;
+                ApplySoftSelectionSettings();
+            })
+            [ SNew(STextBlock).Text(LOCTEXT("LiveFalloff", "Live Falloff")) ]
+        ]
+        + SWrapBox::Slot()
+        [
+            SNew(SCheckBox)
+            .IsChecked_Lambda([this] { return SoftMode == ENGonSoftTransformMode::SlideSculpt ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+            {
+                SoftMode = State == ECheckBoxState::Checked ? ENGonSoftTransformMode::SlideSculpt : ENGonSoftTransformMode::Fixed;
+                ApplySoftSelectionSettings();
+            })
+            [ SNew(STextBlock).Text(LOCTEXT("SlideSculpt", "Slide Sculpt")) ]
         ];
 }
 

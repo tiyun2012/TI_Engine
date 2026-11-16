@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "NGonPicking.h"
+#include "NGonSoftSelection.h"
 #include "NGonTopology.h"
 #include "PreviewScene.h"
 #include "UObject/StrongObjectPtr.h"
@@ -11,6 +12,10 @@ class UInteractiveToolManager;
 class ULineSetComponent;
 class UPointSetComponent;
 class UPreviewGeometry;
+class UInteractiveGizmoManager;
+class UCombinedTransformGizmo;
+class UTransformProxy;
+class IToolContextTransactionProvider;
 
 class FNGonPreviewScene
 {
@@ -29,11 +34,28 @@ public:
     void SetHeatmapVisible(bool bShow);
     void SetHeatBias(float Value);
     void SetBend(float Value);
-    void Pick(ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd);
+    void SetupGizmo(UInteractiveGizmoManager* GizmoManager, IToolContextTransactionProvider* TransactionProvider);
+    void TeardownGizmo();
+    void UpdateGizmo();
+    void SetSoftSelection(const FNGonSoftSelectionSettings& Settings);
+    void SetSoftTransformMode(ENGonSoftTransformMode Mode) { SoftTransformMode = Mode; }
+    ENGonSoftTransformMode GetSoftTransformMode() const { return SoftTransformMode; }
+    const FNGonSoftSelectionSettings& GetSoftSelectionSettings() const { return SoftSettings; }
+    const TArray<FNGonVertexInfluence>& GetSoftSelectionInfluences() const { return SoftInfluences; }
+    bool BeginSoftTransform(const FTransform& GizmoTransform, ENGonSoftTransformMode Mode);
+    bool ApplyGizmoTransform(const FTransform& GizmoTransform);
+    void EndSoftTransform();
+    void CancelSoftTransform();
+    bool IsSoftTransformActive() const { return SoftSession.IsActive(); }
+    FTransform GetSelectionGizmoTransform() const;
+    int32 Pick(ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd);
+    void BoxSelect(ENGonElement Element, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
+    bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
     void ClearSelection();
     FText DescribeSelection() const;
     FText DescribeMesh() const;
     FText DescribeUpdates() const;
+    const FNGonTopology& GetTopology() const { return Topology; }
 
 private:
     struct FColorElement
@@ -49,13 +71,17 @@ private:
     void RebuildOverlays();
     void UpdateOverlayPositions();
     void UpdateSelection(ENGonElement Element, int32 Id, bool bAdd);
+    void ApplySelectionSet(ENGonElement Element, const TSet<int32>& Ids, bool bAdd);
     void DrawSelection();
+    void DrawSoftSelection();
+    void RebuildSoftSelection();
 
     FPreviewScene Scene;
     TStrongObjectPtr<UPreviewGeometry> Overlay;
     UDynamicMeshComponent* Surface = nullptr;
     ULineSetComponent* EdgeLines = nullptr;
     UPointSetComponent* VertexPoints = nullptr;
+    UPointSetComponent* SoftInfluencePoints = nullptr;
     ULineSetComponent* SelectedEdge = nullptr;
     UPointSetComponent* SelectedVertex = nullptr;
 
@@ -74,4 +100,15 @@ private:
     int32 TopologyUpdates = 0;
     int32 PositionUpdates = 0;
     int32 ColorUpdates = 0;
+    FNGonSoftSelectionSettings SoftSettings{};
+    ENGonSoftTransformMode SoftTransformMode = ENGonSoftTransformMode::Fixed;
+    FNGonSoftSelectionSolver SoftSolver;
+    FNGonSoftTransformSession SoftSession;
+    TArray<FNGonVertexInfluence> SoftInfluences;
+    TArray<FVector> SoftOriginalPositions;
+    FTransform ActiveGizmoTransform = FTransform::Identity;
+    UInteractiveGizmoManager* GizmoManager = nullptr;
+    UCombinedTransformGizmo* TransformGizmo = nullptr;
+    UTransformProxy* TransformProxy = nullptr;
+    bool bUpdatingGizmo = false;
 };

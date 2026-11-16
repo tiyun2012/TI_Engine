@@ -26,7 +26,19 @@ public:
         const FNGonTopology& Topology,
         const TArray<FVector>& Positions) const;
 
+    /** Project and select all elements touched by a screen-space marquee. */
+    void BoxPick(
+        ENGonElement Element,
+        const FSceneView& View,
+        const FBox2D& ScreenRect,
+        const FNGonTopology& Topology,
+        const TArray<FVector>& Positions,
+        TSet<int32>& OutIds,
+        bool bFullyContained) const;
+
 private:
+    void EnsureSpatialBuilt() const;
     const UE::Geometry::FDynamicMesh3* Mesh = nullptr;
-    TUniquePtr<UE::Geometry::FDynamicMeshAABBTree3> Spatial;
+    mutable TUniquePtr<UE::Geometry::FDynamicMeshAABBTree3> Spatial;
+    mutable bool bSpatialDirty = false;
 };
