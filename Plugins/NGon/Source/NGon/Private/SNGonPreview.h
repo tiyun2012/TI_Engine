@@ -24,6 +24,7 @@ public:
     bool IsHeatmapVisible() const { return bHeatmapVisible; }
     void SetMesh(FNGonMeshData&& Data);
     void FrameMesh();
+    bool DeleteSelectedFaces();
     int32 Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd);
     void BoxSelect(const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);

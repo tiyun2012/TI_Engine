@@ -178,6 +178,10 @@ public:
                     Pinned->FrameMesh();
                     return true;
                 }
+                if (EventArgs.Key == EKeys::Delete || EventArgs.Key == EKeys::BackSpace)
+                {
+                    return Pinned->DeleteSelectedFaces();
+                }
             }
         }
         return FEditorViewportClient::InputKey(EventArgs);
@@ -307,6 +311,11 @@ bool SNGonViewport::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
     return PreviewScene->SelectEdgeLoop(StartEdgeId, bAdd);
 }
 
+bool SNGonViewport::DeleteSelectedFaces()
+{
+    return PreviewScene->DeleteSelectedFaces();
+}
+
 void SNGonPreview::Construct(const FArguments& InArgs)
 {
     SAssignNew(Viewport, SNGonViewport);
@@ -427,6 +436,16 @@ TSharedRef<SWidget> SNGonPreview::MakeControls()
         + SWrapBox::Slot()
         [
             MakeSelectionMode(ENGonElement::Vertex, LOCTEXT("VertexMode", "Vertex"))
+        ]
+        + SWrapBox::Slot()
+        [
+            SNew(SButton)
+            .Text(LOCTEXT("DeleteFaces", "Delete Faces"))
+            .OnClicked_Lambda([this]
+            {
+                Viewport->DeleteSelectedFaces();
+                return FReply::Handled();
+            })
         ]
         + SWrapBox::Slot()
         [

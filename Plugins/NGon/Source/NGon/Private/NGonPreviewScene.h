@@ -52,6 +52,8 @@ public:
     void BoxSelect(ENGonElement Element, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
     void ClearSelection();
+    bool DeleteSelectedFaces();
+    void SelectElement(ENGonElement Element, int32 Id, bool bAdd = false) { UpdateSelection(Element, Id, bAdd); }
     FText DescribeSelection() const;
     FText DescribeMesh() const;
     FText DescribeUpdates() const;
@@ -92,6 +94,7 @@ private:
     TArray<FVector> Positions;
     TArray<float> AxisFractions;
     TArray<float> HeatSamples;
+    TBitArray<> ImportedHeatMask;
     TArray<FColorElement> ColorElements;
     int32 ImportedSampleCount = 0;
     bool bHeatmapVisible = false;

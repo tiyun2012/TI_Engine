@@ -203,6 +203,7 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
     ImportedSampleCount = 0;
     AxisFractions.Reset(Positions.Num());
     HeatSamples.Reset(Positions.Num());
+    ImportedHeatMask.Init(false, Positions.Num());
     for (int32 Vertex = 0; Vertex < Positions.Num(); ++Vertex)
     {
         const float Fraction = static_cast<float>(
@@ -214,6 +215,7 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
         if (Imported >= 0.0f)
         {
             HeatSamples.Add(Imported);
+            ImportedHeatMask[Vertex] = true;
             ++ImportedSampleCount;
         }
         else
@@ -617,6 +619,67 @@ bool FNGonPreviewScene::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
 void FNGonPreviewScene::ClearSelection()
 {
     UpdateSelection(SelectedElement, INDEX_NONE, false);
+}
+
+bool FNGonPreviewScene::DeleteSelectedFaces()
+{
+    if (SelectedElement != ENGonElement::Face || SelectedIds.IsEmpty() ||
+        Topology.Faces.Num() <= 1 || Positions.IsEmpty())
+    {
+        return false;
+    }
+
+    TSet<int32> ValidSelectedIds;
+    for (const int32 Id : SelectedIds)
+    {
+        if (Topology.Faces.Contains(Id))
+        {
+            ValidSelectedIds.Add(Id);
+        }
+    }
+    if (ValidSelectedIds.IsEmpty() || ValidSelectedIds.Num() >= Topology.Faces.Num())
+    {
+        return false;
+    }
+
+    TArray<TArray<int32>> RemainingFaces;
+    RemainingFaces.Reserve(Topology.Faces.Num() - ValidSelectedIds.Num());
+    for (const TPair<int32, FNGonFace>& FacePair : Topology.Faces)
+    {
+        if (!ValidSelectedIds.Contains(FacePair.Key) && FacePair.Value.Perimeter.Num() >= 3)
+        {
+            RemainingFaces.Add(FacePair.Value.Perimeter);
+        }
+    }
+    if (RemainingFaces.IsEmpty()) return false;
+
+    FNGonMeshData Replacement;
+    FText Error;
+    if (!NGon::BuildPolygonMesh(Positions, RemainingFaces, Replacement, Error)) return false;
+
+    const FNGonSoftSelectionSettings SavedSoftSettings = SoftSettings;
+    const ENGonSoftTransformMode SavedSoftMode = SoftTransformMode;
+    const float SavedHeatBias = HeatBias;
+    // BuildPolygonMesh may compact logical vertices after the deleted faces are
+    // removed. The rebuilt SourceVertexIds point back to the old logical
+    // position array, so carry imported FBX samples by that old index.
+    Replacement.ImportedHeatSamples.Init(-1.0f, Replacement.Topology.RestPositions.Num());
+    for (int32 NewVertex = 0; NewVertex < Replacement.Topology.SourceVertexIds.Num(); ++NewVertex)
+    {
+        const int32 OldVertex = Replacement.Topology.SourceVertexIds[NewVertex];
+        if (ImportedHeatMask.IsValidIndex(OldVertex) && ImportedHeatMask[OldVertex] &&
+            HeatSamples.IsValidIndex(OldVertex))
+        {
+            Replacement.ImportedHeatSamples[NewVertex] = HeatSamples[OldVertex];
+        }
+    }
+    SetMesh(MoveTemp(Replacement));
+    SoftTransformMode = SavedSoftMode;
+    SoftSettings = SavedSoftSettings;
+    HeatBias = SavedHeatBias;
+    UpdateColors();
+    RebuildSoftSelection();
+    return true;
 }
 
 void FNGonPreviewScene::UpdateSelection(ENGonElement Element, int32 Id, bool bAdd)

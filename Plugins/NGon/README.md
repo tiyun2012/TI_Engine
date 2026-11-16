@@ -22,6 +22,7 @@ N-Gon is a project-local C++ editor plugin for picking authored polygons, edges 
 | **Open FBX** | Opens a browser in `Meshes` when that folder exists. Choose another raw FBX to preview. |
 | **Static Mesh** | Choose an Unreal asset to inspect its editable LOD 0. Use the raw FBX for polygons that the Unreal import already triangulated. |
 | **Face / Edge / Vertex** | Click to select. Shift-click adds to the active selection. A face highlights all its underlying triangles. |
+| **Delete Faces** | In Face mode, select one or more faces and click **Delete Faces** or press **Delete/Backspace**. The preview rebuilds the remaining authored polygons, refreshes picking/overlays/gizmo state, and refuses to delete the final face. |
 | **Heatmap / Heat Bias** | Scrub the heat value and watch the **Colors** counter. FBX red values of zero stay zero at neutral bias. |
 | **Bend** | Scrub the position test and check that surface picking and visible overlays follow it. The **Positions** counter advances. |
 | **Load Demo** | Check for 3 faces, 8 triangles, 12 edges and 10 logical vertices. Click both sides of the hidden diagonal in a face, then click inside the concave notch to test a miss. |
@@ -45,7 +46,7 @@ Use Alt + left drag to orbit, scroll to zoom, and **Frame Mesh** to reset the ca
 
 ## Run the tests
 
-Run `Automation RunTests NGon` in the Unreal Editor console. The tests cover demo topology and picking, default-file precedence and a generated FBX with concavity, transform offsets and both imported color mappings.
+Run `Automation RunTests NGon` in the Unreal Editor console. The tests cover demo topology and picking, safe edge loops, face deletion (including the final-face guard), default-file precedence and a generated FBX with concavity, transform offsets and both imported color mappings.
 
 ```bat
 "D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" "D:\Projects\MyProject\MyProject.uproject" -ExecCmds="Automation RunTests NGon" -unattended -nopause -nullrhi -log -TestExit="Automation Test Queue Empty"
