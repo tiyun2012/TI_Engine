@@ -1,0 +1,15 @@
+/.git
+/.vs
+/.vscode
+/Content
+/DerivedDataCache
+/Intermediate
+/Saved
+/Plugins/NGon/Intermediate
+/Plugins/NGon/Meshes
+/Plugins/TiRigLibs/Intermediate
+/Plugins/TiSkinTool/Intermediate
+/Plugins/VisualStudioTools/azure-pipelines
+/Plugins/VisualStudioTools/Docs
+/Plugins/VisualStudioTools/Intermediate
+/Plugins/VisualStudioTools/Scripts

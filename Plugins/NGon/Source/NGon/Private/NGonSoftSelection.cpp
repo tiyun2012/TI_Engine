@@ -40,10 +40,12 @@ const TArray<FNGonVertexInfluence>& FNGonSoftSelectionSolver::Solve(
     {
         if (Position.ContainsNaN()) return Influences;
     }
+
     TSet<int32> Unique; TArray<int32> OrderedSeeds;
     for (const int32 Seed : Seeds) AddSeed(Unique, OrderedSeeds, Seed, Positions.Num());
     if (OrderedSeeds.IsEmpty()) return Influences;
     for (const int32 Seed : OrderedSeeds) Influences.Add({Seed, 1.0});
+
     if (Settings.Metric < ENGonSoftMetric::EdgeSurface || Settings.Metric > ENGonSoftMetric::Volume ||
         Settings.Connectivity < ENGonSoftConnectivity::SameIsland || Settings.Connectivity > ENGonSoftConnectivity::FloodWithinRadius ||
         !FMath::IsFinite(Settings.SurfaceBlend) || Settings.SurfaceBlend < 0.0 || Settings.SurfaceBlend > 1.0)
@@ -57,6 +59,7 @@ const TArray<FNGonVertexInfluence>& FNGonSoftSelectionSolver::Solve(
 
     TSet<int32> SeedSet;
     for (const int32 Seed : OrderedSeeds) SeedSet.Add(Seed);
+
     const double Radius = Settings.Radius;
     const int32 VertexCount = Positions.Num();
     TArray<FVector> WorldPositions;
@@ -73,6 +76,7 @@ const TArray<FNGonVertexInfluence>& FNGonSoftSelectionSolver::Solve(
             Neighbors[Edge.Y].AddUnique(Edge.X);
         }
     }
+
     TArray<int32> Island; Island.SetNum(VertexCount);
     TArray<int32> IslandSize; IslandSize.Init(1, VertexCount);
     for (int32 Vertex = 0; Vertex < VertexCount; ++Vertex) Island[Vertex] = Vertex;
@@ -127,49 +131,69 @@ const TArray<FNGonVertexInfluence>& FNGonSoftSelectionSolver::Solve(
         || Settings.Metric == ENGonSoftMetric::Hybrid;
     if (bNeedSurface)
     {
+        using FQueueItem = TPair<double, int32>;
+        const auto HeapLess = [](const FQueueItem& A, const FQueueItem& B) { return A.Key < B.Key; };
+
         if (Settings.Metric == ENGonSoftMetric::FaceSurface)
         {
             // Face-center surface approximation: vertices connect through the
             // authored polygon centers, matching TiGUI's face metric.
             const int32 FaceCount = Topology.Faces.Num();
             TArray<int32> FaceIds; Topology.Faces.GetKeys(FaceIds);
-            TArray<FVector> Centers; Centers.SetNum(FaceCount);
-            TMap<int32, int32> FaceNode;
+            TArray<FVector> Centers; Centers.SetNumZeroed(FaceCount);
+            TArray<TArray<int32>> VertexFaces; VertexFaces.SetNum(VertexCount);
+
             for (int32 Index = 0; Index < FaceIds.Num(); ++Index)
             {
-                FaceNode.Add(FaceIds[Index], Index);
                 const FNGonFace& Face = Topology.Faces.FindChecked(FaceIds[Index]);
-                for (const int32 Vertex : Face.Perimeter) Centers[Index] += WorldPositions[Vertex];
+                for (const int32 Vertex : Face.Perimeter)
+                {
+                    if (WorldPositions.IsValidIndex(Vertex))
+                    {
+                        Centers[Index] += WorldPositions[Vertex];
+                        VertexFaces[Vertex].Add(Index);
+                    }
+                }
                 Centers[Index] /= FMath::Max(1, Face.Perimeter.Num());
             }
+
             const int32 NodeCount = VertexCount + FaceCount;
             TArray<double> Distances; Distances.Init(TNumericLimits<double>::Max(), NodeCount);
-            using FQueueItem = TPair<double, int32>;
             TArray<FQueueItem> Queue;
-            for (const int32 Seed : OrderedSeeds) { Distances[Seed] = 0.0; Queue.Add({0.0, Seed}); }
+            for (const int32 Seed : OrderedSeeds)
+            {
+                Distances[Seed] = 0.0;
+                Queue.HeapPush({0.0, Seed}, HeapLess);
+            }
+
             while (!Queue.IsEmpty())
             {
-                int32 BestIndex = 0;
-                for (int32 Index = 1; Index < Queue.Num(); ++Index)
-                    if (Queue[Index].Key < Queue[BestIndex].Key) BestIndex = Index;
-                const FQueueItem Item = Queue[BestIndex];
-                Queue.RemoveAtSwap(BestIndex, 1, EAllowShrinking::No);
-                const double Current = Item.Key; const int32 Node = Item.Value;
-                if (Current != Distances[Node] || Current > Radius) continue;
+                FQueueItem Item;
+                Queue.HeapPop(Item, HeapLess, EAllowShrinking::No);
+                const double Current = Item.Key;
+                const int32 Node = Item.Value;
+                if (Current > Distances[Node] || Current > Radius) continue;
+
                 if (Node < VertexCount)
                 {
                     for (const int32 Next : Neighbors[Node])
                     {
                         const double Candidate = Current + Distance(WorldPositions[Node], WorldPositions[Next]);
-                        if (Candidate < Distances[Next] && Candidate <= Radius) { Distances[Next] = Candidate; Queue.Add({Candidate, Next}); }
+                        if (Candidate < Distances[Next] && Candidate <= Radius)
+                        {
+                            Distances[Next] = Candidate;
+                            Queue.HeapPush({Candidate, Next}, HeapLess);
+                        }
                     }
-                    for (int32 FaceIndex = 0; FaceIndex < FaceIds.Num(); ++FaceIndex)
+                    for (const int32 FaceIndex : VertexFaces[Node])
                     {
-                        const FNGonFace& Face = Topology.Faces.FindChecked(FaceIds[FaceIndex]);
-                        if (!Face.Perimeter.Contains(Node)) continue;
                         const int32 FaceNodeId = VertexCount + FaceIndex;
                         const double Candidate = Current + Distance(WorldPositions[Node], Centers[FaceIndex]);
-                        if (Candidate < Distances[FaceNodeId] && Candidate <= Radius) { Distances[FaceNodeId] = Candidate; Queue.Add({Candidate, FaceNodeId}); }
+                        if (Candidate < Distances[FaceNodeId] && Candidate <= Radius)
+                        {
+                            Distances[FaceNodeId] = Candidate;
+                            Queue.HeapPush({Candidate, FaceNodeId}, HeapLess);
+                        }
                     }
                 }
                 else
@@ -179,7 +203,11 @@ const TArray<FNGonVertexInfluence>& FNGonSoftSelectionSolver::Solve(
                     for (const int32 Next : Face.Perimeter)
                     {
                         const double Candidate = Current + Distance(Centers[FaceIndex], WorldPositions[Next]);
-                        if (Candidate < Distances[Next] && Candidate <= Radius) { Distances[Next] = Candidate; Queue.Add({Candidate, Next}); }
+                        if (Candidate < Distances[Next] && Candidate <= Radius)
+                        {
+                            Distances[Next] = Candidate;
+                            Queue.HeapPush({Candidate, Next}, HeapLess);
+                        }
                     }
                 }
             }
@@ -187,22 +215,27 @@ const TArray<FNGonVertexInfluence>& FNGonSoftSelectionSolver::Solve(
         }
         else
         {
-            using FQueueItem = TPair<double, int32>;
             TArray<FQueueItem> Queue;
-            for (const int32 Seed : OrderedSeeds) { SurfaceDistances[Seed] = 0.0; Queue.Add({0.0, Seed}); }
+            for (const int32 Seed : OrderedSeeds)
+            {
+                SurfaceDistances[Seed] = 0.0;
+                Queue.HeapPush({0.0, Seed}, HeapLess);
+            }
             while (!Queue.IsEmpty())
             {
-                int32 BestIndex = 0;
-                for (int32 Index = 1; Index < Queue.Num(); ++Index)
-                    if (Queue[Index].Key < Queue[BestIndex].Key) BestIndex = Index;
-                const FQueueItem Item = Queue[BestIndex];
-                Queue.RemoveAtSwap(BestIndex, 1, EAllowShrinking::No);
-                const double Current = Item.Key; const int32 Vertex = Item.Value;
-                if (Current != SurfaceDistances[Vertex] || Current > Radius) continue;
+                FQueueItem Item;
+                Queue.HeapPop(Item, HeapLess, EAllowShrinking::No);
+                const double Current = Item.Key;
+                const int32 Vertex = Item.Value;
+                if (Current > SurfaceDistances[Vertex] || Current > Radius) continue;
                 for (const int32 Next : Neighbors[Vertex])
                 {
                     const double Candidate = Current + Distance(WorldPositions[Vertex], WorldPositions[Next]);
-                    if (Candidate < SurfaceDistances[Next] && Candidate <= Radius) { SurfaceDistances[Next] = Candidate; Queue.Add({Candidate, Next}); }
+                    if (Candidate < SurfaceDistances[Next] && Candidate <= Radius)
+                    {
+                        SurfaceDistances[Next] = Candidate;
+                        Queue.HeapPush({Candidate, Next}, HeapLess);
+                    }
                 }
             }
         }
@@ -270,6 +303,7 @@ bool FNGonSoftTransformSession::BuildPositions(const FNGonTopology& Topology, co
     {
         OutPositions = StartPositions;
     }
+
     const TArray<FNGonVertexInfluence>& Influences =
         (Mode == ENGonSoftTransformMode::LiveFalloff && !CurrentInfluences.IsEmpty())
             ? CurrentInfluences : StartInfluences;
@@ -283,6 +317,7 @@ bool FNGonSoftTransformSession::BuildPositions(const FNGonTopology& Topology, co
         const FVector WorldPosition = FMath::Lerp(StartWorld, TargetWorld, static_cast<float>(Influence.Weight));
         OutPositions[Influence.Vertex] = ObjectTransform.InverseTransformPosition(WorldPosition);
     }
+
     if (Mode == ENGonSoftTransformMode::SlideSculpt)
     {
         WorkingPositions = OutPositions;
@@ -296,6 +331,7 @@ bool FNGonSoftTransformSession::BuildPositions(const FNGonTopology& Topology, co
 }
 
 void FNGonSoftTransformSession::End() { bActive = false; }
+
 void FNGonSoftTransformSession::Cancel()
 {
     bActive = false; StartInfluences.Reset(); CurrentInfluences.Reset(); StartPositions.Reset();

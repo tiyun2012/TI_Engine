@@ -52,6 +52,7 @@ UMaterial* MakeSurfaceMaterial()
         "float3 color = lerp(surface, float3(1, 0.48, 0.075), 0.65 * MeshData.g);\n"
         "float ndotl = abs(dot(Parameters.WorldNormal, Parameters.CameraVector));\n"
         "return color * lerp(0.62, 1.0, ndotl);");
+
     Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Shade);
     Material->PostEditChange();
     return Material;
@@ -106,8 +107,11 @@ void FNGonPreviewScene::SetupGizmo(UInteractiveGizmoManager* InGizmoManager, ITo
     TransformProxy->OnTransformChanged.AddLambda([this](UTransformProxy*, FTransform Transform) {
         if (!bUpdatingGizmo) ApplyGizmoTransform(Transform);
     });
-    TransformProxy->OnEndTransformEdit.AddLambda([this](UTransformProxy*) { if (!bUpdatingGizmo) EndSoftTransform(); });
+    TransformProxy->OnEndTransformEdit.AddLambda([this](UTransformProxy*) {
+        if (!bUpdatingGizmo) EndSoftTransform();
+    });
     TransformGizmo->SetActiveTarget(TransformProxy, TransactionProvider);
+    UpdateGizmo();
 }
 
 void FNGonPreviewScene::TeardownGizmo()
@@ -191,6 +195,7 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
     SoftInfluences.Reset();
     Bend = 0.0f;
     HeatBias = 0.0f;
+
     Topology = MoveTemp(Data.Topology);
     Positions = Topology.RestPositions;
 
@@ -200,6 +205,7 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
     {
         Axis = 2;
     }
+
     ImportedSampleCount = 0;
     AxisFractions.Reset(Positions.Num());
     HeatSamples.Reset(Positions.Num());
@@ -209,7 +215,6 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
         const float Fraction = static_cast<float>(
             (Positions[Vertex][Axis] - Topology.RestBounds.Min[Axis]) / FMath::Max(Size[Axis], 1.e-8));
         AxisFractions.Add(Fraction);
-
         const float Imported = Data.ImportedHeatSamples.IsValidIndex(Vertex)
             ? Data.ImportedHeatSamples[Vertex] : -1.0f;
         if (Imported >= 0.0f)
@@ -310,6 +315,7 @@ void FNGonPreviewScene::RebuildOverlays()
         Starts.Add(Positions[Edge.X]);
         Ends.Add(Positions[Edge.Y]);
     }
+
     EdgeLines->AddLines(Starts, Ends, EdgeColor, 1.6f, 0.35f);
     VertexPoints->AddPoints(Positions, PointColor, 5.0f, 0.6f);
     DrawSelection();
@@ -341,7 +347,6 @@ void FNGonPreviewScene::DrawSoftSelection()
     {
         return;
     }
-
     SoftInfluencePoints->Clear();
     const bool bVisible = SoftSettings.bEnabled && !SoftInfluences.IsEmpty();
     SoftInfluencePoints->SetVisibility(bVisible);
@@ -420,6 +425,7 @@ void FNGonPreviewScene::SetBend(float Value)
     Picker.PositionsChanged();
     UpdateOverlayPositions();
     RebuildSoftSelection();
+    UpdateGizmo();
     ++PositionUpdates;
 }
 
@@ -501,6 +507,7 @@ bool FNGonPreviewScene::BeginSoftTransform(const FTransform& GizmoTransform, ENG
             }
         }
     }
+
     ActiveGizmoTransform = GizmoTransform;
     return SoftSession.Begin(Topology, Positions, Seeds, FTransform::Identity, GizmoTransform, SoftSettings, Mode);
 }
@@ -517,14 +524,21 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
         const int32 LogicalId = Topology.DynamicToLogicalVertex.IsValidIndex(Vertex) ? Topology.DynamicToLogicalVertex[Vertex] : INDEX_NONE;
         if (Positions.IsValidIndex(LogicalId)) Mesh.SetVertex(Vertex, Positions[LogicalId]);
     }
-    Surface->FastNotifyPositionsUpdated(false, false, false); Picker.PositionsChanged(); UpdateOverlayPositions();
+    Surface->FastNotifyPositionsUpdated(false, false, false);
+    Picker.PositionsChanged();
+    UpdateOverlayPositions();
     ++PositionUpdates;
-    ActiveGizmoTransform = GizmoTransform; SoftInfluences = SoftSession.Influences();
+    ActiveGizmoTransform = GizmoTransform;
+    SoftInfluences = SoftSession.Influences();
     DrawSoftSelection();
     return true;
 }
 
-void FNGonPreviewScene::EndSoftTransform() { SoftSession.End(); }
+void FNGonPreviewScene::EndSoftTransform()
+{
+    SoftSession.End();
+}
+
 void FNGonPreviewScene::CancelSoftTransform()
 {
     if (!SoftSession.IsActive()) return;
@@ -535,7 +549,12 @@ void FNGonPreviewScene::CancelSoftTransform()
         const int32 LogicalId = Topology.DynamicToLogicalVertex.IsValidIndex(Vertex) ? Topology.DynamicToLogicalVertex[Vertex] : INDEX_NONE;
         if (Positions.IsValidIndex(LogicalId)) Mesh.SetVertex(Vertex, Positions[LogicalId]);
     }
-    Surface->FastNotifyPositionsUpdated(false, false, false); Picker.PositionsChanged(); UpdateOverlayPositions(); SoftSession.Cancel();
+    Surface->FastNotifyPositionsUpdated(false, false, false);
+    Picker.PositionsChanged();
+    UpdateOverlayPositions();
+    SoftSession.Cancel();
+    RebuildSoftSelection();
+    UpdateGizmo();
 }
 
 int32 FNGonPreviewScene::Pick(
@@ -585,6 +604,7 @@ bool FNGonPreviewScene::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
             if (const int32* EdgeId = EdgeToId.Find(FIntPoint(FMath::Min(A, B), FMath::Max(A, B)))) EdgeFaces.FindOrAdd(*EdgeId).Add(FacePair.Key);
         }
     }
+
     TSet<int32> Loop;
     TArray<int32> Pending{StartEdgeId};
     const int32 Budget = FMath::Max(Topology.Edges.Num() * 2, 1);
@@ -660,6 +680,7 @@ bool FNGonPreviewScene::DeleteSelectedFaces()
     const FNGonSoftSelectionSettings SavedSoftSettings = SoftSettings;
     const ENGonSoftTransformMode SavedSoftMode = SoftTransformMode;
     const float SavedHeatBias = HeatBias;
+
     // BuildPolygonMesh may compact logical vertices after the deleted faces are
     // removed. The rebuilt SourceVertexIds point back to the old logical
     // position array, so carry imported FBX samples by that old index.
@@ -673,6 +694,7 @@ bool FNGonPreviewScene::DeleteSelectedFaces()
             Replacement.ImportedHeatSamples[NewVertex] = HeatSamples[OldVertex];
         }
     }
+
     SetMesh(MoveTemp(Replacement));
     SoftTransformMode = SavedSoftMode;
     SoftSettings = SavedSoftSettings;
@@ -695,6 +717,7 @@ void FNGonPreviewScene::UpdateSelection(ENGonElement Element, int32 Id, bool bAd
 
     const bool bHadFaces = SelectedElement == ENGonElement::Face && !SelectedIds.IsEmpty();
     const bool bHadOverlaySelection = SelectedElement != ENGonElement::Face && !SelectedIds.IsEmpty();
+
     if (!bAdd || SelectedElement != Element)
     {
         SelectedIds.Reset();
@@ -704,6 +727,7 @@ void FNGonPreviewScene::UpdateSelection(ENGonElement Element, int32 Id, bool bAd
     {
         SelectedIds.Add(Id);
     }
+
     RebuildSoftSelection();
     UpdateGizmo();
     if (bHadFaces || (Element == ENGonElement::Face && Id != INDEX_NONE))
@@ -720,6 +744,7 @@ void FNGonPreviewScene::DrawSelection()
 {
     SelectedEdge->Clear();
     SelectedVertex->Clear();
+
     if (SelectedElement == ENGonElement::Edge && !SelectedIds.IsEmpty())
     {
         TArray<FVector> Starts;
@@ -736,6 +761,7 @@ void FNGonPreviewScene::DrawSelection()
         }
         SelectedEdge->AddLines(Starts, Ends, SelectionColor, 3.5f, 1.2f);
     }
+
     if (SelectedElement == ENGonElement::Vertex && !SelectedIds.IsEmpty())
     {
         TArray<FVector> Points;
@@ -754,6 +780,7 @@ FText FNGonPreviewScene::DescribeSelection() const
     {
         return LOCTEXT("NoSelection", "No selection");
     }
+
     if (SelectedIds.Num() > 1)
     {
         switch (SelectedElement)
@@ -773,7 +800,7 @@ FText FNGonPreviewScene::DescribeSelection() const
     case ENGonElement::Face:
         if (const FNGonFace* Face = Topology.Faces.Find(Id))
         {
-            return FText::Format(LOCTEXT("FaceInfo", "Face {0}  ·  {1} sides  ·  {2} triangles"),
+            return FText::Format(LOCTEXT("FaceInfo", "Face {0}     {1} sides     {2} triangles"),
                 FText::AsNumber(Id), FText::AsNumber(Face->Perimeter.Num()),
                 FText::AsNumber(Face->Triangles.Num()));
         }
@@ -782,7 +809,7 @@ FText FNGonPreviewScene::DescribeSelection() const
         if (Topology.Edges.IsValidIndex(Id))
         {
             const FIntPoint Edge = Topology.Edges[Id];
-            return FText::Format(LOCTEXT("EdgeInfo", "Edge  ·  vertices {0} and {1}"),
+            return FText::Format(LOCTEXT("EdgeInfo", "Edge     vertices {0} and {1}"),
                 FText::AsNumber(Topology.SourceVertexIds[Edge.X]),
                 FText::AsNumber(Topology.SourceVertexIds[Edge.Y]));
         }
@@ -790,7 +817,7 @@ FText FNGonPreviewScene::DescribeSelection() const
     case ENGonElement::Vertex:
         if (Topology.SourceVertexIds.IsValidIndex(Id))
         {
-            return FText::Format(LOCTEXT("VertexInfo", "Vertex {0}  ·  heat {1}"),
+            return FText::Format(LOCTEXT("VertexInfo", "Vertex {0}     heat {1}"),
                 FText::AsNumber(Topology.SourceVertexIds[Id]),
                 FText::AsNumber(FMath::Clamp(HeatSamples[Id] + HeatBias, 0.0f, 1.0f)));
         }
@@ -806,7 +833,7 @@ FText FNGonPreviewScene::DescribeMesh() const
     {
         NGonCount += Pair.Value.Perimeter.Num() > 4 ? 1 : 0;
     }
-    const FText MeshInfo = FText::Format(LOCTEXT("MeshInfo", "{0} faces  ·  {1} triangles  ·  {2} edges  ·  {3} vertices  ·  {4} N-Gons (max {5} sides)"),
+    const FText MeshInfo = FText::Format(LOCTEXT("MeshInfo", "{0} faces     {1} triangles     {2} edges     {3} vertices     {4} N-Gons (max {5} sides)"),
         FText::AsNumber(Topology.Faces.Num()), FText::AsNumber(Topology.TriangleCount),
         FText::AsNumber(Topology.Edges.Num()), FText::AsNumber(Topology.RestPositions.Num()),
         FText::AsNumber(NGonCount), FText::AsNumber(Topology.MaxFaceCorners));

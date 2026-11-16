@@ -1,5 +1,6 @@
 #include "SNGonPreview.h"
 
+#include "AssetEditorModeManager.h"
 #include "AssetRegistry/AssetData.h"
 #include "DesktopPlatformModule.h"
 #include "EditorModeManager.h"
@@ -34,16 +35,19 @@
 
 namespace
 {
-// Base classes are destroyed in reverse order. Keep the scene alive through
-// the FEditorViewportClient destructor, which holds its FPreviewScene pointer.
+// Base classes are destroyed in reverse order. Keep both the preview scene and
+// the viewport-local ModeTools alive through the FEditorViewportClient destructor.
 struct FNGonPreviewSceneOwner
 {
     explicit FNGonPreviewSceneOwner(const TSharedRef<FNGonPreviewScene>& InPreview)
         : PreviewOwner(InPreview)
+        , ModeToolsOwner(MakeShared<FAssetEditorModeManager>())
     {
+        ModeToolsOwner->SetPreviewScene(&InPreview->GetPreviewScene());
     }
 
     TSharedRef<FNGonPreviewScene> PreviewOwner;
+    TSharedPtr<FAssetEditorModeManager> ModeToolsOwner;
 };
 
 class FNGonViewportClient final : private FNGonPreviewSceneOwner, public FEditorViewportClient
@@ -53,7 +57,7 @@ public:
         const TSharedRef<FNGonPreviewScene>& InPreview,
         const TSharedRef<SNGonViewport>& InWidget)
         : FNGonPreviewSceneOwner(InPreview)
-        , FEditorViewportClient(nullptr, &InPreview->GetPreviewScene(), InWidget)
+        , FEditorViewportClient(ModeToolsOwner.Get(), &InPreview->GetPreviewScene(), InWidget)
         , Widget(InWidget)
     {
         SetViewportType(LVT_Perspective);
@@ -64,10 +68,14 @@ public:
         EngineShowFlags.SetSelectionOutline(false);
         EngineShowFlags.SetEyeAdaptation(false);
         EngineShowFlags.SetPostProcessing(false);
+        EngineShowFlags.SetModeWidgets(true);
+
         if (FEditorModeTools* ViewportModeTools = GetModeTools())
         {
+            ViewportModeTools->ActivateDefaultMode();
+
             if (UModeManagerInteractiveToolsContext* ToolsContext = ViewportModeTools->GetInteractiveToolsContext();
-                ToolsContext && ToolsContext->ToolManager)
+                ToolsContext && ToolsContext->ToolManager && ToolsContext->GizmoManager)
             {
                 PreviewOwner->SetOverlayMaterials(ToolsContext->ToolManager.Get());
                 PreviewOwner->SetupGizmo(ToolsContext->GizmoManager.Get(), ToolsContext->ToolManager.Get());
@@ -78,6 +86,12 @@ public:
     void ProcessClick(FSceneView& View, HHitProxy* HitProxy, FKey Key,
         EInputEvent Event, uint32 HitX, uint32 HitY) override
     {
+        if (bConsumedByGizmo)
+        {
+            bConsumedByGizmo = false;
+            return;
+        }
+
         if (Key == EKeys::LeftMouseButton && !IsAltPressed() && !IsCtrlPressed())
         {
             if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
@@ -94,47 +108,83 @@ public:
         if (EventArgs.Event == IE_Pressed && EventArgs.Key == EKeys::Escape && PreviewOwner->IsSoftTransformActive())
         {
             PreviewOwner->CancelSoftTransform();
+            bMarqueeActive = false;
+            bMarqueePending = false;
+            bConsumedByGizmo = false;
+            Invalidate();
             return true;
         }
+
         if (EventArgs.Key == EKeys::LeftMouseButton && EventArgs.Viewport)
         {
             const int32 MouseX = EventArgs.Viewport->GetMouseX();
             const int32 MouseY = EventArgs.Viewport->GetMouseY();
+
             if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
             {
+                bConsumedByGizmo = false;
+                // Let InteractiveToolsContext / Gizmo hit-test the click first
+                const bool bHandledByTools = FEditorViewportClient::InputKey(EventArgs);
+                if (PreviewOwner->IsSoftTransformActive())
+                {
+                    bConsumedByGizmo = true;
+                    bMarqueeActive = false;
+                    bMarqueePending = false;
+                    return true;
+                }
+
                 MarqueeStart = FVector2D(MouseX, MouseY);
                 MarqueeCurrent = MarqueeStart;
                 bMarqueeActive = false;
                 bMarqueePending = true;
+                return bHandledByTools;
             }
-            else if (EventArgs.Event == IE_Released && bMarqueeActive)
+            else if (EventArgs.Event == IE_Released && !IsAltPressed() && !IsCtrlPressed())
             {
-                if (PreviewOwner->IsSoftTransformActive())
+                const bool bWasSoftActive = PreviewOwner->IsSoftTransformActive();
+                const bool bHandledByTools = FEditorViewportClient::InputKey(EventArgs);
+
+                if (bWasSoftActive || bConsumedByGizmo)
                 {
                     bMarqueeActive = false;
                     bMarqueePending = false;
+                    Invalidate();
+                    return true;
                 }
-                else
+
+                if (bMarqueeActive)
                 {
-                FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags).SetRealtimeUpdate(IsRealtime()));
-                if (FSceneView* View = CalcSceneView(&ViewFamily))
-                {
-                    const FBox2D Rect(MarqueeStart, MarqueeCurrent);
-                    const bool bFullyContained = MarqueeCurrent.X >= MarqueeStart.X;
-                    if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin()) Pinned->BoxSelect(*View, Rect, IsShiftPressed(), bFullyContained);
+                    FSceneViewFamilyContext ViewFamily(
+                        FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
+                        .SetRealtimeUpdate(IsRealtime()));
+                    if (FSceneView* View = CalcSceneView(&ViewFamily))
+                    {
+                        const FBox2D Rect(MarqueeStart, MarqueeCurrent);
+                        const bool bFullyContained = MarqueeCurrent.X >= MarqueeStart.X;
+                        if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+                        {
+                            Pinned->BoxSelect(*View, Rect, IsShiftPressed(), bFullyContained);
+                        }
+                    }
+                    bMarqueeActive = false;
+                    bMarqueePending = false;
+                    Invalidate();
+                    return true;
                 }
-                bMarqueeActive = false;
+
                 bMarqueePending = false;
-                return true;
-                }
+                return bHandledByTools;
             }
             else if (EventArgs.Event == IE_Released)
             {
+                bMarqueeActive = false;
                 bMarqueePending = false;
             }
             else if (EventArgs.Event == IE_Pressed && IsCtrlPressed() && !IsAltPressed())
             {
-                FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags).SetRealtimeUpdate(IsRealtime()));
+                FSceneViewFamilyContext ViewFamily(
+                    FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
+                    .SetRealtimeUpdate(IsRealtime()));
                 if (FSceneView* View = CalcSceneView(&ViewFamily))
                 {
                     if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
@@ -143,12 +193,14 @@ public:
                         if (Pinned->GetSelectionMode() == ENGonElement::Edge && Id != INDEX_NONE)
                         {
                             Pinned->SelectEdgeLoop(Id, IsShiftPressed());
+                            Invalidate();
                             return true;
                         }
                     }
                 }
             }
         }
+
         if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
         {
             if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
@@ -180,7 +232,12 @@ public:
                 }
                 if (EventArgs.Key == EKeys::Delete || EventArgs.Key == EKeys::BackSpace)
                 {
-                    return Pinned->DeleteSelectedFaces();
+                    if (Pinned->DeleteSelectedFaces())
+                    {
+                        Invalidate();
+                        return true;
+                    }
+                    return false;
                 }
             }
         }
@@ -189,14 +246,45 @@ public:
 
     void MouseMove(FViewport* InViewport, int32 X, int32 Y) override
     {
-        if (!PreviewOwner->IsSoftTransformActive() && bMarqueePending && (bMarqueeActive || (InViewport && MarqueeStart != FVector2D(X, Y) &&
-            (FMath::Abs(X - MarqueeStart.X) + FMath::Abs(Y - MarqueeStart.Y) > 5.0))))
-        {
-            MarqueeCurrent = FVector2D(X, Y);
-            bMarqueeActive = true;
-            if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin()) Pinned->Invalidate();
-        }
+        // Forwards hover state to ModeTools so gizmo handles highlight under the cursor
         FEditorViewportClient::MouseMove(InViewport, X, Y);
+    }
+
+    void CapturedMouseMove(FViewport* InViewport, int32 InMouseX, int32 InMouseY) override
+    {
+        if (PreviewOwner->IsSoftTransformActive())
+        {
+            bMarqueeActive = false;
+            bMarqueePending = false;
+            FEditorViewportClient::CapturedMouseMove(InViewport, InMouseX, InMouseY);
+            Invalidate();
+            return;
+        }
+
+        if (bMarqueePending && !IsAltPressed())
+        {
+            const FVector2D Current(InMouseX, InMouseY);
+            if (bMarqueeActive || (InViewport && MarqueeStart != Current &&
+                (FMath::Abs(Current.X - MarqueeStart.X) + FMath::Abs(Current.Y - MarqueeStart.Y) > 5.0)))
+            {
+                MarqueeCurrent = Current;
+                bMarqueeActive = true;
+                Invalidate();
+            }
+            return;
+        }
+
+        FEditorViewportClient::CapturedMouseMove(InViewport, InMouseX, InMouseY);
+    }
+
+    bool InputAxis(const FInputKeyEventArgs& Args) override
+    {
+        // Prevent plain Left-Mouse-Drag (without Alt) from panning the camera during gizmo or marquee drags
+        if (!IsAltPressed() && (PreviewOwner->IsSoftTransformActive() || bMarqueePending || bMarqueeActive))
+        {
+            return true;
+        }
+        return FEditorViewportClient::InputAxis(Args);
     }
 
     void Draw(FViewport* InViewport, FCanvas* Canvas) override
@@ -224,6 +312,7 @@ private:
     FVector2D MarqueeCurrent = FVector2D::ZeroVector;
     bool bMarqueeActive = false;
     bool bMarqueePending = false;
+    bool bConsumedByGizmo = false;
 };
 }
 
@@ -260,6 +349,7 @@ void SNGonViewport::FrameMesh()
         {
             FromTarget = FVector(-1.0, -0.25, 0.30);
         }
+
         const double Distance = FMath::Max(Size.Size() * 1.35, 35.0);
         const FVector Location = Center + FromTarget.GetSafeNormal() * Distance;
         const TSharedPtr<FEditorViewportClient> ViewportClient = GetViewportClient();
@@ -281,6 +371,7 @@ void SNGonViewport::SetSelectionMode(ENGonElement Element)
     {
         SelectionMode = Element;
         PreviewScene->ClearSelection();
+        Invalidate();
     }
 }
 
@@ -288,32 +379,44 @@ void SNGonViewport::ToggleHeatmap()
 {
     bHeatmapVisible = !bHeatmapVisible;
     PreviewScene->SetHeatmapVisible(bHeatmapVisible);
+    Invalidate();
 }
 
 void SNGonViewport::SetHeatmapVisible(bool bVisible)
 {
     bHeatmapVisible = bVisible;
     PreviewScene->SetHeatmapVisible(bVisible);
+    Invalidate();
 }
 
 int32 SNGonViewport::Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd)
 {
-    return PreviewScene->Pick(SelectionMode, View, Cursor, bAdd);
+    const int32 Id = PreviewScene->Pick(SelectionMode, View, Cursor, bAdd);
+    Invalidate();
+    return Id;
 }
 
 void SNGonViewport::BoxSelect(const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained)
 {
     PreviewScene->BoxSelect(SelectionMode, View, ScreenRect, bAdd, bFullyContained);
+    Invalidate();
 }
 
 bool SNGonViewport::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
 {
-    return PreviewScene->SelectEdgeLoop(StartEdgeId, bAdd);
+    const bool bSelected = PreviewScene->SelectEdgeLoop(StartEdgeId, bAdd);
+    Invalidate();
+    return bSelected;
 }
 
 bool SNGonViewport::DeleteSelectedFaces()
 {
-    return PreviewScene->DeleteSelectedFaces();
+    const bool bDeleted = PreviewScene->DeleteSelectedFaces();
+    if (bDeleted)
+    {
+        Invalidate();
+    }
+    return bDeleted;
 }
 
 void SNGonPreview::Construct(const FArguments& InArgs)
@@ -405,7 +508,7 @@ TSharedRef<SWidget> SNGonPreview::MakeSelectionMode(ENGonElement Element, const 
     return SNew(SCheckBox)
         .IsChecked_Lambda([this, Element]
         {
-            return SelectionMode == Element ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+            return Viewport->GetSelectionMode() == Element ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
         })
         .OnCheckStateChanged_Lambda([this, Element](ECheckBoxState)
         {
@@ -453,6 +556,7 @@ TSharedRef<SWidget> SNGonPreview::MakeControls()
             .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
             {
                 Viewport->Preview().SetShowEdges(State == ECheckBoxState::Checked);
+                Viewport->Invalidate();
             })
             [
                 SNew(STextBlock).Text(LOCTEXT("Edges", "Show Edges"))
@@ -464,6 +568,7 @@ TSharedRef<SWidget> SNGonPreview::MakeControls()
             .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
             {
                 Viewport->Preview().SetShowVertices(State == ECheckBoxState::Checked);
+                Viewport->Invalidate();
             })
             [
                 SNew(STextBlock).Text(LOCTEXT("Vertices", "Show Vertices"))
@@ -505,6 +610,7 @@ TSharedRef<SWidget> SNGonPreview::MakeSliders()
                 {
                     HeatBias = Value;
                     Viewport->Preview().SetHeatBias(Value);
+                    Viewport->Invalidate();
                 })
             ]
         ]
@@ -522,12 +628,13 @@ TSharedRef<SWidget> SNGonPreview::MakeSliders()
                 {
                     Bend = Value;
                     Viewport->Preview().SetBend(Value);
+                    Viewport->Invalidate();
                 })
             ]
         ]
         + SWrapBox::Slot()
         [
-            SNew(STextBlock).Text(LOCTEXT("Controls", "1 vertex  ·  2 edge  ·  3 face  ·  H heatmap  ·  F frame  ·  Shift-click/add marquee  ·  Ctrl-click edge loop  ·  Alt + drag orbit"))
+            SNew(STextBlock).Text(LOCTEXT("Controls", "1 vertex     2 edge     3 face     Del delete face     H heatmap     F frame     Shift-click/add marquee     Ctrl-click edge loop     Alt + drag orbit"))
         ];
 }
 
@@ -541,6 +648,7 @@ void SNGonPreview::ApplySoftSelectionSettings()
     Settings.SurfaceBlend = FMath::Clamp(static_cast<double>(SoftSurfaceBlend), 0.0, 1.0);
     Viewport->Preview().SetSoftTransformMode(SoftMode);
     Viewport->Preview().SetSoftSelection(Settings);
+    Viewport->Invalidate();
 }
 
 TSharedRef<SWidget> SNGonPreview::MakeSoftSelectionControls()
@@ -835,6 +943,7 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName)
     HeatBias = 0.0f;
     Bend = 0.0f;
     Viewport->SetMesh(MoveTemp(Data));
+    ApplySoftSelectionSettings();
 }
 
 void SNGonPreview::ShowError(const FText& Error)
