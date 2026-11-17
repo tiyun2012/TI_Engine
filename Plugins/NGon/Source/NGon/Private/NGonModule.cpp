@@ -3,6 +3,7 @@
 #include "Framework/Docking/TabManager.h"
 #include "Modules/ModuleManager.h"
 #include "SNGonPreview.h"
+#include "NGonUVEditor.h"
 #include "ToolMenus.h"
 #include "Widgets/Docking/SDockTab.h"
 
@@ -11,6 +12,7 @@
 namespace
 {
 const FName PreviewTabName(TEXT("NGonViewport"));
+const FName UVEditorTabName(TEXT("NGonUVEditor"));
 }
 
 class FNGonModule final : public IModuleInterface
@@ -26,6 +28,10 @@ public:
         FGlobalTabmanager::Get()->RegisterNomadTabSpawner(
             PreviewTabName, FOnSpawnTab::CreateRaw(this, &FNGonModule::SpawnTab))
             .SetDisplayName(LOCTEXT("TabTitle", "N-Gon"))
+            .SetMenuType(ETabSpawnerMenuType::Hidden);
+        FGlobalTabmanager::Get()->RegisterNomadTabSpawner(
+            UVEditorTabName, FOnSpawnTab::CreateRaw(this, &FNGonModule::SpawnUVTab))
+            .SetDisplayName(LOCTEXT("UVTabTitle", "N-Gon UV Editor"))
             .SetMenuType(ETabSpawnerMenuType::Hidden);
 
         UToolMenus::RegisterStartupCallback(
@@ -43,6 +49,7 @@ public:
                 Tab->RequestCloseTab();
             }
             FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(PreviewTabName);
+            FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(UVEditorTabName);
         }
     }
 
@@ -62,6 +69,14 @@ private:
             {
                 FGlobalTabmanager::Get()->TryInvokeTab(PreviewTabName);
             })));
+        Section.AddMenuEntry(TEXT("OpenNGonUV"),
+            LOCTEXT("OpenUVEditor", "N-Gon UV Editor"),
+            LOCTEXT("OpenUVEditorTooltip", "Edit and inspect the mesh UV layout with corner, edge, face and island tools."),
+            FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([]
+            {
+                FGlobalTabmanager::Get()->TryInvokeTab(UVEditorTabName);
+            })));
     }
 
     TSharedRef<SDockTab> SpawnTab(const FSpawnTabArgs&)
@@ -72,6 +87,14 @@ private:
             ];
         LiveTab = Tab;
         return Tab;
+    }
+
+    TSharedRef<SDockTab> SpawnUVTab(const FSpawnTabArgs&)
+    {
+        return SNew(SDockTab).TabRole(ETabRole::NomadTab)
+            [
+                SNew(SNGonUVEditor)
+            ];
     }
 
     TWeakPtr<SDockTab> LiveTab;

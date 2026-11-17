@@ -465,6 +465,7 @@ TSharedRef<FEditorViewportClient> SNGonViewport::MakeEditorViewportClient()
 
 void SNGonViewport::SetMesh(FNGonMeshData&& Data)
 {
+    bHeatmapVisible = false;
     PreviewScene->SetMesh(MoveTemp(Data));
     FrameMesh();
 }
@@ -507,27 +508,44 @@ void SNGonViewport::SetSelectionMode(ENGonElement Element)
     {
         SelectionMode = Element;
         PreviewScene->ClearSelection();
+        SetHeatmapVisible(false);
         Invalidate();
     }
 }
 
 void SNGonViewport::ToggleHeatmap()
 {
+    if (!PreviewScene->HasSoftSelectionInfluence())
+    {
+        bHeatmapVisible = false;
+        PreviewScene->SetHeatmapVisible(false);
+        Invalidate();
+        return;
+    }
     bHeatmapVisible = !bHeatmapVisible;
     PreviewScene->SetHeatmapVisible(bHeatmapVisible);
     Invalidate();
 }
 
+bool SNGonViewport::IsHeatmapVisible() const
+{
+    return bHeatmapVisible && PreviewScene.IsValid() && PreviewScene->HasSoftSelectionInfluence();
+}
+
 void SNGonViewport::SetHeatmapVisible(bool bVisible)
 {
-    bHeatmapVisible = bVisible;
-    PreviewScene->SetHeatmapVisible(bVisible);
+    bHeatmapVisible = bVisible && PreviewScene->HasSoftSelectionInfluence();
+    PreviewScene->SetHeatmapVisible(bHeatmapVisible);
     Invalidate();
 }
 
 int32 SNGonViewport::Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd)
 {
     const int32 Id = PreviewScene->Pick(SelectionMode, View, Cursor, bAdd);
+    if (!PreviewScene->HasSoftSelectionInfluence())
+    {
+        SetHeatmapVisible(false);
+    }
     Invalidate();
     return Id;
 }
@@ -535,12 +553,20 @@ int32 SNGonViewport::Pick(const FSceneView& View, const FVector2D& Cursor, bool 
 void SNGonViewport::BoxSelect(const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained)
 {
     PreviewScene->BoxSelect(SelectionMode, View, ScreenRect, bAdd, bFullyContained);
+    if (!PreviewScene->HasSoftSelectionInfluence())
+    {
+        SetHeatmapVisible(false);
+    }
     Invalidate();
 }
 
 bool SNGonViewport::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
 {
     const bool bSelected = PreviewScene->SelectEdgeLoop(StartEdgeId, bAdd);
+    if (!PreviewScene->HasSoftSelectionInfluence())
+    {
+        SetHeatmapVisible(false);
+    }
     Invalidate();
     return bSelected;
 }
@@ -550,6 +576,10 @@ bool SNGonViewport::DeleteSelectedFaces()
     const bool bDeleted = PreviewScene->DeleteSelectedFaces();
     if (bDeleted)
     {
+        if (!PreviewScene->HasSoftSelectionInfluence())
+        {
+            SetHeatmapVisible(false);
+        }
         Invalidate();
     }
     return bDeleted;
@@ -678,6 +708,25 @@ TSharedRef<SWidget> SNGonPreview::MakeControls()
         ]
         + SWrapBox::Slot()
         [
+            SNew(SCheckBox)
+            .IsChecked_Lambda([this]
+            {
+                return Viewport->Preview().GetGizmoFramePolicy() == ENGonGizmoFramePolicy::ActiveElement
+                    ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+            })
+            .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+            {
+                Viewport->Preview().SetGizmoFramePolicy(
+                    State == ECheckBoxState::Checked ? ENGonGizmoFramePolicy::ActiveElement
+                        : ENGonGizmoFramePolicy::WeightedAverage);
+                Viewport->Invalidate();
+            })
+            [
+                SNew(STextBlock).Text(LOCTEXT("ActiveFrame", "Active Frame"))
+            ]
+        ]
+        + SWrapBox::Slot()
+        [
             SNew(SButton)
             .Text(LOCTEXT("DeleteFaces", "Delete Faces"))
             .OnClicked_Lambda([this]
@@ -714,13 +763,14 @@ TSharedRef<SWidget> SNGonPreview::MakeControls()
         [
             SNew(SCheckBox)
             .IsChecked_Lambda([this] { return Viewport->IsHeatmapVisible() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .IsEnabled_Lambda([this] { return Viewport->Preview().HasSoftSelectionInfluence(); })
             .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
             {
                 bShowHeatmap = State == ECheckBoxState::Checked;
                 Viewport->SetHeatmapVisible(bShowHeatmap);
             })
             [
-                SNew(STextBlock).Text(LOCTEXT("Heatmap", "Heatmap"))
+                SNew(STextBlock).Text(LOCTEXT("SoftHeatmap", "Soft Heatmap"))
             ]
         ];
 }
@@ -730,26 +780,6 @@ TSharedRef<SWidget> SNGonPreview::MakeSliders()
     return SNew(SWrapBox)
         .UseAllottedSize(true)
         .InnerSlotPadding(FVector2D(10, 4))
-        + SWrapBox::Slot()
-        [
-            SNew(STextBlock).Text(LOCTEXT("HeatBias", "Heat Bias"))
-        ]
-        + SWrapBox::Slot()
-        [
-            SNew(SBox).WidthOverride(135)
-            [
-                SNew(SSlider)
-                .MinValue(-0.5f).MaxValue(0.5f)
-                .IsEnabled_Lambda([this] { return Viewport->IsHeatmapVisible(); })
-                .Value_Lambda([this] { return HeatBias; })
-                .OnValueChanged_Lambda([this](float Value)
-                {
-                    HeatBias = Value;
-                    Viewport->Preview().SetHeatBias(Value);
-                    Viewport->Invalidate();
-                })
-            ]
-        ]
         + SWrapBox::Slot()
         [
             SNew(STextBlock).Text(LOCTEXT("Bend", "Bend"))
@@ -770,7 +800,7 @@ TSharedRef<SWidget> SNGonPreview::MakeSliders()
         ]
         + SWrapBox::Slot()
         [
-            SNew(STextBlock).Text(LOCTEXT("Controls", "1 vertex     2 edge     3 face     Del delete face     H heatmap     F frame     Shift-click/add marquee     Ctrl-click edge loop     Alt + drag orbit"))
+            SNew(STextBlock).Text(LOCTEXT("Controls", "1 vertex     2 edge     3 face     Del delete face     H soft heatmap     F frame     Shift-click/add marquee     Ctrl-click edge loop     Alt + drag orbit"))
         ];
 }
 
@@ -784,6 +814,11 @@ void SNGonPreview::ApplySoftSelectionSettings()
     Settings.SurfaceBlend = FMath::Clamp(static_cast<double>(SoftSurfaceBlend), 0.0, 1.0);
     Viewport->Preview().SetSoftTransformMode(SoftMode);
     Viewport->Preview().SetSoftSelection(Settings);
+    if (!Viewport->Preview().HasSoftSelectionInfluence())
+    {
+        bShowHeatmap = false;
+        Viewport->SetHeatmapVisible(false);
+    }
     Viewport->Invalidate();
 }
 
@@ -1076,6 +1111,7 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName)
 {
     SourceLabel = SourceName;
     ErrorText = FText::GetEmpty();
+    bShowHeatmap = false;
     HeatBias = 0.0f;
     Bend = 0.0f;
     Viewport->SetMesh(MoveTemp(Data));

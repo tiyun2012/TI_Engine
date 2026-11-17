@@ -22,19 +22,22 @@ N-Gon is a project-local C++ editor plugin for picking authored polygons, edges 
 | **Open FBX** | Opens a browser in `Meshes` when that folder exists. Choose another raw FBX to preview. |
 | **Static Mesh** | Choose an Unreal asset to inspect its editable LOD 0. Use the raw FBX for polygons that the Unreal import already triangulated. |
 | **Face / Edge / Vertex** | Click to select. Shift-click adds to the active selection. A face highlights all its underlying triangles. |
+| **Gizmo frame** | The gizmo follows the selected component like Maya/TiGUI: faces use centroid + normal + perimeter tangent, edges use midpoint + edge direction + adjacent normal, and vertices use incident-face normals. Multiple components use weighted averages. Enable **Active Frame** to pivot/orient from the active component. |
 | **Delete Faces** | In Face mode, select one or more faces and click **Delete Faces** or press **Delete/Backspace**. The preview rebuilds the remaining authored polygons, refreshes picking/overlays/gizmo state, and refuses to delete the final face. |
-| **Heatmap / Heat Bias** | Scrub the heat value and watch the **Colors** counter. FBX red values of zero stay zero at neutral bias. |
+| **Soft Heatmap** | Enable Soft Selection, select a face, edge, or vertex, then toggle Soft Heatmap. The surface uses the same blue-to-green-to-orange influence ramp as the soft-selection markers; changing radius, metric, connectivity, or gizmo deformation updates it. |
 | **Bend** | Scrub the position test and check that surface picking and visible overlays follow it. The **Positions** counter advances. |
 | **Load Demo** | Check for 3 faces, 8 triangles, 12 edges and 10 logical vertices. Click both sides of the hidden diagonal in a face, then click inside the concave notch to test a miss. |
 
-Use Alt + left drag to orbit, scroll to zoom, and **Frame Mesh** to reset the camera.
+Choose **Window → N-Gon UV Editor** to open the native Slate UV editor. It reads the primary UV overlay from the same raw FBX/default mesh and keeps overlay element IDs intact, so authored seams remain separate UV corners. Corner, edge, face and island modes support Shift-add and Ctrl marquee selection; left-drag moves the selected UVs, middle/right drag pans, and the wheel zooms around the cursor. The toolbar provides Fit, 90-degree rotation, Flip U/V, Normalize and Reload. The grid, UV triangle outlines, corner markers, selected highlighting and status line provide the same inspection feedback as the TiGUI UV canvas.
+
+Use Alt + left drag to orbit, scroll to zoom, and **Frame Mesh** to reset the camera. Translate, rotate, and scale with the gizmo; the frame is frozen at gesture start so soft selection remains stable through the drag.
 
 ## FBX export and preview
 
 - In Maya or your DCC, export the original polygon geometry with **Triangulate** disabled. Each polygon needs a simple perimeter. The loader reports when the file contains triangle faces only.
 - The loader applies FBX node and geometric transforms and converts the result to Z-up centimeters. The viewport combines the polygon mesh nodes in the file into a single preview.
-- The first vertex color layer's red channel drives the scalar heatmap. Direct and indexed colors by control point or polygon corner are supported. Where corners share a vertex, the plugin averages their valid red samples. Missing samples use a gradient along the mesh's longest axis.
-- FBX previews use the editor's preview material. Skin deformation, animation, source materials and source UV display are outside this build.
+- The first vertex color layer's red channel is imported as source metadata for compatibility. The viewport heatmap is driven by active soft-selection influence, so it follows the selected seeds and the current radius, metric, connectivity, and transform mode. Missing source samples still use a longest-axis fallback for inspection data.
+- FBX previews use the editor's preview material. Skin deformation, animation and source materials are outside this build. UV edits are held in the editor document for the active UV tab; use Reload to restore the source mesh.
 
 ## Why the update uses these APIs
 
