@@ -1,0 +1,17 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "0.1.0",
+    "FriendlyName": "Ti Paint",
+    "Description": "Layered texture painting editor ported from TiGUI.",
+    "Category": "Editor",
+    "EnabledByDefault": true,
+    "CanContainContent": false,
+    "Modules": [
+        {
+            "Name": "TiPaint",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ]
+}

@@ -33,6 +33,10 @@
 		{
 			"Name": "NGon",
 			"Enabled": true
+		},
+		{
+			"Name": "TiPaint",
+			"Enabled": true
 		}
 	],
 	"TargetPlatforms": [],
