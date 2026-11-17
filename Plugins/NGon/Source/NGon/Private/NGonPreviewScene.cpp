@@ -17,7 +17,10 @@
 #include "BaseGizmos/GizmoViewContext.h"
 #include "BaseGizmos/TransformGizmoUtil.h"
 #include "BaseGizmos/TransformProxy.h"
+#include "BaseGizmos/ViewAdjustedStaticMeshGizmoComponent.h"
+#include "Engine/StaticMesh.h"
 #include "InteractiveGizmoManager.h"
+#include "PhysicsEngine/BodySetup.h"
 
 using namespace UE::Geometry;
 
@@ -28,6 +31,169 @@ namespace
 const FColor EdgeColor(80, 224, 246);
 const FColor PointColor(230, 249, 255);
 const FColor SelectionColor(255, 181, 65);
+
+struct FNGonSceneAccel
+{
+    int32 CachedNGonCount = 0;
+    bool bShowEdges = true;
+    bool bShowVertices = true;
+    bool bEdgesOverlayDirty = false;
+    bool bVerticesOverlayDirty = false;
+    int32 CachedSoftPointCount = 0;
+
+    // CSR mapping: logical vertex -> dynamic mesh vertex IDs
+    TArray<int32> LogicalToDynamicOffsets;
+    TArray<int32> LogicalToDynamicVertices;
+
+    // CSR mapping: logical vertex -> incident edge indices
+    TArray<int32> LogicalToEdgeOffsets;
+    TArray<int32> LogicalToEdges;
+
+    // CSR mapping: logical vertex -> ColorElements indices
+    TArray<int32> LogicalToColorOffsets;
+    TArray<int32> LogicalToColorElements;
+
+    // Stamp buffers for zero-allocation partial updates during gizmo drags
+    int32 Stamp = 1;
+    TArray<int32> VertexStamp;
+    TArray<int32> EdgeStamp;
+    TArray<int32> DirtyVertices;
+    TArray<int32> DirtyEdges;
+    TArray<int32> PreviousSessionVertices;
+
+    int32 NextStamp()
+    {
+        ++Stamp;
+        if (Stamp <= 0)
+        {
+            Stamp = 1;
+            FMemory::Memzero(VertexStamp.GetData(), VertexStamp.Num() * sizeof(int32));
+            FMemory::Memzero(EdgeStamp.GetData(), EdgeStamp.Num() * sizeof(int32));
+        }
+        return Stamp;
+    }
+
+    void BuildTopologyTables(const FNGonTopology& Topology, const FDynamicMesh3& Mesh)
+    {
+        const int32 LogicalCount = Topology.RestPositions.Num();
+        CachedNGonCount = 0;
+        for (const TPair<int32, FNGonFace>& Pair : Topology.Faces)
+        {
+            if (Pair.Value.Perimeter.Num() > 4)
+            {
+                ++CachedNGonCount;
+            }
+        }
+
+        // 1. Logical -> Dynamic vertices CSR
+        LogicalToDynamicOffsets.Init(0, LogicalCount + 1);
+        for (const int32 DynVert : Mesh.VertexIndicesItr())
+        {
+            const int32 LogicalId = Topology.DynamicToLogicalVertex.IsValidIndex(DynVert)
+                ? Topology.DynamicToLogicalVertex[DynVert] : INDEX_NONE;
+            if (LogicalId >= 0 && LogicalId < LogicalCount)
+            {
+                ++LogicalToDynamicOffsets[LogicalId + 1];
+            }
+        }
+        for (int32 i = 0; i < LogicalCount; ++i)
+        {
+            LogicalToDynamicOffsets[i + 1] += LogicalToDynamicOffsets[i];
+        }
+        LogicalToDynamicVertices.SetNumUninitialized(LogicalToDynamicOffsets[LogicalCount]);
+        {
+            TArray<int32> Cursor = LogicalToDynamicOffsets;
+            for (const int32 DynVert : Mesh.VertexIndicesItr())
+            {
+                const int32 LogicalId = Topology.DynamicToLogicalVertex.IsValidIndex(DynVert)
+                    ? Topology.DynamicToLogicalVertex[DynVert] : INDEX_NONE;
+                if (LogicalId >= 0 && LogicalId < LogicalCount)
+                {
+                    LogicalToDynamicVertices[Cursor[LogicalId]++] = DynVert;
+                }
+            }
+        }
+
+        // 2. Logical -> Incident Edges CSR
+        const int32 EdgeCount = Topology.Edges.Num();
+        LogicalToEdgeOffsets.Init(0, LogicalCount + 1);
+        for (int32 EdgeIdx = 0; EdgeIdx < EdgeCount; ++EdgeIdx)
+        {
+            const FIntPoint Edge = Topology.Edges[EdgeIdx];
+            if (Edge.X >= 0 && Edge.X < LogicalCount)
+            {
+                ++LogicalToEdgeOffsets[Edge.X + 1];
+            }
+            if (Edge.Y >= 0 && Edge.Y < LogicalCount && Edge.Y != Edge.X)
+            {
+                ++LogicalToEdgeOffsets[Edge.Y + 1];
+            }
+        }
+        for (int32 i = 0; i < LogicalCount; ++i)
+        {
+            LogicalToEdgeOffsets[i + 1] += LogicalToEdgeOffsets[i];
+        }
+        LogicalToEdges.SetNumUninitialized(LogicalToEdgeOffsets[LogicalCount]);
+        {
+            TArray<int32> Cursor = LogicalToEdgeOffsets;
+            for (int32 EdgeIdx = 0; EdgeIdx < EdgeCount; ++EdgeIdx)
+            {
+                const FIntPoint Edge = Topology.Edges[EdgeIdx];
+                if (Edge.X >= 0 && Edge.X < LogicalCount)
+                {
+                    LogicalToEdges[Cursor[Edge.X]++] = EdgeIdx;
+                }
+                if (Edge.Y >= 0 && Edge.Y < LogicalCount && Edge.Y != Edge.X)
+                {
+                    LogicalToEdges[Cursor[Edge.Y]++] = EdgeIdx;
+                }
+            }
+        }
+
+        VertexStamp.Init(0, LogicalCount);
+        EdgeStamp.Init(0, EdgeCount);
+        DirtyVertices.Reset();
+        DirtyEdges.Reset();
+        PreviousSessionVertices.Reset();
+        bEdgesOverlayDirty = false;
+        bVerticesOverlayDirty = false;
+        CachedSoftPointCount = 0;
+    }
+
+    void BuildColorTables(int32 LogicalCount, int32 NumColorElements, TFunctionRef<int32(int32)> GetLogicalVertex)
+    {
+        LogicalToColorOffsets.Init(0, LogicalCount + 1);
+        for (int32 ElemIdx = 0; ElemIdx < NumColorElements; ++ElemIdx)
+        {
+            const int32 LogicalId = GetLogicalVertex(ElemIdx);
+            if (LogicalId >= 0 && LogicalId < LogicalCount)
+            {
+                ++LogicalToColorOffsets[LogicalId + 1];
+            }
+        }
+        for (int32 i = 0; i < LogicalCount; ++i)
+        {
+            LogicalToColorOffsets[i + 1] += LogicalToColorOffsets[i];
+        }
+        LogicalToColorElements.SetNumUninitialized(LogicalToColorOffsets[LogicalCount]);
+        TArray<int32> Cursor = LogicalToColorOffsets;
+        for (int32 ElemIdx = 0; ElemIdx < NumColorElements; ++ElemIdx)
+        {
+            const int32 LogicalId = GetLogicalVertex(ElemIdx);
+            if (LogicalId >= 0 && LogicalId < LogicalCount)
+            {
+                LogicalToColorElements[Cursor[LogicalId]++] = ElemIdx;
+            }
+        }
+    }
+};
+
+TMap<const FNGonPreviewScene*, FNGonSceneAccel> GSceneAccelMap;
+
+FNGonSceneAccel& GetSceneAccel(const FNGonPreviewScene* Scene)
+{
+    return GSceneAccelMap.FindOrAdd(Scene);
+}
 
 void BindGizmoActorViewContext(UCombinedTransformGizmo* TransformGizmo, UInteractiveGizmoManager* GizmoManager, bool bMarkRenderStateDirty)
 {
@@ -59,7 +225,36 @@ void BindGizmoActorViewContext(UCombinedTransformGizmo* TransformGizmo, UInterac
                 Comp->SetGizmoViewContext(ViewContext);
                 if (bMarkRenderStateDirty)
                 {
+                    Comp->NotifyExternalPropertyUpdates();
                     Comp->MarkRenderStateDirty();
+                }
+            }
+        }
+
+        // In UE 5.5–5.8, ACombinedTransformGizmoActor uses UViewAdjustedStaticMeshGizmoComponent
+        // (which inherits from UStaticMeshComponent, not UGizmoBaseComponent) for its handles.
+        // Ensure both GizmoViewContext and physics collision state are initialized for line traces.
+        TInlineComponentArray<UViewAdjustedStaticMeshGizmoComponent*> ViewAdjustedComponents(GizmoActor);
+        for (UViewAdjustedStaticMeshGizmoComponent* ViewComp : ViewAdjustedComponents)
+        {
+            if (ViewComp)
+            {
+                ViewComp->SetGizmoViewContext(ViewContext);
+                if (bMarkRenderStateDirty)
+                {
+                    if (UStaticMesh* StaticMesh = ViewComp->GetStaticMesh())
+                    {
+                        if (UBodySetup* BodySetup = StaticMesh->GetBodySetup())
+                        {
+                            BodySetup->CreatePhysicsMeshes();
+                        }
+                    }
+                    if (ViewComp->GetCollisionEnabled() == ECollisionEnabled::NoCollision)
+                    {
+                        ViewComp->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+                    }
+                    ViewComp->RecreatePhysicsState();
+                    ViewComp->MarkRenderStateDirty();
                 }
             }
         }
@@ -100,8 +295,10 @@ UMaterial* MakeSurfaceMaterial()
 }
 
 FNGonPreviewScene::FNGonPreviewScene()
-    : Scene(FPreviewScene::ConstructionValues().SetCreatePhysicsScene(false))
+    : Scene(FPreviewScene::ConstructionValues().SetCreatePhysicsScene(true))
 {
+    GetSceneAccel(this);
+
     Surface = NewObject<UDynamicMeshComponent>(GetTransientPackage(), NAME_None, RF_Transient);
     Surface->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     Surface->SetCastShadow(false);
@@ -122,6 +319,7 @@ FNGonPreviewScene::FNGonPreviewScene()
 
 FNGonPreviewScene::~FNGonPreviewScene()
 {
+    GSceneAccelMap.Remove(this);
     TeardownGizmo();
     Picker.SetMesh(nullptr);
     Overlay->Disconnect();
@@ -134,11 +332,14 @@ void FNGonPreviewScene::SetupGizmo(UInteractiveGizmoManager* InGizmoManager, ITo
     GizmoManager = InGizmoManager;
     if (!GizmoManager) return;
     TransformProxy = NewObject<UTransformProxy>(GizmoManager);
-    // UInteractiveGizmoManager registers its built-in builders during tools
-    // context initialization. Use that manager API directly; the namespace
-    // utility is for the separate UCombinedTransformGizmoContextObject path
-    // and can assert when the editor context has not installed that helper.
-    TransformGizmo = GizmoManager->Create3AxisTransformGizmo(this, TEXT("NGonPreview"));
+    // Use UE::TransformGizmoUtil::Create3AxisTransformGizmo first (backed by the
+    // registered UCombinedTransformGizmoContextObject and UGizmoViewContext),
+    // falling back to GizmoManager->Create3AxisTransformGizmo if needed.
+    TransformGizmo = UE::TransformGizmoUtil::Create3AxisTransformGizmo(GizmoManager, this, TEXT("NGonPreview"));
+    if (!TransformGizmo)
+    {
+        TransformGizmo = GizmoManager->Create3AxisTransformGizmo(this, TEXT("NGonPreview"));
+    }
     if (!TransformGizmo) { TransformProxy = nullptr; return; }
 
     TransformProxy->SetTransform(GetSelectionGizmoTransform());
@@ -152,8 +353,6 @@ void FNGonPreviewScene::SetupGizmo(UInteractiveGizmoManager* InGizmoManager, ITo
         if (!bUpdatingGizmo) EndSoftTransform();
     });
     TransformGizmo->SetActiveTarget(TransformProxy, TransactionProvider);
-    // GizmoActor and its UGizmoBaseComponents are spawned inside SetActiveTarget,
-    // so bind UGizmoViewContext and refresh component proxies after SetActiveTarget.
     BindGizmoActorViewContext(TransformGizmo, GizmoManager, true);
     UpdateGizmo();
 }
@@ -307,6 +506,13 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
     SoftHeatSamples.Init(0.0f, Positions.Num());
 
     InitializeColorOverlay(Data.Mesh);
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    Accel.BuildTopologyTables(Topology, Data.Mesh);
+    Accel.BuildColorTables(Positions.Num(), ColorElements.Num(), [this](int32 ElemIdx)
+    {
+        return ColorElements[ElemIdx].LogicalVertex;
+    });
+
     Surface->SetMesh(MoveTemp(Data.Mesh));
     Picker.SetMesh(Surface->GetDynamicMesh()->GetMeshPtr());
     RebuildOverlays();
@@ -416,25 +622,47 @@ void FNGonPreviewScene::RebuildOverlays()
 
     EdgeLines->AddLines(Starts, Ends, EdgeColor, 1.6f, 0.35f);
     VertexPoints->AddPoints(Positions, PointColor, 5.0f, 0.6f);
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    Accel.bEdgesOverlayDirty = false;
+    Accel.bVerticesOverlayDirty = false;
     DrawSelection();
     DrawSoftSelection();
 }
 
 void FNGonPreviewScene::UpdateOverlayPositions()
 {
-    for (int32 EdgeIndex = 0; EdgeIndex < Topology.Edges.Num(); ++EdgeIndex)
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    if (Accel.bShowEdges)
     {
-        const FIntPoint Edge = Topology.Edges[EdgeIndex];
-        if (Positions.IsValidIndex(Edge.X) && Positions.IsValidIndex(Edge.Y))
+        for (int32 EdgeIndex = 0; EdgeIndex < Topology.Edges.Num(); ++EdgeIndex)
         {
-            EdgeLines->SetLineStart(EdgeIndex, Positions[Edge.X]);
-            EdgeLines->SetLineEnd(EdgeIndex, Positions[Edge.Y]);
+            const FIntPoint Edge = Topology.Edges[EdgeIndex];
+            if (Positions.IsValidIndex(Edge.X) && Positions.IsValidIndex(Edge.Y))
+            {
+                EdgeLines->SetLineStart(EdgeIndex, Positions[Edge.X]);
+                EdgeLines->SetLineEnd(EdgeIndex, Positions[Edge.Y]);
+            }
         }
+        Accel.bEdgesOverlayDirty = false;
     }
-    for (int32 VertexIndex = 0; VertexIndex < Positions.Num(); ++VertexIndex)
+    else
     {
-        VertexPoints->SetPointPosition(VertexIndex, Positions[VertexIndex]);
+        Accel.bEdgesOverlayDirty = true;
     }
+
+    if (Accel.bShowVertices)
+    {
+        for (int32 VertexIndex = 0; VertexIndex < Positions.Num(); ++VertexIndex)
+        {
+            VertexPoints->SetPointPosition(VertexIndex, Positions[VertexIndex]);
+        }
+        Accel.bVerticesOverlayDirty = false;
+    }
+    else
+    {
+        Accel.bVerticesOverlayDirty = true;
+    }
+
     DrawSelection();
     DrawSoftSelection();
 }
@@ -445,14 +673,21 @@ void FNGonPreviewScene::DrawSoftSelection()
     {
         return;
     }
-    SoftInfluencePoints->Clear();
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
     const bool bVisible = SoftSettings.bEnabled && !SoftInfluences.IsEmpty();
     SoftInfluencePoints->SetVisibility(bVisible);
     if (!bVisible)
     {
+        if (Accel.CachedSoftPointCount > 0)
+        {
+            SoftInfluencePoints->Clear();
+            Accel.CachedSoftPointCount = 0;
+        }
         return;
     }
 
+    SoftInfluencePoints->Clear();
+    int32 AddedCount = 0;
     for (const FNGonVertexInfluence& Influence : SoftInfluences)
     {
         if (!Positions.IsValidIndex(Influence.Vertex))
@@ -463,16 +698,43 @@ void FNGonPreviewScene::DrawSoftSelection()
         const FLinearColor Color = FLinearColor::LerpUsingHSV(
             FLinearColor(0.04f, 0.35f, 1.0f), FLinearColor(1.0f, 0.12f, 0.02f), Weight);
         SoftInfluencePoints->AddPoint(Positions[Influence.Vertex], Color.ToFColor(true), 5.0f + 8.0f * Weight, 1.8f);
+        ++AddedCount;
     }
+    Accel.CachedSoftPointCount = AddedCount;
 }
 
 void FNGonPreviewScene::SetShowEdges(bool bShow)
 {
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    Accel.bShowEdges = bShow;
+    if (bShow && Accel.bEdgesOverlayDirty)
+    {
+        for (int32 EdgeIndex = 0; EdgeIndex < Topology.Edges.Num(); ++EdgeIndex)
+        {
+            const FIntPoint Edge = Topology.Edges[EdgeIndex];
+            if (Positions.IsValidIndex(Edge.X) && Positions.IsValidIndex(Edge.Y))
+            {
+                EdgeLines->SetLineStart(EdgeIndex, Positions[Edge.X]);
+                EdgeLines->SetLineEnd(EdgeIndex, Positions[Edge.Y]);
+            }
+        }
+        Accel.bEdgesOverlayDirty = false;
+    }
     EdgeLines->SetVisibility(bShow);
 }
 
 void FNGonPreviewScene::SetShowVertices(bool bShow)
 {
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    Accel.bShowVertices = bShow;
+    if (bShow && Accel.bVerticesOverlayDirty)
+    {
+        for (int32 VertexIndex = 0; VertexIndex < Positions.Num(); ++VertexIndex)
+        {
+            VertexPoints->SetPointPosition(VertexIndex, Positions[VertexIndex]);
+        }
+        Accel.bVerticesOverlayDirty = false;
+    }
     VertexPoints->SetVisibility(bShow);
 }
 
@@ -791,30 +1053,218 @@ bool FNGonPreviewScene::BeginSoftTransform(const FTransform& GizmoTransform, ENG
     }
 
     ActiveGizmoTransform = GizmoTransform;
-    return SoftSession.Begin(Topology, Positions, Seeds, FTransform::Identity, GizmoTransform, SoftSettings, Mode);
+    const bool bStarted = SoftSession.Begin(Topology, Positions, Seeds, FTransform::Identity, GizmoTransform, SoftSettings, Mode);
+    if (bStarted)
+    {
+        SoftInfluences = SoftSession.Influences();
+        FNGonSceneAccel& Accel = GetSceneAccel(this);
+        Accel.PreviousSessionVertices.Reset(SoftInfluences.Num());
+        for (const FNGonVertexInfluence& Inf : SoftInfluences)
+        {
+            if (Positions.IsValidIndex(Inf.Vertex))
+            {
+                Accel.PreviousSessionVertices.Add(Inf.Vertex);
+            }
+        }
+    }
+    return bStarted;
 }
 
 bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
 {
-    TArray<FVector> Updated;
-    if (!SoftSession.BuildPositions(Topology, Positions, GizmoTransform, SoftSettings, Updated)) return false;
-    if (Updated.Num() != Positions.Num()) return false;
-    Positions = MoveTemp(Updated);
-    FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
-    for (const int32 Vertex : Mesh.VertexIndicesItr())
+    if (!SoftSession.IsActive())
     {
-        const int32 LogicalId = Topology.DynamicToLogicalVertex.IsValidIndex(Vertex) ? Topology.DynamicToLogicalVertex[Vertex] : INDEX_NONE;
-        if (Positions.IsValidIndex(LogicalId)) Mesh.SetVertex(Vertex, Positions[LogicalId]);
+        return false;
+    }
+    if (GizmoTransform.Equals(ActiveGizmoTransform, 1e-6))
+    {
+        return true;
+    }
+
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    const int32 LogicalCount = Positions.Num();
+    if (Accel.VertexStamp.Num() < LogicalCount)
+    {
+        Accel.BuildTopologyTables(Topology, Surface->GetDynamicMesh()->GetMeshRef());
+        Accel.BuildColorTables(LogicalCount, ColorElements.Num(), [this](int32 ElemIdx)
+        {
+            return ColorElements[ElemIdx].LogicalVertex;
+        });
+    }
+
+    const int32 Mark = Accel.NextStamp();
+    Accel.DirtyVertices.Reset();
+    auto MarkDirtyVertex = [&](int32 Vertex)
+    {
+        if (Vertex >= 0 && Vertex < LogicalCount && Accel.VertexStamp[Vertex] != Mark)
+        {
+            Accel.VertexStamp[Vertex] = Mark;
+            Accel.DirtyVertices.Add(Vertex);
+        }
+    };
+
+    for (const int32 PrevV : Accel.PreviousSessionVertices)
+    {
+        MarkDirtyVertex(PrevV);
+    }
+    for (const FNGonVertexInfluence& Inf : SoftInfluences)
+    {
+        MarkDirtyVertex(Inf.Vertex);
+    }
+
+    // Update Positions in-place without allocating or copying the entire vertex array.
+    if (!SoftSession.BuildPositions(Topology, Positions, GizmoTransform, SoftSettings, Positions))
+    {
+        return false;
+    }
+
+    const TArray<FNGonVertexInfluence>& SessionInfluences = SoftSession.Influences();
+    for (const FNGonVertexInfluence& Inf : SessionInfluences)
+    {
+        MarkDirtyVertex(Inf.Vertex);
+    }
+
+    // Record currently displaced vertices for the next step.
+    Accel.PreviousSessionVertices.Reset(SessionInfluences.Num());
+    for (const FNGonVertexInfluence& Inf : SessionInfluences)
+    {
+        if (Positions.IsValidIndex(Inf.Vertex))
+        {
+            Accel.PreviousSessionVertices.Add(Inf.Vertex);
+        }
+    }
+
+    // 1. Update only the displaced dynamic mesh vertices.
+    FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
+    for (const int32 LogicalId : Accel.DirtyVertices)
+    {
+        const FVector& Pos = Positions[LogicalId];
+        const int32 StartDyn = Accel.LogicalToDynamicOffsets[LogicalId];
+        const int32 EndDyn = Accel.LogicalToDynamicOffsets[LogicalId + 1];
+        for (int32 i = StartDyn; i < EndDyn; ++i)
+        {
+            Mesh.SetVertex(Accel.LogicalToDynamicVertices[i], Pos);
+        }
     }
     Surface->FastNotifyPositionsUpdated(false, false, false);
     Picker.PositionsChanged();
-    UpdateOverlayPositions();
+
+    // 2. Update only the affected vertex points and incident edge lines.
+    if (Accel.bShowVertices)
+    {
+        for (const int32 LogicalId : Accel.DirtyVertices)
+        {
+            VertexPoints->SetPointPosition(LogicalId, Positions[LogicalId]);
+        }
+    }
+    else
+    {
+        Accel.bVerticesOverlayDirty = true;
+    }
+
+    if (Accel.bShowEdges)
+    {
+        Accel.DirtyEdges.Reset();
+        const int32 EdgeCount = Topology.Edges.Num();
+        for (const int32 LogicalId : Accel.DirtyVertices)
+        {
+            const int32 StartE = Accel.LogicalToEdgeOffsets[LogicalId];
+            const int32 EndE = Accel.LogicalToEdgeOffsets[LogicalId + 1];
+            for (int32 i = StartE; i < EndE; ++i)
+            {
+                const int32 EdgeIdx = Accel.LogicalToEdges[i];
+                if (EdgeIdx >= 0 && EdgeIdx < EdgeCount && Accel.EdgeStamp[EdgeIdx] != Mark)
+                {
+                    Accel.EdgeStamp[EdgeIdx] = Mark;
+                    Accel.DirtyEdges.Add(EdgeIdx);
+                }
+            }
+        }
+        for (const int32 EdgeIndex : Accel.DirtyEdges)
+        {
+            const FIntPoint Edge = Topology.Edges[EdgeIndex];
+            EdgeLines->SetLineStart(EdgeIndex, Positions[Edge.X]);
+            EdgeLines->SetLineEnd(EdgeIndex, Positions[Edge.Y]);
+        }
+    }
+    else
+    {
+        Accel.bEdgesOverlayDirty = true;
+    }
+
+    DrawSelection();
     ++PositionUpdates;
     ActiveGizmoTransform = GizmoTransform;
-    SoftInfluences = SoftSession.Influences();
-    RebuildSoftHeatSamples();
-    DrawSoftSelection();
-    UpdateColors();
+
+    // 3. Only update soft selection overlays and vertex colors when needed.
+    if (SoftSettings.bEnabled)
+    {
+        if (SoftTransformMode == ENGonSoftTransformMode::Fixed)
+        {
+            // In Fixed mode, weights and colors do not change during a drag;
+            // only update the positions of existing SoftInfluencePoints.
+            if (SoftInfluencePoints && SoftInfluencePoints->IsVisible() &&
+                Accel.CachedSoftPointCount == SoftInfluences.Num())
+            {
+                for (int32 idx = 0; idx < SoftInfluences.Num(); ++idx)
+                {
+                    const int32 VertId = SoftInfluences[idx].Vertex;
+                    if (Positions.IsValidIndex(VertId))
+                    {
+                        SoftInfluencePoints->SetPointPosition(idx, Positions[VertId]);
+                    }
+                }
+            }
+            else
+            {
+                DrawSoftSelection();
+            }
+        }
+        else
+        {
+            SoftInfluences = SessionInfluences;
+            for (const int32 LogicalId : Accel.DirtyVertices)
+            {
+                if (SoftHeatSamples.IsValidIndex(LogicalId))
+                {
+                    SoftHeatSamples[LogicalId] = 0.0f;
+                }
+            }
+            for (const FNGonVertexInfluence& Influence : SoftInfluences)
+            {
+                if (SoftHeatSamples.IsValidIndex(Influence.Vertex))
+                {
+                    SoftHeatSamples[Influence.Vertex] = FMath::Max(
+                        SoftHeatSamples[Influence.Vertex],
+                        FMath::Clamp(static_cast<float>(Influence.Weight), 0.0f, 1.0f));
+                }
+            }
+            DrawSoftSelection();
+
+            if (bHeatmapVisible && !ColorElements.IsEmpty())
+            {
+                FDynamicMeshColorOverlay* Colors = Mesh.Attributes()->PrimaryColors();
+                const bool bUseSoftHeat = !SoftInfluences.IsEmpty();
+                for (const int32 LogicalId : Accel.DirtyVertices)
+                {
+                    const float Sample = (bUseSoftHeat && SoftHeatSamples.IsValidIndex(LogicalId))
+                        ? SoftHeatSamples[LogicalId] : 0.0f;
+                    const int32 StartC = Accel.LogicalToColorOffsets[LogicalId];
+                    const int32 EndC = Accel.LogicalToColorOffsets[LogicalId + 1];
+                    for (int32 i = StartC; i < EndC; ++i)
+                    {
+                        const FColorElement& Element = ColorElements[Accel.LogicalToColorElements[i]];
+                        const bool bSelected = SelectedElement == ENGonElement::Face && SelectedIds.Contains(Element.Face);
+                        Colors->SetElement(Element.OverlayId, FVector4f(
+                            Sample, bSelected ? 1.0f : 0.0f, bUseSoftHeat ? 1.0f : 0.0f, 1.0f));
+                    }
+                }
+                Surface->FastNotifyColorsUpdated();
+                ++ColorUpdates;
+            }
+        }
+    }
+
     return true;
 }
 
@@ -1110,15 +1560,9 @@ FText FNGonPreviewScene::DescribeSelection() const
     case ENGonElement::Vertex:
         if (Topology.SourceVertexIds.IsValidIndex(Id))
         {
-            float Influence = 0.0f;
-            for (const FNGonVertexInfluence& Entry : SoftInfluences)
-            {
-                if (Entry.Vertex == Id)
-                {
-                    Influence = FMath::Clamp(static_cast<float>(Entry.Weight), 0.0f, 1.0f);
-                    break;
-                }
-            }
+            const float Influence = (SoftSettings.bEnabled && SoftHeatSamples.IsValidIndex(Id))
+                ? SoftHeatSamples[Id]
+                : (SelectedIds.Contains(Id) ? 1.0f : 0.0f);
             return FText::Format(LOCTEXT("VertexInfo", "Vertex {0}     soft influence {1}"),
                 FText::AsNumber(Topology.SourceVertexIds[Id]), FText::AsNumber(Influence));
         }
@@ -1129,15 +1573,11 @@ FText FNGonPreviewScene::DescribeSelection() const
 
 FText FNGonPreviewScene::DescribeMesh() const
 {
-    int32 NGonCount = 0;
-    for (const TPair<int32, FNGonFace>& Pair : Topology.Faces)
-    {
-        NGonCount += Pair.Value.Perimeter.Num() > 4 ? 1 : 0;
-    }
+    const FNGonSceneAccel& Accel = GetSceneAccel(this);
     const FText MeshInfo = FText::Format(LOCTEXT("MeshInfo", "{0} faces     {1} triangles     {2} edges     {3} vertices     {4} N-Gons (max {5} sides)"),
         FText::AsNumber(Topology.Faces.Num()), FText::AsNumber(Topology.TriangleCount),
         FText::AsNumber(Topology.Edges.Num()), FText::AsNumber(Topology.RestPositions.Num()),
-        FText::AsNumber(NGonCount), FText::AsNumber(Topology.MaxFaceCorners));
+        FText::AsNumber(Accel.CachedNGonCount), FText::AsNumber(Topology.MaxFaceCorners));
     if (SoftSettings.bEnabled && !SelectedIds.IsEmpty())
     {
         return FText::Format(LOCTEXT("SoftHeatmapStatus", "{0}  |  Soft heatmap follows selection influence"), MeshInfo);
