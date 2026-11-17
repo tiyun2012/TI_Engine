@@ -9,6 +9,7 @@
 
 struct FAssetData;
 struct FNGonMeshData;
+class SVerticalBox;
 
 class SNGonViewport final : public SEditorViewport
 {
@@ -19,10 +20,13 @@ public:
     void Construct(const FArguments& InArgs);
     void SetSelectionMode(ENGonElement Element);
     void SetGizmoMode(ENGonGizmoMode Mode);
+    ENGonGizmoMode GetGizmoMode() const;
     ENGonElement GetSelectionMode() const { return SelectionMode; }
     void ToggleHeatmap();
     void SetHeatmapVisible(bool bVisible);
     bool IsHeatmapVisible() const;
+    void SetGridVisible(bool bVisible);
+    bool IsGridVisible() const { return bGridVisible; }
     void SetMesh(FNGonMeshData&& Data);
     void FrameMesh();
     bool DeleteSelectedFaces();
@@ -30,6 +34,7 @@ public:
     void BoxSelect(const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
     FNGonPreviewScene& Preview() { return *PreviewScene; }
+    const FNGonPreviewScene& Preview() const { return *PreviewScene; }
 
 protected:
     TSharedRef<FEditorViewportClient> MakeEditorViewportClient() override;
@@ -39,6 +44,48 @@ private:
     TSharedPtr<FNGonPreviewScene> PreviewScene;
     ENGonElement SelectionMode = ENGonElement::Face;
     bool bHeatmapVisible = false;
+    bool bGridVisible = false;
+};
+
+enum class ENGonToolShelfTab : uint8
+{
+    Select,
+    Model,
+    Sculpt,
+    Deform,
+    Skin,
+    Display
+};
+
+enum class ENGonRightUpperTab : uint8
+{
+    SkeletonTree,
+    MorphTargets,
+    Topology
+};
+
+enum class ENGonRightLowerTab : uint8
+{
+    Details,
+    AssetDetails,
+    PreviewSettings
+};
+
+struct FNGonBoneEntry
+{
+    int32 BoneIndex = INDEX_NONE;
+    int32 ParentIndex = INDEX_NONE;
+    int32 Depth = 0;
+    int32 ChildCount = 0;
+    FName Name = NAME_None;
+    FTransform LocalTransform = FTransform::Identity;
+    FTransform ComponentTransform = FTransform::Identity;
+};
+
+struct FNGonMorphEntry
+{
+    FName Name = NAME_None;
+    int32 VertexDeltaCount = 0;
 };
 
 class SNGonPreview final : public SCompoundWidget
@@ -56,23 +103,55 @@ private:
     bool TryLoadDefault(FText& Error);
     bool TryLoadFbx(const FString& Filename, FText& Error);
     void LoadStaticMesh(const FAssetData& Asset);
-    void ShowMesh(FNGonMeshData&& Data, const FText& SourceName);
+    void LoadSkeletalMesh(const FAssetData& Asset);
+    void ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const FText& InSourceType);
     void ShowError(const FText& Error);
     void SetSelectionMode(ENGonElement Element);
+    void SetActiveToolTab(ENGonToolShelfTab Tab);
     void ApplySoftSelectionSettings();
+    void RebuildSkeletonTreeList();
+    void RebuildMorphTargetList();
+    FReply SelectVerticesNearSelectedBone();
 
-    TSharedRef<SWidget> MakeSelectionMode(ENGonElement Element, const FText& Label);
-    TSharedRef<SWidget> MakeControls();
-    TSharedRef<SWidget> MakeSliders();
+    TSharedRef<SWidget> MakeTopCommandBar();
+    TSharedRef<SWidget> MakeLeftToolSidebar();
+    TSharedRef<SWidget> MakeViewportOverlayHeader();
+    TSharedRef<SWidget> MakeViewportStatsOverlay();
+    TSharedRef<SWidget> MakeViewportHotkeysOverlay();
+    TSharedRef<SWidget> MakeRightInspectorPanel();
+    TSharedRef<SWidget> MakeSkeletonTreeTab();
+    TSharedRef<SWidget> MakeMorphTargetsTab();
+    TSharedRef<SWidget> MakeTopologyTab();
+    TSharedRef<SWidget> MakeDetailsTab();
+    TSharedRef<SWidget> MakeAssetDetailsTab();
+    TSharedRef<SWidget> MakePreviewSettingsTab();
     TSharedRef<SWidget> MakeStatus();
-    TSharedRef<SWidget> MakeSoftSelectionControls();
 
     TSharedPtr<SNGonViewport> Viewport;
-    FString AssetPath;
+    TSharedPtr<SVerticalBox> SkeletonListBox;
+    TSharedPtr<SVerticalBox> MorphListBox;
+
+    FString StaticMeshAssetPath;
+    FString SkeletalMeshAssetPath;
     FText SourceLabel;
+    FText SourceTypeLabel;
     FText ErrorText;
+
+    TArray<FNGonBoneEntry> SkeletonBones;
+    TArray<FNGonMorphEntry> MorphTargets;
+    FString BoneSearchFilter;
+    int32 SelectedBoneIndex = INDEX_NONE;
+
     ENGonElement SelectionMode = ENGonElement::Face;
+    ENGonToolShelfTab ActiveToolTab = ENGonToolShelfTab::Model;
+    ENGonRightUpperTab ActiveUpperTab = ENGonRightUpperTab::SkeletonTree;
+    ENGonRightLowerTab ActiveLowerTab = ENGonRightLowerTab::Details;
+
+    bool bShowEdges = true;
+    bool bShowVertices = true;
     bool bShowHeatmap = false;
+    bool bShowStatsOverlay = true;
+    bool bShowHotkeysOverlay = true;
     float HeatBias = 0.0f;
     float Bend = 0.0f;
     bool bSoftSelection = false;

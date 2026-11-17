@@ -81,7 +81,18 @@ private:
 
     TSharedRef<SDockTab> SpawnTab(const FSpawnTabArgs&)
     {
-        const TSharedRef<SDockTab> Tab = SNew(SDockTab).TabRole(ETabRole::NomadTab)
+        const TSharedRef<SDockTab> Tab = SNew(SDockTab)
+            .TabRole(ETabRole::NomadTab)
+            .OnTabClosed_Lambda([](TSharedRef<SDockTab>)
+            {
+                if (FSlateApplication::IsInitialized())
+                {
+                    if (const TSharedPtr<SDockTab> UVTab = FGlobalTabmanager::Get()->FindExistingLiveTab(UVEditorTabName))
+                    {
+                        UVTab->RequestCloseTab();
+                    }
+                }
+            })
             [
                 SNew(SNGonPreview)
             ];

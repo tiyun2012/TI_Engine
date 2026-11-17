@@ -2,8 +2,10 @@
 
 #include "Algo/Reverse.h"
 #include "HAL/FileManager.h"
+#include "MeshDescription.h"
 #include "Misc/Paths.h"
 #include "NGonTopology.h"
+#include "StaticMeshAttributes.h"
 
 THIRD_PARTY_INCLUDES_START
 #include <fbxsdk.h>
@@ -22,6 +24,13 @@ struct FHeatAccumulator
 {
     double Sum = 0.0;
     int32 Count = 0;
+};
+
+struct FFbxCornerUV
+{
+    FVector2f UV = FVector2f::ZeroVector;
+    int32 SeamKey = INDEX_NONE;
+    bool bValid = false;
 };
 
 FText MakeFbxError(const FText& Message, FbxImporter& Importer)
@@ -77,9 +86,73 @@ bool ReadRed(
     return true;
 }
 
+bool ReadCornerUV(
+    const FbxGeometryElementUV& UVs,
+    int32 BaseUVOffset,
+    int32 Vertex,
+    int32 PolygonCorner,
+    FFbxCornerUV& OutCornerUV)
+{
+    int32 MapIndex = INDEX_NONE;
+    switch (UVs.GetMappingMode())
+    {
+    case FbxGeometryElement::eByControlPoint:
+        MapIndex = Vertex;
+        break;
+    case FbxGeometryElement::eByPolygonVertex:
+        MapIndex = PolygonCorner;
+        break;
+    default:
+        return false;
+    }
+
+    int32 DirectIndex = MapIndex;
+    const auto& Indices = UVs.GetIndexArray();
+    switch (UVs.GetReferenceMode())
+    {
+    case FbxGeometryElement::eDirect:
+        break;
+    case FbxGeometryElement::eIndexToDirect:
+        if (MapIndex < 0 || MapIndex >= Indices.GetCount())
+        {
+            return false;
+        }
+        DirectIndex = Indices.GetAt(MapIndex);
+        break;
+    default:
+        return false;
+    }
+
+    const auto& Values = UVs.GetDirectArray();
+    if (DirectIndex < 0 || DirectIndex >= Values.GetCount())
+    {
+        return false;
+    }
+
+    const FbxVector2 Value = Values.GetAt(DirectIndex);
+    if (!FMath::IsFinite(Value[0]) || !FMath::IsFinite(Value[1]))
+    {
+        return false;
+    }
+
+    OutCornerUV.UV = FVector2f(static_cast<float>(Value[0]), static_cast<float>(Value[1]));
+    OutCornerUV.SeamKey = (UVs.GetReferenceMode() == FbxGeometryElement::eIndexToDirect)
+        ? (BaseUVOffset + DirectIndex)
+        : INDEX_NONE;
+    OutCornerUV.bValid = true;
+    return true;
+}
+
 bool AppendMesh(
-    FbxNode& Node, FbxMesh& Mesh, double ToCentimeters,
-    TArray<FVector>& Positions, TArray<TArray<int32>>& Faces, TArray<float>& RedSamples, FText& Error)
+    FbxNode& Node,
+    FbxMesh& Mesh,
+    double ToCentimeters,
+    int32& InOutUVKeyOffset,
+    TArray<FVector>& Positions,
+    TArray<TArray<int32>>& Faces,
+    TArray<TArray<FFbxCornerUV>>& FaceUVs,
+    TArray<float>& RedSamples,
+    FText& Error)
 {
     FbxAMatrix GeometryTransform;
     GeometryTransform.SetT(Node.GetGeometricTranslation(FbxNode::eSourcePivot));
@@ -115,8 +188,16 @@ bool AppendMesh(
         Samples.SetNum(PointCount);
     }
 
+    const FbxGeometryElementUV* UVElement = Mesh.GetElementUV(0);
+    const int32 BaseUVOffset = InOutUVKeyOffset;
+    if (UVElement)
+    {
+        InOutUVKeyOffset += FMath::Max(UVElement->GetDirectArray().GetCount(), 1);
+    }
+
     const int32 FaceCount = Mesh.GetPolygonCount();
     Faces.Reserve(Faces.Num() + FaceCount);
+    FaceUVs.Reserve(FaceUVs.Num() + FaceCount);
     for (int32 Polygon = 0; Polygon < FaceCount; ++Polygon)
     {
         const int32 Corners = Mesh.GetPolygonSize(Polygon);
@@ -130,7 +211,9 @@ bool AppendMesh(
         }
 
         TArray<int32>& Face = Faces.AddDefaulted_GetRef();
+        TArray<FFbxCornerUV>& CornerUVList = FaceUVs.AddDefaulted_GetRef();
         Face.Reserve(Corners);
+        CornerUVList.Reserve(Corners);
         for (int32 Corner = 0; Corner < Corners; ++Corner)
         {
             const int32 Vertex = Mesh.GetPolygonVertex(Polygon, Corner);
@@ -142,6 +225,14 @@ bool AppendMesh(
             }
 
             Face.Add(BaseVertex + Vertex);
+
+            FFbxCornerUV ParsedUV;
+            if (UVElement)
+            {
+                ReadCornerUV(*UVElement, BaseUVOffset, Vertex, FirstCorner + Corner, ParsedUV);
+            }
+            CornerUVList.Add(ParsedUV);
+
             double Red = 0.0;
             if (Colors && ReadRed(*Colors, Vertex, FirstCorner + Corner, Red))
             {
@@ -152,6 +243,7 @@ bool AppendMesh(
         if (bReverseWinding)
         {
             Algo::Reverse(Face);
+            Algo::Reverse(CornerUVList);
         }
     }
 
@@ -162,6 +254,182 @@ bool AppendMesh(
             ? static_cast<float>(Samples[Vertex].Sum / Samples[Vertex].Count)
             : -1.0f;
     }
+    return true;
+}
+
+bool BuildFbxMeshDescription(
+    const TArray<FVector>& Positions,
+    const TArray<TArray<int32>>& Faces,
+    const TArray<TArray<FFbxCornerUV>>& FaceUVs,
+    FMeshDescription& Out,
+    FText& Error)
+{
+    if (Positions.Num() < 3 || Faces.IsEmpty())
+    {
+        Error = LOCTEXT("EmptyPolygonData", "The polygon file needs at least three positions and one face.");
+        return false;
+    }
+
+    FStaticMeshAttributes Attributes(Out);
+    Attributes.Register();
+    Out.SetNumUVChannels(1);
+    auto VertexPositions = Attributes.GetVertexPositions();
+    auto UVs = Attributes.GetVertexInstanceUVs();
+    UVs.SetNumChannels(1);
+    auto SharedUVs = Attributes.GetUVCoordinates(0);
+    auto Normals = Attributes.GetVertexInstanceNormals();
+
+    TArray<FVertexID> VertexIds;
+    VertexIds.Reserve(Positions.Num());
+    for (const FVector& Position : Positions)
+    {
+        if (Position.ContainsNaN() || Position.GetAbsMax() > TNumericLimits<float>::Max())
+        {
+            Error = LOCTEXT("InvalidPosition", "The mesh contains an invalid vertex position.");
+            return false;
+        }
+        const FVertexID Vertex = Out.CreateVertex();
+        VertexPositions[Vertex] = FVector3f(Position);
+        VertexIds.Add(Vertex);
+    }
+
+    const FPolygonGroupID PolygonGroup = Out.CreatePolygonGroup();
+    // Map either authored FBX direct UV index or quantized (VertexIndex, U, V) to shared FUVID
+    // so welded UV islands share FUVIDs while authored UV seams stay split.
+    TMap<int32, FUVID> SeamKeyToUVID;
+    TMap<uint64, FUVID> QuantizedVertexUVToUVID;
+
+    for (int32 FaceIndex = 0; FaceIndex < Faces.Num(); ++FaceIndex)
+    {
+        const TArray<int32>& Face = Faces[FaceIndex];
+        const TArray<FFbxCornerUV>* CornerUVs = FaceUVs.IsValidIndex(FaceIndex) ? &FaceUVs[FaceIndex] : nullptr;
+
+        TSet<int32> Seen;
+        TArray<FVertexInstanceID> Instances;
+        Instances.Reserve(Face.Num());
+        for (const int32 VertexIndex : Face)
+        {
+            if (!VertexIds.IsValidIndex(VertexIndex) || Seen.Contains(VertexIndex))
+            {
+                Error = FText::Format(
+                    LOCTEXT("InvalidFaceVertex", "Face {0} contains an invalid or repeated vertex index."),
+                    FText::AsNumber(FaceIndex));
+                return false;
+            }
+            Seen.Add(VertexIndex);
+        }
+
+        if (Face.Num() < 3)
+        {
+            Error = FText::Format(
+                LOCTEXT("ShortFace", "Face {0} needs at least three vertices."),
+                FText::AsNumber(FaceIndex));
+            return false;
+        }
+
+        const FVector& Origin = Positions[Face[0]];
+        FVector Normal = FVector::ZeroVector;
+        double ScaleSquared = 0.0;
+        for (int32 Corner = 1; Corner < Face.Num(); ++Corner)
+        {
+            const FVector A = Positions[Face[Corner]] - Origin;
+            const FVector B = Positions[Face[(Corner + 1) % Face.Num()]] - Origin;
+            Normal += FVector::CrossProduct(A, B);
+            ScaleSquared = FMath::Max(ScaleSquared, A.SizeSquared());
+        }
+
+        const double Area = Normal.Size();
+        if (!FMath::IsFinite(Area) || Area <= ScaleSquared * 1.e-12)
+        {
+            Error = FText::Format(
+                LOCTEXT("DegenerateFace", "Face {0} has no usable area."),
+                FText::AsNumber(FaceIndex));
+            return false;
+        }
+        Normal /= Area;
+
+        TMap<FVertexInstanceID, FUVID> UVForInstance;
+        for (int32 Corner = 0; Corner < Face.Num(); ++Corner)
+        {
+            const int32 VertexIndex = Face[Corner];
+            const FVertexInstanceID Instance = Out.CreateVertexInstance(VertexIds[VertexIndex]);
+            Instances.Add(Instance);
+            Normals[Instance] = FVector3f(Normal);
+
+            FVector2f UVValue;
+            int32 SeamKey = INDEX_NONE;
+            if (CornerUVs && CornerUVs->IsValidIndex(Corner) && (*CornerUVs)[Corner].bValid)
+            {
+                UVValue = (*CornerUVs)[Corner].UV;
+                SeamKey = (*CornerUVs)[Corner].SeamKey;
+            }
+            else
+            {
+                const FVector& Position = Positions[VertexIndex];
+                UVValue = FVector2f(
+                    static_cast<float>(Position.X / 100.0),
+                    static_cast<float>(Position.Y / 100.0));
+            }
+
+            UVs.Set(Instance, 0, UVValue);
+
+            FUVID UvId(INDEX_NONE);
+            if (SeamKey != INDEX_NONE)
+            {
+                if (const FUVID* Existing = SeamKeyToUVID.Find(SeamKey))
+                {
+                    UvId = *Existing;
+                }
+                else
+                {
+                    UvId = Out.CreateUV(0);
+                    SharedUVs[UvId] = UVValue;
+                    SeamKeyToUVID.Add(SeamKey, UvId);
+                }
+            }
+            else
+            {
+                const uint32 QuantU = static_cast<uint32>(FMath::RoundToInt(UVValue.X * 100000.0f));
+                const uint32 QuantV = static_cast<uint32>(FMath::RoundToInt(UVValue.Y * 100000.0f));
+                const uint64 HashKey = (static_cast<uint64>(static_cast<uint32>(VertexIndex)) << 32)
+                    ^ (static_cast<uint64>(QuantU) * 2654435761ULL)
+                    ^ static_cast<uint64>(QuantV);
+                if (const FUVID* Existing = QuantizedVertexUVToUVID.Find(HashKey))
+                {
+                    UvId = *Existing;
+                }
+                else
+                {
+                    UvId = Out.CreateUV(0);
+                    SharedUVs[UvId] = UVValue;
+                    QuantizedVertexUVToUVID.Add(HashKey, UvId);
+                }
+            }
+
+            UVForInstance.Add(Instance, UvId);
+        }
+
+        const FPolygonID Polygon = Out.CreatePolygon(PolygonGroup, Instances);
+        const auto Triangles = Out.GetPolygonTriangles(Polygon);
+        if (Triangles.Num() != Instances.Num() - 2)
+        {
+            Error = FText::Format(
+                LOCTEXT("TriangulationFailed", "Face {0} could not be triangulated as a single polygon."),
+                FText::AsNumber(FaceIndex));
+            return false;
+        }
+        for (const FTriangleID Triangle : Triangles)
+        {
+            const auto Corners = Out.GetTriangleVertexInstances(Triangle);
+            const FUVID TriangleUVs[] = {
+                UVForInstance.FindChecked(Corners[0]),
+                UVForInstance.FindChecked(Corners[1]),
+                UVForInstance.FindChecked(Corners[2])
+            };
+            Out.SetTriangleUVIndices(Triangle, MakeArrayView(TriangleUVs), 0);
+        }
+    }
+
     return true;
 }
 }
@@ -214,9 +482,6 @@ bool NGon::LoadFbx(const FString& Filename, FNGonMeshData& Out, FText& Error)
         Error = MakeFbxError(LOCTEXT("FbxReadError", "The SDK could not read the FBX scene."), *Importer);
         return false;
     }
-    // Keep the importer owned by FbxManager until the complete scene has been
-    // converted.  Destroying it here can invalidate SDK-owned scene state on
-    // the UE 5.8 FBX SDK build.
 
     FbxAxisSystem::Max.DeepConvertScene(Scene);
     const double ToCentimeters = Scene->GetGlobalSettings().GetSystemUnit().GetScaleFactor();
@@ -228,7 +493,9 @@ bool NGon::LoadFbx(const FString& Filename, FNGonMeshData& Out, FText& Error)
 
     TArray<FVector> Positions;
     TArray<TArray<int32>> Faces;
+    TArray<TArray<FFbxCornerUV>> FaceUVs;
     TArray<float> RedSamples;
+    int32 UVKeyOffset = 0;
     TArray<FbxNode*> Pending;
     if (FbxNode* Root = Scene->GetRootNode())
     {
@@ -239,7 +506,7 @@ bool NGon::LoadFbx(const FString& Filename, FNGonMeshData& Out, FText& Error)
         FbxNode* Node = Pending.Pop(EAllowShrinking::No);
         if (FbxMesh* Mesh = Node->GetMesh(); Mesh && Mesh->GetPolygonCount() > 0)
         {
-            if (!AppendMesh(*Node, *Mesh, ToCentimeters, Positions, Faces, RedSamples, Error))
+            if (!AppendMesh(*Node, *Mesh, ToCentimeters, UVKeyOffset, Positions, Faces, FaceUVs, RedSamples, Error))
             {
                 return false;
             }
@@ -255,8 +522,10 @@ bool NGon::LoadFbx(const FString& Filename, FNGonMeshData& Out, FText& Error)
         return false;
     }
 
+    FMeshDescription SourceMesh;
     FNGonMeshData Result;
-    if (!BuildPolygonMesh(Positions, Faces, Result, Error))
+    if (!BuildFbxMeshDescription(Positions, Faces, FaceUVs, SourceMesh, Error)
+        || !ConvertMeshDescription(SourceMesh, Result, Error))
     {
         return false;
     }
@@ -264,17 +533,12 @@ bool NGon::LoadFbx(const FString& Filename, FNGonMeshData& Out, FText& Error)
     Result.ImportedHeatSamples.Reserve(Result.Topology.SourceVertexIds.Num());
     for (const int32 SourceVertex : Result.Topology.SourceVertexIds)
     {
-        // A scene can contain several mesh nodes.  Keep the source sample
-        // lookup safe even when a malformed node did not contribute a color
-        // sample for every accumulated control point.
         Result.ImportedHeatSamples.Add(RedSamples.IsValidIndex(SourceVertex)
             ? RedSamples[SourceVertex]
             : -1.0f);
     }
     Error = FText::GetEmpty();
     Out = MoveTemp(Result);
-    // Keep FBX SDK cleanup scoped to the manager's normal destructor. Explicit
-    // Destroy calls can double-clean SDK-owned scene state in UE 5.8.
     return true;
 }
 
