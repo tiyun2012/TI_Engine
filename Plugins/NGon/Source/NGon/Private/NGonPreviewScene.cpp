@@ -29,6 +29,43 @@ const FColor EdgeColor(80, 224, 246);
 const FColor PointColor(230, 249, 255);
 const FColor SelectionColor(255, 181, 65);
 
+void BindGizmoActorViewContext(UCombinedTransformGizmo* TransformGizmo, UInteractiveGizmoManager* GizmoManager, bool bMarkRenderStateDirty)
+{
+    if (!TransformGizmo || !GizmoManager)
+    {
+        return;
+    }
+
+    UContextObjectStore* ContextStore = GizmoManager->GetContextObjectStore();
+    if (!ContextStore)
+    {
+        return;
+    }
+
+    UGizmoViewContext* ViewContext = ContextStore->FindContext<UGizmoViewContext>();
+    if (!ViewContext)
+    {
+        ViewContext = NewObject<UGizmoViewContext>(GizmoManager);
+        ContextStore->AddContextObject(ViewContext);
+    }
+
+    if (AActor* GizmoActor = TransformGizmo->GetGizmoActor())
+    {
+        TInlineComponentArray<UGizmoBaseComponent*> GizmoComponents(GizmoActor);
+        for (UGizmoBaseComponent* Comp : GizmoComponents)
+        {
+            if (Comp)
+            {
+                Comp->SetGizmoViewContext(ViewContext);
+                if (bMarkRenderStateDirty)
+                {
+                    Comp->MarkRenderStateDirty();
+                }
+            }
+        }
+    }
+}
+
 UMaterial* MakeSurfaceMaterial()
 {
     UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
@@ -104,27 +141,6 @@ void FNGonPreviewScene::SetupGizmo(UInteractiveGizmoManager* InGizmoManager, ITo
     TransformGizmo = GizmoManager->Create3AxisTransformGizmo(this, TEXT("NGonPreview"));
     if (!TransformGizmo) { TransformProxy = nullptr; return; }
 
-    if (UContextObjectStore* ContextStore = GizmoManager->GetContextObjectStore())
-    {
-        UGizmoViewContext* ViewContext = ContextStore->FindContext<UGizmoViewContext>();
-        if (!ViewContext)
-        {
-            ViewContext = NewObject<UGizmoViewContext>(GizmoManager);
-            ContextStore->AddContextObject(ViewContext);
-        }
-        if (AActor* GizmoActor = TransformGizmo->GetGizmoActor())
-        {
-            TInlineComponentArray<UGizmoBaseComponent*> GizmoComponents(GizmoActor);
-            for (UGizmoBaseComponent* Comp : GizmoComponents)
-            {
-                if (Comp)
-                {
-                    Comp->SetGizmoViewContext(ViewContext);
-                }
-            }
-        }
-    }
-
     TransformProxy->SetTransform(GetSelectionGizmoTransform());
     TransformProxy->OnBeginTransformEdit.AddLambda([this](UTransformProxy*) {
         if (!bUpdatingGizmo) BeginSoftTransform(TransformProxy->GetTransform(), SoftTransformMode);
@@ -136,6 +152,9 @@ void FNGonPreviewScene::SetupGizmo(UInteractiveGizmoManager* InGizmoManager, ITo
         if (!bUpdatingGizmo) EndSoftTransform();
     });
     TransformGizmo->SetActiveTarget(TransformProxy, TransactionProvider);
+    // GizmoActor and its UGizmoBaseComponents are spawned inside SetActiveTarget,
+    // so bind UGizmoViewContext and refresh component proxies after SetActiveTarget.
+    BindGizmoActorViewContext(TransformGizmo, GizmoManager, true);
     UpdateGizmo();
 }
 
@@ -177,6 +196,11 @@ void FNGonPreviewScene::UpdateGizmo()
     TransformGizmo->SetVisibility(!SelectedIds.IsEmpty());
     TransformProxy->SetTransform(Frame);
     TransformGizmo->ReinitializeGizmoTransform(Frame);
+    BindGizmoActorViewContext(TransformGizmo, GizmoManager, false);
+    if (GizmoManager)
+    {
+        GizmoManager->Tick(0.0f);
+    }
     bUpdatingGizmo = false;
 }
 
@@ -797,6 +821,8 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
 void FNGonPreviewScene::EndSoftTransform()
 {
     SoftSession.End();
+    RebuildSoftSelection();
+    UpdateGizmo();
 }
 
 void FNGonPreviewScene::CancelSoftTransform()

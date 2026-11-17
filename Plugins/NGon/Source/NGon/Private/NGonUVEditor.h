@@ -94,7 +94,7 @@ private:
     FVector2f ScreenToUV(const FGeometry& Geometry, const FVector2D& Screen) const;
     FVector2D UVToScreen(const FGeometry& Geometry, const FVector2f& UV) const;
     void UpdateViewFromBounds(const FGeometry& Geometry) const;
-    TSharedRef<FNGonUVDocument> Document;
+    TSharedRef<FNGonUVDocument> Document = MakeShared<FNGonUVDocument>();
     mutable FVector2f ViewCenter = FVector2f(0.5f, 0.5f);
     mutable float Zoom = 300.0f;
     mutable bool bNeedsFit = true;

@@ -25,7 +25,7 @@ protected:
 private:
     FVector2f ScreenToUV(const FGeometry&, const FVector2D&) const;
     FVector2D UVToScreen(const FGeometry&, const FVector2f&) const;
-    TSharedRef<FTiPaintDocument> Document;
+    TSharedRef<FTiPaintDocument> Document = MakeShared<FTiPaintDocument>(1, 1);
     mutable FVector2f Center = FVector2f(0.5f, 0.5f);
     mutable float Pixels = 450.0f;
     mutable bool bNeedsFit = true;
@@ -50,7 +50,7 @@ private:
     void SetMode(ETiPaintMode);
     TSharedRef<SWidget> MakeLayerMenu();
     FReply Export();
-    TSharedRef<FTiPaintDocument> Document;
+    TSharedRef<FTiPaintDocument> Document = MakeShared<FTiPaintDocument>();
     TSharedPtr<STiPaintCanvas> Canvas;
     FText Status;
 };

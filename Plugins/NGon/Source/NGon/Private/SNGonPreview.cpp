@@ -79,6 +79,7 @@ public:
         if (FEditorModeTools* ViewportModeTools = GetModeTools())
         {
             ViewportModeTools->ActivateDefaultMode();
+            ViewportModeTools->SetWidgetMode(UE::Widget::WM_None);
 
             if (UModeManagerInteractiveToolsContext* ToolsContext = ViewportModeTools->GetInteractiveToolsContext();
                 ToolsContext && ToolsContext->ToolManager && ToolsContext->GizmoManager && ToolsContext->InputRouter)
@@ -103,6 +104,41 @@ public:
         }
     }
 
+    EMouseCursor::Type GetRequiredCursor() override
+    {
+        // Prevent FSceneViewport::OnMouseButtonDown from hiding/locking the OS
+        // cursor (bCursorHiddenDueToCapture) during non-Alt gizmo and marquee drags.
+        if (!IsAltPressed())
+        {
+            if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || PreviewOwner->IsSoftTransformActive())
+            {
+                return EMouseCursor::CardinalCross;
+            }
+            return EMouseCursor::Default;
+        }
+        return FEditorViewportClient::GetRequiredCursor();
+    }
+
+    void Tick(float DeltaSeconds) override
+    {
+        FEditorViewportClient::Tick(DeltaSeconds);
+        if (Viewport && GizmoViewContext)
+        {
+            FSceneViewFamilyContext ViewFamily(
+                FSceneViewFamily::ConstructionValues(Viewport, GetScene(), EngineShowFlags)
+                .SetRealtimeUpdate(IsRealtime()));
+            BuildSceneView(Viewport, ViewFamily);
+        }
+        if (ToolManager)
+        {
+            ToolManager->Tick(DeltaSeconds);
+        }
+        if (GizmoManager)
+        {
+            GizmoManager->Tick(DeltaSeconds);
+        }
+    }
+
     bool InputKey(const FInputKeyEventArgs& EventArgs) override
     {
         if (EventArgs.Event == IE_Pressed && EventArgs.Key == EKeys::Escape && PreviewOwner->IsSoftTransformActive())
@@ -122,6 +158,11 @@ public:
 
         if (EventArgs.Key == EKeys::LeftMouseButton && EventArgs.Viewport)
         {
+            if (FEditorModeTools* ViewportModeTools = GetModeTools())
+            {
+                ViewportModeTools->ReceivedFocus(this, EventArgs.Viewport);
+            }
+
             const int32 MouseX = EventArgs.Viewport->GetMouseX();
             const int32 MouseY = EventArgs.Viewport->GetMouseY();
             const FVector2D CurrentPos(MouseX, MouseY);
@@ -137,8 +178,15 @@ public:
                     .SetRealtimeUpdate(IsRealtime()));
                 if (FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily))
                 {
+                    if (GizmoManager)
+                    {
+                        GizmoManager->Tick(0.0f);
+                    }
                     if (InputRouter)
                     {
+                        FInputDeviceState HoverState = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
+                        InputRouter->PostHoverInputEvent(HoverState);
+
                         FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
                         State.Mouse.Left.SetStates(true, true, false);
                         InputRouter->PostInputEvent(State);
@@ -178,6 +226,10 @@ public:
                         FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, Delta);
                         State.Mouse.Left.SetStates(false, false, true);
                         InputRouter->PostInputEvent(State);
+                    }
+                    if (GizmoManager)
+                    {
+                        GizmoManager->Tick(0.0f);
                     }
                     bConsumedByGizmo = false;
                     bMarqueeActive = false;
@@ -306,6 +358,11 @@ public:
 
     void MouseMove(FViewport* InViewport, int32 X, int32 Y) override
     {
+        if (FEditorModeTools* ViewportModeTools = GetModeTools())
+        {
+            ViewportModeTools->MouseEnter(this, InViewport, X, Y);
+        }
+
         if (HandleLeftMouseDrag(InViewport, X, Y))
         {
             return;
@@ -318,6 +375,10 @@ public:
                 .SetRealtimeUpdate(IsRealtime()));
             if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
             {
+                if (GizmoManager)
+                {
+                    GizmoManager->Tick(0.0f);
+                }
                 const FVector2D CurrentPos(X, Y);
                 FInputDeviceState State = MakeMouseInputState(*View, X, Y, CurrentPos - LastMousePosition);
                 LastMousePosition = CurrentPos;
@@ -430,6 +491,10 @@ private:
                     FInputDeviceState State = MakeMouseInputState(*View, InMouseX, InMouseY, Delta);
                     State.Mouse.Left.SetStates(false, true, false);
                     InputRouter->PostInputEvent(State);
+                }
+                if (GizmoManager)
+                {
+                    GizmoManager->Tick(0.0f);
                 }
             }
             Invalidate();

@@ -291,12 +291,11 @@ bool FNGonSoftTransformSession::BuildPositions(const FNGonTopology& Topology, co
     const FTransform& NewGizmo, const FNGonSoftSelectionSettings& Settings, TArray<FVector>& OutPositions)
 {
     if (!bActive || CurrentPositions.Num() != StartPositions.Num()) return false;
-    FTransform Delta = NewGizmo * InitialGizmo.Inverse();
+    const FTransform& ReferenceGizmo = (Mode == ENGonSoftTransformMode::SlideSculpt) ? LastGizmo : InitialGizmo;
     if (Mode == ENGonSoftTransformMode::SlideSculpt)
     {
         // Slide mode applies the incremental gizmo delta to its working mesh,
         // retaining the accumulated sculpt after the cursor changes direction.
-        Delta = NewGizmo * LastGizmo.Inverse();
         OutPositions = WorkingPositions;
     }
     else
@@ -313,7 +312,8 @@ bool FNGonSoftTransformSession::BuildPositions(const FNGonTopology& Topology, co
         const FVector BaseLocal = (Mode == ENGonSoftTransformMode::SlideSculpt)
             ? OutPositions[Influence.Vertex] : StartPositions[Influence.Vertex];
         const FVector StartWorld = ObjectTransform.TransformPosition(BaseLocal);
-        const FVector TargetWorld = Delta.TransformPosition(StartWorld);
+        const FVector GizmoLocal = ReferenceGizmo.InverseTransformPosition(StartWorld);
+        const FVector TargetWorld = NewGizmo.TransformPosition(GizmoLocal);
         const FVector WorldPosition = FMath::Lerp(StartWorld, TargetWorld, static_cast<float>(Influence.Weight));
         OutPositions[Influence.Vertex] = ObjectTransform.InverseTransformPosition(WorldPosition);
     }
