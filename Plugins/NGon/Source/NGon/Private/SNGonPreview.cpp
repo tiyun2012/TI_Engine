@@ -2,6 +2,11 @@
 
 #include "AssetEditorModeManager.h"
 #include "AssetRegistry/AssetData.h"
+#include "BaseGizmos/GizmoViewContext.h"
+#include "BaseGizmos/TransformGizmoUtil.h"
+#include "CanvasItem.h"
+#include "CanvasTypes.h"
+#include "ContextObjectStore.h"
 #include "DesktopPlatformModule.h"
 #include "EditorModeManager.h"
 #include "EditorViewportClient.h"
@@ -11,19 +16,20 @@
 #include "HAL/FileManager.h"
 #include "IDesktopPlatform.h"
 #include "InputCoreTypes.h"
+#include "InputRouter.h"
+#include "InputState.h"
+#include "InteractiveGizmoManager.h"
+#include "InteractiveToolManager.h"
 #include "Misc/Paths.h"
 #include "NGonFbx.h"
 #include "NGonMeshFiles.h"
 #include "NGonPreviewScene.h"
 #include "PropertyCustomizationHelpers.h"
 #include "SceneView.h"
-#include "CanvasItem.h"
-#include "CanvasTypes.h"
 #include "Tools/EdModeInteractiveToolsContext.h"
-#include "BaseGizmos/TransformGizmoUtil.h"
 #include "Widgets/Input/SButton.h"
-#include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SSlider.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
@@ -75,42 +81,41 @@ public:
             ViewportModeTools->ActivateDefaultMode();
 
             if (UModeManagerInteractiveToolsContext* ToolsContext = ViewportModeTools->GetInteractiveToolsContext();
-                ToolsContext && ToolsContext->ToolManager && ToolsContext->GizmoManager)
+                ToolsContext && ToolsContext->ToolManager && ToolsContext->GizmoManager && ToolsContext->InputRouter)
             {
-                PreviewOwner->SetOverlayMaterials(ToolsContext->ToolManager.Get());
-                PreviewOwner->SetupGizmo(ToolsContext->GizmoManager.Get(), ToolsContext->ToolManager.Get());
+                ToolManager = ToolsContext->ToolManager.Get();
+                GizmoManager = ToolsContext->GizmoManager.Get();
+                InputRouter = ToolsContext->InputRouter.Get();
+
+                if (UContextObjectStore* ContextStore = ToolManager->GetContextObjectStore())
+                {
+                    GizmoViewContext = ContextStore->FindContext<UGizmoViewContext>();
+                    if (!GizmoViewContext)
+                    {
+                        GizmoViewContext = NewObject<UGizmoViewContext>(ToolManager);
+                        ContextStore->AddContextObject(GizmoViewContext);
+                    }
+                }
+
+                PreviewOwner->SetOverlayMaterials(ToolManager);
+                PreviewOwner->SetupGizmo(GizmoManager, ToolManager);
             }
         }
-    }
-
-    void ProcessClick(FSceneView& View, HHitProxy* HitProxy, FKey Key,
-        EInputEvent Event, uint32 HitX, uint32 HitY) override
-    {
-        if (bConsumedByGizmo)
-        {
-            bConsumedByGizmo = false;
-            return;
-        }
-
-        if (Key == EKeys::LeftMouseButton && !IsAltPressed() && !IsCtrlPressed())
-        {
-            if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
-            {
-                Pinned->Pick(View, FVector2D(HitX, HitY), IsShiftPressed());
-                return;
-            }
-        }
-        FEditorViewportClient::ProcessClick(View, HitProxy, Key, Event, HitX, HitY);
     }
 
     bool InputKey(const FInputKeyEventArgs& EventArgs) override
     {
         if (EventArgs.Event == IE_Pressed && EventArgs.Key == EKeys::Escape && PreviewOwner->IsSoftTransformActive())
         {
+            if (InputRouter)
+            {
+                InputRouter->ForceTerminateAll();
+            }
             PreviewOwner->CancelSoftTransform();
+            bLeftMouseButtonDown = false;
+            bConsumedByGizmo = false;
             bMarqueeActive = false;
             bMarqueePending = false;
-            bConsumedByGizmo = false;
             Invalidate();
             return true;
         }
@@ -119,33 +124,62 @@ public:
         {
             const int32 MouseX = EventArgs.Viewport->GetMouseX();
             const int32 MouseY = EventArgs.Viewport->GetMouseY();
+            const FVector2D CurrentPos(MouseX, MouseY);
 
             if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
             {
+                LastMousePosition = CurrentPos;
+                bLeftMouseButtonDown = true;
                 bConsumedByGizmo = false;
-                // Let InteractiveToolsContext / Gizmo hit-test the click first
-                const bool bHandledByTools = FEditorViewportClient::InputKey(EventArgs);
-                if (PreviewOwner->IsSoftTransformActive())
+
+                FSceneViewFamilyContext ViewFamily(
+                    FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
+                    .SetRealtimeUpdate(IsRealtime()));
+                if (FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily))
                 {
-                    bConsumedByGizmo = true;
-                    bMarqueeActive = false;
-                    bMarqueePending = false;
-                    return true;
+                    if (InputRouter)
+                    {
+                        FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
+                        State.Mouse.Left.SetStates(true, true, false);
+                        InputRouter->PostInputEvent(State);
+
+                        if (InputRouter->HasActiveMouseCapture() || PreviewOwner->IsSoftTransformActive())
+                        {
+                            bConsumedByGizmo = true;
+                            bMarqueeActive = false;
+                            bMarqueePending = false;
+                            Invalidate();
+                            return true;
+                        }
+                    }
                 }
 
-                MarqueeStart = FVector2D(MouseX, MouseY);
-                MarqueeCurrent = MarqueeStart;
+                MarqueeStart = CurrentPos;
+                MarqueeCurrent = CurrentPos;
                 bMarqueeActive = false;
                 bMarqueePending = true;
-                return bHandledByTools;
+                return true;
             }
             else if (EventArgs.Event == IE_Released && !IsAltPressed() && !IsCtrlPressed())
             {
-                const bool bWasSoftActive = PreviewOwner->IsSoftTransformActive();
-                const bool bHandledByTools = FEditorViewportClient::InputKey(EventArgs);
+                const FVector2D Delta = CurrentPos - LastMousePosition;
+                LastMousePosition = CurrentPos;
+                bLeftMouseButtonDown = false;
 
-                if (bWasSoftActive || bConsumedByGizmo)
+                FSceneViewFamilyContext ViewFamily(
+                    FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
+                    .SetRealtimeUpdate(IsRealtime()));
+                FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily);
+
+                if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || PreviewOwner->IsSoftTransformActive())
                 {
+                    if (View && InputRouter)
+                    {
+                        FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, Delta);
+                        State.Mouse.Left.SetStates(false, false, true);
+                        InputRouter->PostInputEvent(State);
+                    }
+                    bConsumedByGizmo = false;
                     bMarqueeActive = false;
                     bMarqueePending = false;
                     Invalidate();
@@ -154,10 +188,7 @@ public:
 
                 if (bMarqueeActive)
                 {
-                    FSceneViewFamilyContext ViewFamily(
-                        FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
-                        .SetRealtimeUpdate(IsRealtime()));
-                    if (FSceneView* View = CalcSceneView(&ViewFamily))
+                    if (View)
                     {
                         const FBox2D Rect(MarqueeStart, MarqueeCurrent);
                         const bool bFullyContained = MarqueeCurrent.X >= MarqueeStart.X;
@@ -172,11 +203,25 @@ public:
                     return true;
                 }
 
-                bMarqueePending = false;
-                return bHandledByTools;
+                if (bMarqueePending)
+                {
+                    bMarqueePending = false;
+                    if (View)
+                    {
+                        if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+                        {
+                            Pinned->Pick(*View, CurrentPos, IsShiftPressed());
+                        }
+                    }
+                    Invalidate();
+                    return true;
+                }
+                return true;
             }
             else if (EventArgs.Event == IE_Released)
             {
+                bLeftMouseButtonDown = false;
+                bConsumedByGizmo = false;
                 bMarqueeActive = false;
                 bMarqueePending = false;
             }
@@ -185,11 +230,11 @@ public:
                 FSceneViewFamilyContext ViewFamily(
                     FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
                     .SetRealtimeUpdate(IsRealtime()));
-                if (FSceneView* View = CalcSceneView(&ViewFamily))
+                if (FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily))
                 {
                     if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
                     {
-                        const int32 Id = Pinned->Pick(*View, FVector2D(MouseX, MouseY), IsShiftPressed());
+                        const int32 Id = Pinned->Pick(*View, CurrentPos, IsShiftPressed());
                         if (Pinned->GetSelectionMode() == ENGonElement::Edge && Id != INDEX_NONE)
                         {
                             Pinned->SelectEdgeLoop(Id, IsShiftPressed());
@@ -246,31 +291,34 @@ public:
 
     void MouseMove(FViewport* InViewport, int32 X, int32 Y) override
     {
-        // Forwards hover state to ModeTools so gizmo handles highlight under the cursor
+        if (HandleLeftMouseDrag(InViewport, X, Y))
+        {
+            return;
+        }
+
+        if (InputRouter && InViewport && !IsAltPressed())
+        {
+            FSceneViewFamilyContext ViewFamily(
+                FSceneViewFamily::ConstructionValues(InViewport, GetScene(), EngineShowFlags)
+                .SetRealtimeUpdate(IsRealtime()));
+            if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+            {
+                const FVector2D CurrentPos(X, Y);
+                FInputDeviceState State = MakeMouseInputState(*View, X, Y, CurrentPos - LastMousePosition);
+                LastMousePosition = CurrentPos;
+                InputRouter->PostHoverInputEvent(State);
+                Invalidate();
+            }
+            return;
+        }
+
         FEditorViewportClient::MouseMove(InViewport, X, Y);
     }
 
     void CapturedMouseMove(FViewport* InViewport, int32 InMouseX, int32 InMouseY) override
     {
-        if (PreviewOwner->IsSoftTransformActive())
+        if (HandleLeftMouseDrag(InViewport, InMouseX, InMouseY))
         {
-            bMarqueeActive = false;
-            bMarqueePending = false;
-            FEditorViewportClient::CapturedMouseMove(InViewport, InMouseX, InMouseY);
-            Invalidate();
-            return;
-        }
-
-        if (bMarqueePending && !IsAltPressed())
-        {
-            const FVector2D Current(InMouseX, InMouseY);
-            if (bMarqueeActive || (InViewport && MarqueeStart != Current &&
-                (FMath::Abs(Current.X - MarqueeStart.X) + FMath::Abs(Current.Y - MarqueeStart.Y) > 5.0)))
-            {
-                MarqueeCurrent = Current;
-                bMarqueeActive = true;
-                Invalidate();
-            }
             return;
         }
 
@@ -279,8 +327,7 @@ public:
 
     bool InputAxis(const FInputKeyEventArgs& Args) override
     {
-        // Prevent plain Left-Mouse-Drag (without Alt) from panning the camera during gizmo or marquee drags
-        if (!IsAltPressed() && (PreviewOwner->IsSoftTransformActive() || bMarqueePending || bMarqueeActive))
+        if (!IsAltPressed() && (bLeftMouseButtonDown || bConsumedByGizmo || PreviewOwner->IsSoftTransformActive() || bMarqueePending || bMarqueeActive))
         {
             return true;
         }
@@ -289,7 +336,16 @@ public:
 
     void Draw(FViewport* InViewport, FCanvas* Canvas) override
     {
+        if (InViewport && GizmoViewContext)
+        {
+            FSceneViewFamilyContext ViewFamily(
+                FSceneViewFamily::ConstructionValues(InViewport, GetScene(), EngineShowFlags)
+                .SetRealtimeUpdate(IsRealtime()));
+            BuildSceneView(InViewport, ViewFamily);
+        }
+
         FEditorViewportClient::Draw(InViewport, Canvas);
+
         if (bMarqueeActive && Canvas)
         {
             const FVector2D Min(FMath::Min(MarqueeStart.X, MarqueeCurrent.X), FMath::Min(MarqueeStart.Y, MarqueeCurrent.Y));
@@ -307,9 +363,89 @@ public:
     }
 
 private:
+    FSceneView* BuildSceneView(FViewport* InViewport, FSceneViewFamilyContext& ViewFamily)
+    {
+        if (!InViewport || InViewport->GetSizeXY().GetMin() <= 0)
+        {
+            return nullptr;
+        }
+        FSceneView* View = CalcSceneView(&ViewFamily);
+        if (View && GizmoViewContext)
+        {
+            GizmoViewContext->ResetFromSceneView(*View);
+        }
+        return View;
+    }
+
+    FInputDeviceState MakeMouseInputState(const FSceneView& View, int32 MouseX, int32 MouseY, const FVector2D& Delta2D) const
+    {
+        FVector RayOrigin = FVector::ZeroVector;
+        FVector RayDirection = FVector::ForwardVector;
+        View.DeprojectFVector2D(FVector2D(MouseX, MouseY), RayOrigin, RayDirection);
+
+        FInputDeviceState State;
+        State.InputDevice = EInputDevices::Mouse;
+        State.SetModifierKeyStates(IsShiftPressed(), IsAltPressed(), IsCtrlPressed(), false);
+        State.Mouse.Position2D = FVector2D(MouseX, MouseY);
+        State.Mouse.Delta2D = Delta2D;
+        State.Mouse.WorldRay = FRay(RayOrigin, RayDirection);
+        return State;
+    }
+
+    bool HandleLeftMouseDrag(FViewport* InViewport, int32 InMouseX, int32 InMouseY)
+    {
+        if (!bLeftMouseButtonDown || !InViewport)
+        {
+            return false;
+        }
+
+        const FVector2D CurrentPos(InMouseX, InMouseY);
+        const FVector2D Delta = CurrentPos - LastMousePosition;
+        LastMousePosition = CurrentPos;
+
+        if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || PreviewOwner->IsSoftTransformActive())
+        {
+            FSceneViewFamilyContext ViewFamily(
+                FSceneViewFamily::ConstructionValues(InViewport, GetScene(), EngineShowFlags)
+                .SetRealtimeUpdate(IsRealtime()));
+            if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+            {
+                if (InputRouter)
+                {
+                    FInputDeviceState State = MakeMouseInputState(*View, InMouseX, InMouseY, Delta);
+                    State.Mouse.Left.SetStates(false, true, false);
+                    InputRouter->PostInputEvent(State);
+                }
+            }
+            Invalidate();
+            return true;
+        }
+
+        if (bMarqueePending && !IsAltPressed())
+        {
+            if (bMarqueeActive || (MarqueeStart != CurrentPos &&
+                (FMath::Abs(CurrentPos.X - MarqueeStart.X) + FMath::Abs(CurrentPos.Y - MarqueeStart.Y) > 5.0)))
+            {
+                MarqueeCurrent = CurrentPos;
+                bMarqueeActive = true;
+                Invalidate();
+            }
+            return true;
+        }
+
+        return false;
+    }
+
     TWeakPtr<SNGonViewport> Widget;
+    UInteractiveToolManager* ToolManager = nullptr;
+    UInteractiveGizmoManager* GizmoManager = nullptr;
+    UInputRouter* InputRouter = nullptr;
+    UGizmoViewContext* GizmoViewContext = nullptr;
+
+    FVector2D LastMousePosition = FVector2D::ZeroVector;
     FVector2D MarqueeStart = FVector2D::ZeroVector;
     FVector2D MarqueeCurrent = FVector2D::ZeroVector;
+    bool bLeftMouseButtonDown = false;
     bool bMarqueeActive = false;
     bool bMarqueePending = false;
     bool bConsumedByGizmo = false;
