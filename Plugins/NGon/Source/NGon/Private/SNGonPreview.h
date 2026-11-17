@@ -2,12 +2,12 @@
 
 #include "CoreMinimal.h"
 #include "NGonPicking.h"
+#include "NGonPreviewScene.h"
 #include "NGonSoftSelection.h"
 #include "SEditorViewport.h"
 #include "Widgets/SCompoundWidget.h"
 
 struct FAssetData;
-class FNGonPreviewScene;
 struct FNGonMeshData;
 
 class SNGonViewport final : public SEditorViewport
@@ -18,6 +18,7 @@ public:
 
     void Construct(const FArguments& InArgs);
     void SetSelectionMode(ENGonElement Element);
+    void SetGizmoMode(ENGonGizmoMode Mode);
     ENGonElement GetSelectionMode() const { return SelectionMode; }
     void ToggleHeatmap();
     void SetHeatmapVisible(bool bVisible);

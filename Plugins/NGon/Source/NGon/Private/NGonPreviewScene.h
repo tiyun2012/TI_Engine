@@ -25,6 +25,16 @@ enum class ENGonGizmoFramePolicy : uint8
     ActiveElement
 };
 
+/** High-level W/E/R transform tool. UE owns gizmo drawing and hit testing. */
+enum class ENGonGizmoMode : uint8
+{
+    Combined,
+    Translate,
+    Rotate,
+    Scale,
+    None
+};
+
 class FNGonPreviewScene
 {
 public:
@@ -59,6 +69,8 @@ public:
     FTransform GetSelectionGizmoTransform() const;
     void SetGizmoFramePolicy(ENGonGizmoFramePolicy InPolicy) { GizmoFramePolicy = InPolicy; UpdateGizmo(); }
     ENGonGizmoFramePolicy GetGizmoFramePolicy() const { return GizmoFramePolicy; }
+    void SetGizmoMode(ENGonGizmoMode InMode) { GizmoMode = InMode; UpdateGizmo(); }
+    ENGonGizmoMode GetGizmoMode() const { return GizmoMode; }
     int32 Pick(ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd);
     void BoxSelect(ENGonElement Element, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
@@ -132,6 +144,7 @@ private:
     TArray<FVector> SoftOriginalPositions;
     FTransform ActiveGizmoTransform = FTransform::Identity;
     ENGonGizmoFramePolicy GizmoFramePolicy = ENGonGizmoFramePolicy::WeightedAverage;
+    ENGonGizmoMode GizmoMode = ENGonGizmoMode::Combined;
     UInteractiveGizmoManager* GizmoManager = nullptr;
     UCombinedTransformGizmo* TransformGizmo = nullptr;
     UTransformProxy* TransformProxy = nullptr;

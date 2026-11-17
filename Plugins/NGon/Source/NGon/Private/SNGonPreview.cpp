@@ -265,6 +265,21 @@ public:
                     Pinned->SetSelectionMode(ENGonElement::Face);
                     return true;
                 }
+                if (EventArgs.Key == EKeys::W)
+                {
+                    Pinned->SetGizmoMode(ENGonGizmoMode::Translate);
+                    return true;
+                }
+                if (EventArgs.Key == EKeys::E)
+                {
+                    Pinned->SetGizmoMode(ENGonGizmoMode::Rotate);
+                    return true;
+                }
+                if (EventArgs.Key == EKeys::R)
+                {
+                    Pinned->SetGizmoMode(ENGonGizmoMode::Scale);
+                    return true;
+                }
                 if (EventArgs.Key == EKeys::H)
                 {
                     Pinned->ToggleHeatmap();
@@ -513,6 +528,12 @@ void SNGonViewport::SetSelectionMode(ENGonElement Element)
     }
 }
 
+void SNGonViewport::SetGizmoMode(ENGonGizmoMode Mode)
+{
+    PreviewScene->SetGizmoMode(Mode);
+    Invalidate();
+}
+
 void SNGonViewport::ToggleHeatmap()
 {
     if (!PreviewScene->HasSoftSelectionInfluence())
@@ -705,6 +726,30 @@ TSharedRef<SWidget> SNGonPreview::MakeControls()
         + SWrapBox::Slot()
         [
             MakeSelectionMode(ENGonElement::Vertex, LOCTEXT("VertexMode", "Vertex"))
+        ]
+        + SWrapBox::Slot()
+        [
+            SNew(STextBlock).Text(LOCTEXT("Transform", "Transform"))
+        ]
+        + SWrapBox::Slot()
+        [
+            SNew(SButton).Text(LOCTEXT("TranslateTool", "Translate (W)"))
+            .OnClicked_Lambda([this] { Viewport->SetGizmoMode(ENGonGizmoMode::Translate); return FReply::Handled(); })
+        ]
+        + SWrapBox::Slot()
+        [
+            SNew(SButton).Text(LOCTEXT("RotateTool", "Rotate (E)"))
+            .OnClicked_Lambda([this] { Viewport->SetGizmoMode(ENGonGizmoMode::Rotate); return FReply::Handled(); })
+        ]
+        + SWrapBox::Slot()
+        [
+            SNew(SButton).Text(LOCTEXT("ScaleTool", "Scale (R)"))
+            .OnClicked_Lambda([this] { Viewport->SetGizmoMode(ENGonGizmoMode::Scale); return FReply::Handled(); })
+        ]
+        + SWrapBox::Slot()
+        [
+            SNew(SButton).Text(LOCTEXT("CombinedTool", "Combined"))
+            .OnClicked_Lambda([this] { Viewport->SetGizmoMode(ENGonGizmoMode::Combined); return FReply::Handled(); })
         ]
         + SWrapBox::Slot()
         [

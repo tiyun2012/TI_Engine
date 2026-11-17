@@ -150,6 +150,30 @@ void FNGonPreviewScene::UpdateGizmo()
     if (!TransformProxy || !TransformGizmo) return;
     bUpdatingGizmo = true;
     const FTransform Frame = GetSelectionGizmoTransform();
+    // Keep the tool policy local to the preview, matching TiGUI/Maya W/E/R
+    // behavior while retaining UE's native sub-gizmo interaction and hit test.
+    TransformGizmo->bUseContextGizmoMode = false;
+    switch (GizmoMode)
+    {
+    case ENGonGizmoMode::Translate:
+        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::Translation;
+        break;
+    case ENGonGizmoMode::Rotate:
+        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::Rotation;
+        break;
+    case ENGonGizmoMode::Scale:
+        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::Scale;
+        break;
+    case ENGonGizmoMode::None:
+        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::NoGizmo;
+        break;
+    case ENGonGizmoMode::Combined:
+    default:
+        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::Combined;
+        break;
+    }
+    TransformGizmo->bUseContextCoordinateSystem = false;
+    TransformGizmo->CurrentCoordinateSystem = EToolContextCoordinateSystem::Local;
     TransformGizmo->SetVisibility(!SelectedIds.IsEmpty());
     TransformProxy->SetTransform(Frame);
     TransformGizmo->ReinitializeGizmoTransform(Frame);
