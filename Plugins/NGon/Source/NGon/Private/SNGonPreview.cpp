@@ -84,6 +84,7 @@ public:
             if (UModeManagerInteractiveToolsContext* ToolsContext = ViewportModeTools->GetInteractiveToolsContext();
                 ToolsContext && ToolsContext->ToolManager && ToolsContext->GizmoManager && ToolsContext->InputRouter)
             {
+                InteractiveToolsContext = ToolsContext;
                 ToolManager = ToolsContext->ToolManager.Get();
                 GizmoManager = ToolsContext->GizmoManager.Get();
                 InputRouter = ToolsContext->InputRouter.Get();
@@ -104,19 +105,18 @@ public:
         }
     }
 
-    EMouseCursor::Type GetRequiredCursor() override
+    EMouseCursor::Type GetCursor(FViewport* InViewport, int32 X, int32 Y) override
     {
-        // Prevent FSceneViewport::OnMouseButtonDown from hiding/locking the OS
-        // cursor (bCursorHiddenDueToCapture) during non-Alt gizmo and marquee drags.
-        if (!IsAltPressed())
+        // Keep the normal editor cursor contract in UE 5.8 while showing an
+        // explicit drag cursor for an active Interactive Tools capture.
+        if (InViewport && !IsAltPressed())
         {
             if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || PreviewOwner->IsSoftTransformActive())
             {
                 return EMouseCursor::CardinalCross;
             }
-            return EMouseCursor::Default;
         }
-        return FEditorViewportClient::GetRequiredCursor();
+        return FEditorViewportClient::GetCursor(InViewport, X, Y);
     }
 
     void Tick(float DeltaSeconds) override
@@ -182,16 +182,25 @@ public:
                     {
                         GizmoManager->Tick(0.0f);
                     }
-                    if (InputRouter)
+                    if (InputRouter || InteractiveToolsContext)
                     {
-                        FInputDeviceState HoverState = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
-                        InputRouter->PostHoverInputEvent(HoverState);
+                        // Let UE update the tools-context mouse state and route
+                        // the press through its normal capture arbitration.
+                        // This keeps hover/capture ownership synchronized with
+                        // Slate's viewport mouse capture.
+                        bool bCapturedOnPress = false;
+                        if (InteractiveToolsContext)
+                        {
+                            bCapturedOnPress = InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                        }
+                        else if (InputRouter)
+                        {
+                            FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
+                            State.Mouse.Left.SetStates(true, true, false);
+                            bCapturedOnPress = InputRouter->PostInputEvent(State);
+                        }
 
-                        FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
-                        State.Mouse.Left.SetStates(true, true, false);
-                        InputRouter->PostInputEvent(State);
-
-                        if (InputRouter->HasActiveMouseCapture() || PreviewOwner->IsSoftTransformActive())
+                        if (bCapturedOnPress || InputRouter->HasActiveMouseCapture() || PreviewOwner->IsSoftTransformActive())
                         {
                             bConsumedByGizmo = true;
                             bMarqueeActive = false;
@@ -212,6 +221,13 @@ public:
             {
                 const FVector2D Delta = CurrentPos - LastMousePosition;
                 LastMousePosition = CurrentPos;
+                // Snapshot ownership before forwarding release. The tools
+                // context clears its active capture while processing IE_Released,
+                // so checking HasActiveMouseCapture() afterwards would lose the
+                // information needed to keep this event out of mesh picking.
+                const bool bWasGizmoInteraction = bConsumedByGizmo
+                    || (InputRouter && InputRouter->HasActiveMouseCapture())
+                    || PreviewOwner->IsSoftTransformActive();
                 bLeftMouseButtonDown = false;
 
                 FSceneViewFamilyContext ViewFamily(
@@ -219,9 +235,18 @@ public:
                     .SetRealtimeUpdate(IsRealtime()));
                 FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily);
 
-                if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || PreviewOwner->IsSoftTransformActive())
+                // Always update the tools-context button state, including a
+                // marquee/click release. Otherwise its cached Left.bDown state
+                // remains stale and the next hover can start with a phantom
+                // capture.
+                if (InteractiveToolsContext)
                 {
-                    if (View && InputRouter)
+                    InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                }
+
+                if (bWasGizmoInteraction)
+                {
+                    if (!InteractiveToolsContext && View && InputRouter)
                     {
                         FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, Delta);
                         State.Mouse.Left.SetStates(false, false, true);
@@ -272,6 +297,27 @@ public:
             }
             else if (EventArgs.Event == IE_Released)
             {
+                if (InteractiveToolsContext)
+                {
+                    const bool bNeedsToolRelease = bConsumedByGizmo
+                        || (InputRouter && InputRouter->HasActiveMouseCapture())
+                        || PreviewOwner->IsSoftTransformActive();
+                    if (bNeedsToolRelease)
+                    {
+                        // A modifier may be pressed when the gesture ends.
+                        // Active captures still own that release and must see it
+                        // or the transform remains latched.
+                        InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                    }
+                    else
+                    {
+                        // Ctrl/Alt selection shortcuts bypass normal tool
+                        // routing, but the tools context still needs the
+                        // physical button state transition.
+                        InteractiveToolsContext->UpdateStateWithoutRoutingInputKey(
+                            this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                    }
+                }
                 bLeftMouseButtonDown = false;
                 bConsumedByGizmo = false;
                 bMarqueeActive = false;
@@ -279,6 +325,11 @@ public:
             }
             else if (EventArgs.Event == IE_Pressed && IsCtrlPressed() && !IsAltPressed())
             {
+                if (InteractiveToolsContext)
+                {
+                    InteractiveToolsContext->UpdateStateWithoutRoutingInputKey(
+                        this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                }
                 FSceneViewFamilyContext ViewFamily(
                     FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
                     .SetRealtimeUpdate(IsRealtime()));
@@ -358,12 +409,7 @@ public:
 
     void MouseMove(FViewport* InViewport, int32 X, int32 Y) override
     {
-        if (FEditorModeTools* ViewportModeTools = GetModeTools())
-        {
-            ViewportModeTools->MouseEnter(this, InViewport, X, Y);
-        }
-
-        if (HandleLeftMouseDrag(InViewport, X, Y))
+        if (HandleLeftMouseDrag(InViewport, X, Y, false))
         {
             return;
         }
@@ -379,10 +425,20 @@ public:
                 {
                     GizmoManager->Tick(0.0f);
                 }
-                const FVector2D CurrentPos(X, Y);
-                FInputDeviceState State = MakeMouseInputState(*View, X, Y, CurrentPos - LastMousePosition);
-                LastMousePosition = CurrentPos;
-                InputRouter->PostHoverInputEvent(State);
+                // Use the tools context for hover updates as well. It tracks
+                // the current ray and transitions an existing hover capture
+                // into a drag capture using the same path as editor viewports.
+                if (InteractiveToolsContext)
+                {
+                    InteractiveToolsContext->MouseMove(this, InViewport, X, Y);
+                }
+                else if (InputRouter)
+                {
+                    const FVector2D CurrentPos(X, Y);
+                    FInputDeviceState State = MakeMouseInputState(*View, X, Y, CurrentPos - LastMousePosition);
+                    LastMousePosition = CurrentPos;
+                    InputRouter->PostHoverInputEvent(State);
+                }
                 Invalidate();
             }
             return;
@@ -393,7 +449,7 @@ public:
 
     void CapturedMouseMove(FViewport* InViewport, int32 InMouseX, int32 InMouseY) override
     {
-        if (HandleLeftMouseDrag(InViewport, InMouseX, InMouseY))
+        if (HandleLeftMouseDrag(InViewport, InMouseX, InMouseY, true))
         {
             return;
         }
@@ -468,7 +524,7 @@ private:
         return State;
     }
 
-    bool HandleLeftMouseDrag(FViewport* InViewport, int32 InMouseX, int32 InMouseY)
+    bool HandleLeftMouseDrag(FViewport* InViewport, int32 InMouseX, int32 InMouseY, bool bCapturedMouseMove)
     {
         if (!bLeftMouseButtonDown || !InViewport)
         {
@@ -486,7 +542,18 @@ private:
                 .SetRealtimeUpdate(IsRealtime()));
             if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
             {
-                if (InputRouter)
+                if (InteractiveToolsContext)
+                {
+                    if (bCapturedMouseMove)
+                    {
+                        InteractiveToolsContext->CapturedMouseMove(this, InViewport, InMouseX, InMouseY);
+                    }
+                    else
+                    {
+                        InteractiveToolsContext->MouseMove(this, InViewport, InMouseX, InMouseY);
+                    }
+                }
+                else if (InputRouter)
                 {
                     FInputDeviceState State = MakeMouseInputState(*View, InMouseX, InMouseY, Delta);
                     State.Mouse.Left.SetStates(false, true, false);
@@ -517,6 +584,7 @@ private:
     }
 
     TWeakPtr<SNGonViewport> Widget;
+    UModeManagerInteractiveToolsContext* InteractiveToolsContext = nullptr;
     UInteractiveToolManager* ToolManager = nullptr;
     UInteractiveGizmoManager* GizmoManager = nullptr;
     UInputRouter* InputRouter = nullptr;
