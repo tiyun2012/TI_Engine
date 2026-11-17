@@ -1,6 +1,7 @@
 #include "NGonPreviewScene.h"
 
 #include "Components/DynamicMeshComponent.h"
+#include "ContextObjectStore.h"
 #include "Drawing/LineSetComponent.h"
 #include "Drawing/PointSetComponent.h"
 #include "Drawing/PreviewGeometryActor.h"
@@ -12,6 +13,8 @@
 #include "ToolSetupUtil.h"
 #include "UDynamicMesh.h"
 #include "BaseGizmos/CombinedTransformGizmo.h"
+#include "BaseGizmos/GizmoBaseComponent.h"
+#include "BaseGizmos/GizmoViewContext.h"
 #include "BaseGizmos/TransformGizmoUtil.h"
 #include "BaseGizmos/TransformProxy.h"
 #include "InteractiveGizmoManager.h"
@@ -100,6 +103,28 @@ void FNGonPreviewScene::SetupGizmo(UInteractiveGizmoManager* InGizmoManager, ITo
     // and can assert when the editor context has not installed that helper.
     TransformGizmo = GizmoManager->Create3AxisTransformGizmo(this, TEXT("NGonPreview"));
     if (!TransformGizmo) { TransformProxy = nullptr; return; }
+
+    if (UContextObjectStore* ContextStore = GizmoManager->GetContextObjectStore())
+    {
+        UGizmoViewContext* ViewContext = ContextStore->FindContext<UGizmoViewContext>();
+        if (!ViewContext)
+        {
+            ViewContext = NewObject<UGizmoViewContext>(GizmoManager);
+            ContextStore->AddContextObject(ViewContext);
+        }
+        if (AActor* GizmoActor = TransformGizmo->GetGizmoActor())
+        {
+            TInlineComponentArray<UGizmoBaseComponent*> GizmoComponents(GizmoActor);
+            for (UGizmoBaseComponent* Comp : GizmoComponents)
+            {
+                if (Comp)
+                {
+                    Comp->SetGizmoViewContext(ViewContext);
+                }
+            }
+        }
+    }
+
     TransformProxy->SetTransform(GetSelectionGizmoTransform());
     TransformProxy->OnBeginTransformEdit.AddLambda([this](UTransformProxy*) {
         if (!bUpdatingGizmo) BeginSoftTransform(TransformProxy->GetTransform(), SoftTransformMode);
