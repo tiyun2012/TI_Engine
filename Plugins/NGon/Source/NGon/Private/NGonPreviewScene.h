@@ -17,6 +17,14 @@ class UCombinedTransformGizmo;
 class UTransformProxy;
 class IToolContextTransactionProvider;
 
+/** Coordinate frame used by the component gizmo. WeightedAverage matches Maya's
+ * multi-component behavior; ActiveElement uses the most recently picked item. */
+enum class ENGonGizmoFramePolicy : uint8
+{
+    WeightedAverage,
+    ActiveElement
+};
+
 class FNGonPreviewScene
 {
 public:
@@ -42,12 +50,15 @@ public:
     ENGonSoftTransformMode GetSoftTransformMode() const { return SoftTransformMode; }
     const FNGonSoftSelectionSettings& GetSoftSelectionSettings() const { return SoftSettings; }
     const TArray<FNGonVertexInfluence>& GetSoftSelectionInfluences() const { return SoftInfluences; }
+    bool HasSoftSelectionInfluence() const { return SoftSettings.bEnabled && !SelectedIds.IsEmpty() && !SoftInfluences.IsEmpty(); }
     bool BeginSoftTransform(const FTransform& GizmoTransform, ENGonSoftTransformMode Mode);
     bool ApplyGizmoTransform(const FTransform& GizmoTransform);
     void EndSoftTransform();
     void CancelSoftTransform();
     bool IsSoftTransformActive() const { return SoftSession.IsActive(); }
     FTransform GetSelectionGizmoTransform() const;
+    void SetGizmoFramePolicy(ENGonGizmoFramePolicy InPolicy) { GizmoFramePolicy = InPolicy; UpdateGizmo(); }
+    ENGonGizmoFramePolicy GetGizmoFramePolicy() const { return GizmoFramePolicy; }
     int32 Pick(ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd);
     void BoxSelect(ENGonElement Element, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
@@ -77,6 +88,12 @@ private:
     void DrawSelection();
     void DrawSoftSelection();
     void RebuildSoftSelection();
+    // Build a dense logical-vertex buffer from the sparse solver result. The
+    // surface material consumes this buffer so its ramp matches the TiGUI
+    // influence display instead of imported FBX vertex colors.
+    void RebuildSoftHeatSamples();
+    void RebuildGizmoAdjacency();
+    FTransform BuildComponentGizmoTransform() const;
 
     FPreviewScene Scene;
     TStrongObjectPtr<UPreviewGeometry> Overlay;
@@ -91,7 +108,10 @@ private:
     FNGonPicker Picker;
     ENGonElement SelectedElement = ENGonElement::Face;
     TSet<int32> SelectedIds;
+    int32 ActiveSelectedId = INDEX_NONE;
     TArray<FVector> Positions;
+    TMap<int32, TArray<int32>> GizmoVertexFaces;
+    TMap<FIntPoint, TArray<int32>> GizmoEdgeFaces;
     TArray<float> AxisFractions;
     TArray<float> HeatSamples;
     TBitArray<> ImportedHeatMask;
@@ -108,8 +128,10 @@ private:
     FNGonSoftSelectionSolver SoftSolver;
     FNGonSoftTransformSession SoftSession;
     TArray<FNGonVertexInfluence> SoftInfluences;
+    TArray<float> SoftHeatSamples;
     TArray<FVector> SoftOriginalPositions;
     FTransform ActiveGizmoTransform = FTransform::Identity;
+    ENGonGizmoFramePolicy GizmoFramePolicy = ENGonGizmoFramePolicy::WeightedAverage;
     UInteractiveGizmoManager* GizmoManager = nullptr;
     UCombinedTransformGizmo* TransformGizmo = nullptr;
     UTransformProxy* TransformProxy = nullptr;

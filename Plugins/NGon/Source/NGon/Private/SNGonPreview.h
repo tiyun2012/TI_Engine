@@ -21,7 +21,7 @@ public:
     ENGonElement GetSelectionMode() const { return SelectionMode; }
     void ToggleHeatmap();
     void SetHeatmapVisible(bool bVisible);
-    bool IsHeatmapVisible() const { return bHeatmapVisible; }
+    bool IsHeatmapVisible() const;
     void SetMesh(FNGonMeshData&& Data);
     void FrameMesh();
     bool DeleteSelectedFaces();

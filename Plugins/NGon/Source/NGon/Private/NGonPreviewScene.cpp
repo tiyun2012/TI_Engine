@@ -188,16 +188,19 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
     Picker.SetMesh(nullptr);
     SelectedElement = ENGonElement::Face;
     SelectedIds.Reset();
+    ActiveSelectedId = INDEX_NONE;
     SoftSettings = FNGonSoftSelectionSettings{};
     SoftTransformMode = ENGonSoftTransformMode::Fixed;
     SoftSession.Cancel();
     SoftSolver.Reset();
     SoftInfluences.Reset();
+    bHeatmapVisible = false;
     Bend = 0.0f;
     HeatBias = 0.0f;
 
     Topology = MoveTemp(Data.Topology);
     Positions = Topology.RestPositions;
+    RebuildGizmoAdjacency();
 
     const FVector Size = Topology.RestBounds.GetSize();
     int32 Axis = Size.Y > Size.X ? 1 : 0;
@@ -228,6 +231,7 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
             HeatSamples.Add(Fraction);
         }
     }
+    SoftHeatSamples.Init(0.0f, Positions.Num());
 
     InitializeColorOverlay(Data.Mesh);
     Surface->SetMesh(MoveTemp(Data.Mesh));
@@ -280,12 +284,33 @@ void FNGonPreviewScene::InitializeColorOverlay(FDynamicMesh3& Mesh)
 void FNGonPreviewScene::WriteColors(FDynamicMesh3& Mesh) const
 {
     FDynamicMeshColorOverlay* Colors = Mesh.Attributes()->PrimaryColors();
+    const bool bUseSoftHeat = bHeatmapVisible && SoftSettings.bEnabled && !SoftInfluences.IsEmpty();
     for (const FColorElement& Element : ColorElements)
     {
-        const float Sample = FMath::Clamp(HeatSamples[Element.LogicalVertex] + HeatBias, 0.0f, 1.0f);
+        const float Sample = bUseSoftHeat && SoftHeatSamples.IsValidIndex(Element.LogicalVertex)
+            ? SoftHeatSamples[Element.LogicalVertex] : 0.0f;
         const bool bSelected = SelectedElement == ENGonElement::Face && SelectedIds.Contains(Element.Face);
         Colors->SetElement(Element.OverlayId, FVector4f(
-            Sample, bSelected ? 1.0f : 0.0f, bHeatmapVisible ? 1.0f : 0.0f, 1.0f));
+            Sample, bSelected ? 1.0f : 0.0f, bUseSoftHeat ? 1.0f : 0.0f, 1.0f));
+    }
+}
+
+void FNGonPreviewScene::RebuildSoftHeatSamples()
+{
+    SoftHeatSamples.Init(0.0f, Positions.Num());
+    if (!SoftSettings.bEnabled || SoftInfluences.IsEmpty())
+    {
+        return;
+    }
+
+    for (const FNGonVertexInfluence& Influence : SoftInfluences)
+    {
+        if (SoftHeatSamples.IsValidIndex(Influence.Vertex))
+        {
+            SoftHeatSamples[Influence.Vertex] = FMath::Max(
+                SoftHeatSamples[Influence.Vertex],
+                FMath::Clamp(static_cast<float>(Influence.Weight), 0.0f, 1.0f));
+        }
     }
 }
 
@@ -433,7 +458,6 @@ void FNGonPreviewScene::SetSoftSelection(const FNGonSoftSelectionSettings& Setti
 {
     SoftSettings = Settings;
     RebuildSoftSelection();
-    DrawSoftSelection();
 }
 
 void FNGonPreviewScene::RebuildSoftSelection()
@@ -454,20 +478,205 @@ void FNGonPreviewScene::RebuildSoftSelection()
             for (const int32 Vertex : Face->Perimeter) Seeds.AddUnique(Vertex);
     }
     SoftInfluences = SoftSolver.Solve(Topology, Positions, Seeds, FTransform::Identity, SoftSettings);
+    RebuildSoftHeatSamples();
     DrawSoftSelection();
+    UpdateColors();
 }
 
 FTransform FNGonPreviewScene::GetSelectionGizmoTransform() const
 {
-    FBox Bounds(ForceInit);
+    return BuildComponentGizmoTransform();
+}
+
+void FNGonPreviewScene::RebuildGizmoAdjacency()
+{
+    GizmoVertexFaces.Reset();
+    GizmoEdgeFaces.Reset();
+    for (const TPair<int32, FNGonFace>& Pair : Topology.Faces)
+    {
+        const int32 FaceId = Pair.Key;
+        const TArray<int32>& Perimeter = Pair.Value.Perimeter;
+        for (const int32 Vertex : Perimeter)
+        {
+            GizmoVertexFaces.FindOrAdd(Vertex).AddUnique(FaceId);
+        }
+        for (int32 Corner = 0; Corner < Perimeter.Num(); ++Corner)
+        {
+            const int32 A = Perimeter[Corner];
+            const int32 B = Perimeter[(Corner + 1) % Perimeter.Num()];
+            if (A != B)
+            {
+                GizmoEdgeFaces.FindOrAdd(FIntPoint(FMath::Min(A, B), FMath::Max(A, B))).AddUnique(FaceId);
+            }
+        }
+    }
+}
+
+FTransform FNGonPreviewScene::BuildComponentGizmoTransform() const
+{
+    struct FSample
+    {
+        FVector Position = FVector::ZeroVector;
+        FVector Normal = FVector::ZeroVector;
+        FVector Tangent = FVector::ZeroVector;
+        double Weight = 1.0;
+        bool bActive = false;
+    };
+
+    auto FaceNormal = [this](const FNGonFace& Face)
+    {
+        FVector Normal = FVector::ZeroVector;
+        if (Face.Perimeter.Num() < 3 || !Positions.IsValidIndex(Face.Perimeter[0]))
+        {
+            return Normal;
+        }
+        const FVector Origin = Positions[Face.Perimeter[0]];
+        for (int32 Corner = 1; Corner < Face.Perimeter.Num(); ++Corner)
+        {
+            const int32 Next = (Corner + 1) % Face.Perimeter.Num();
+            if (Positions.IsValidIndex(Face.Perimeter[Corner]) && Positions.IsValidIndex(Face.Perimeter[Next]))
+            {
+                Normal += FVector::CrossProduct(Positions[Face.Perimeter[Corner]] - Origin,
+                    Positions[Face.Perimeter[Next]] - Origin);
+            }
+        }
+        return Normal.GetSafeNormal();
+    };
+
+    TArray<FSample> Samples;
+    Samples.Reserve(SelectedIds.Num());
     for (const int32 Id : SelectedIds)
     {
-        if (SelectedElement == ENGonElement::Vertex && Positions.IsValidIndex(Id)) Bounds += Positions[Id];
-        else if (SelectedElement == ENGonElement::Edge && Topology.Edges.IsValidIndex(Id))
-        { const FIntPoint Edge = Topology.Edges[Id]; if (Positions.IsValidIndex(Edge.X)) Bounds += Positions[Edge.X]; if (Positions.IsValidIndex(Edge.Y)) Bounds += Positions[Edge.Y]; }
-        else if (SelectedElement == ENGonElement::Face) if (const FNGonFace* Face = Topology.Faces.Find(Id)) for (const int32 Vertex : Face->Perimeter) if (Positions.IsValidIndex(Vertex)) Bounds += Positions[Vertex];
+        FSample Sample;
+        Sample.bActive = Id == ActiveSelectedId;
+        if (SelectedElement == ENGonElement::Vertex)
+        {
+            if (!Positions.IsValidIndex(Id)) continue;
+            Sample.Position = Positions[Id];
+            if (const TArray<int32>* IncidentFaces = GizmoVertexFaces.Find(Id))
+            {
+                for (const int32 FaceId : *IncidentFaces)
+                {
+                    const FNGonFace* FacePtr = Topology.Faces.Find(FaceId);
+                    if (!FacePtr) continue;
+                    const FNGonFace& Face = *FacePtr;
+                    const FVector FaceN = FaceNormal(Face);
+                    Sample.Normal += FaceN;
+                    for (int32 Corner = 0; Corner < Face.Perimeter.Num(); ++Corner)
+                    {
+                        if (Face.Perimeter[Corner] != Id) continue;
+                        const int32 Next = Face.Perimeter[(Corner + 1) % Face.Perimeter.Num()];
+                        if (Positions.IsValidIndex(Next))
+                        {
+                            // Accumulate incident perimeter directions so the vertex
+                            // frame does not depend on TMap face iteration order.
+                            Sample.Tangent += Positions[Next] - Sample.Position;
+                        }
+                        break;
+                    }
+                }
+            }
+            Sample.Weight = 1.0;
+        }
+        else if (SelectedElement == ENGonElement::Edge)
+        {
+            if (!Topology.Edges.IsValidIndex(Id)) continue;
+            const FIntPoint Edge = Topology.Edges[Id];
+            if (!Positions.IsValidIndex(Edge.X) || !Positions.IsValidIndex(Edge.Y)) continue;
+            Sample.Position = (Positions[Edge.X] + Positions[Edge.Y]) * 0.5;
+            Sample.Tangent = Positions[Edge.Y] - Positions[Edge.X];
+            Sample.Weight = FMath::Max(Sample.Tangent.Size(), 1.e-4);
+            const FIntPoint EdgeKey(FMath::Min(Edge.X, Edge.Y), FMath::Max(Edge.X, Edge.Y));
+            if (const TArray<int32>* IncidentFaces = GizmoEdgeFaces.Find(EdgeKey))
+            {
+                for (const int32 FaceId : *IncidentFaces)
+                {
+                    if (const FNGonFace* Face = Topology.Faces.Find(FaceId))
+                    {
+                        Sample.Normal += FaceNormal(*Face);
+                    }
+                }
+            }
+        }
+        else
+        {
+            const FNGonFace* Face = Topology.Faces.Find(Id);
+            if (!Face || Face->Perimeter.Num() < 3) continue;
+            for (const int32 Vertex : Face->Perimeter)
+            {
+                if (Positions.IsValidIndex(Vertex)) Sample.Position += Positions[Vertex];
+            }
+            Sample.Position /= static_cast<double>(Face->Perimeter.Num());
+            Sample.Normal = FaceNormal(*Face);
+            if (Positions.IsValidIndex(Face->Perimeter[0]) && Positions.IsValidIndex(Face->Perimeter[1]))
+            {
+                Sample.Tangent = Positions[Face->Perimeter[1]] - Positions[Face->Perimeter[0]];
+            }
+            double Area = 0.0;
+            for (int32 Corner = 1; Corner + 1 < Face->Perimeter.Num(); ++Corner)
+            {
+                if (Positions.IsValidIndex(Face->Perimeter[0]) && Positions.IsValidIndex(Face->Perimeter[Corner]) && Positions.IsValidIndex(Face->Perimeter[Corner + 1]))
+                {
+                    Area += FVector::CrossProduct(Positions[Face->Perimeter[Corner]] - Positions[Face->Perimeter[0]],
+                        Positions[Face->Perimeter[Corner + 1]] - Positions[Face->Perimeter[0]]).Size() * 0.5;
+                }
+            }
+            Sample.Weight = FMath::Max(Area, 1.e-4);
+        }
+        if (!Sample.Normal.Normalize()) continue;
+        Sample.Tangent = Sample.Tangent - Sample.Normal * FVector::DotProduct(Sample.Tangent, Sample.Normal);
+        if (!Sample.Tangent.Normalize())
+        {
+            FVector FallbackY;
+            Sample.Normal.FindBestAxisVectors(Sample.Tangent, FallbackY);
+        }
+        Samples.Add(Sample);
     }
-    return Bounds.IsValid ? FTransform(FQuat::Identity, Bounds.GetCenter()) : FTransform::Identity;
+
+    if (Samples.IsEmpty()) return FTransform::Identity;
+    const FSample* Active = nullptr;
+    if (GizmoFramePolicy == ENGonGizmoFramePolicy::ActiveElement)
+    {
+        for (const FSample& Sample : Samples) if (Sample.bActive) { Active = &Sample; break; }
+        if (!Active) Active = &Samples[0];
+    }
+
+    FVector Position = FVector::ZeroVector;
+    FVector Normal = FVector::ZeroVector;
+    FVector Tangent = FVector::ZeroVector;
+    if (Active)
+    {
+        Position = Active->Position; Normal = Active->Normal; Tangent = Active->Tangent;
+    }
+    else
+    {
+        double TotalWeight = 0.0;
+        for (const FSample& Sample : Samples)
+        {
+            const double Weight = FMath::Max(Sample.Weight, 1.e-4);
+            Position += Sample.Position * Weight; Normal += Sample.Normal * Weight; Tangent += Sample.Tangent * Weight; TotalWeight += Weight;
+        }
+        Position /= FMath::Max(TotalWeight, 1.e-8);
+        Normal.Normalize();
+        Tangent = Tangent - Normal * FVector::DotProduct(Tangent, Normal);
+        if (!Tangent.Normalize())
+        {
+            FVector FallbackY;
+            Normal.FindBestAxisVectors(Tangent, FallbackY);
+        }
+    }
+    if (!Normal.Normalize()) return FTransform(FQuat::Identity, Position);
+    Tangent = Tangent - Normal * FVector::DotProduct(Tangent, Normal);
+    if (!Tangent.Normalize())
+    {
+        FVector FallbackY;
+        Normal.FindBestAxisVectors(Tangent, FallbackY);
+    }
+    FVector Binormal = FVector::CrossProduct(Normal, Tangent).GetSafeNormal();
+    Tangent = FVector::CrossProduct(Binormal, Normal).GetSafeNormal();
+    if (Binormal.IsNearlyZero() || Tangent.IsNearlyZero()) return FTransform(FQuat::Identity, Position);
+    const FMatrix Basis = FRotationMatrix::MakeFromXZ(Tangent, Normal);
+    return FTransform(FQuat(Basis), Position);
 }
 
 bool FNGonPreviewScene::BeginSoftTransform(const FTransform& GizmoTransform, ENGonSoftTransformMode Mode)
@@ -530,7 +739,9 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
     ++PositionUpdates;
     ActiveGizmoTransform = GizmoTransform;
     SoftInfluences = SoftSession.Influences();
+    RebuildSoftHeatSamples();
     DrawSoftSelection();
+    UpdateColors();
     return true;
 }
 
@@ -580,6 +791,8 @@ void FNGonPreviewScene::ApplySelectionSet(ENGonElement Element, const TSet<int32
     if (!bAdd || SelectedElement != Element) SelectedIds.Reset();
     SelectedElement = Element;
     for (const int32 Id : Ids) SelectedIds.Add(Id);
+    if (!Ids.IsEmpty()) ActiveSelectedId = *Ids.CreateConstIterator();
+    else if (SelectedIds.IsEmpty()) ActiveSelectedId = INDEX_NONE;
     RebuildSoftSelection();
     UpdateGizmo();
     if (bHadFaces || (Element == ENGonElement::Face && !Ids.IsEmpty())) UpdateColors();
@@ -726,6 +939,11 @@ void FNGonPreviewScene::UpdateSelection(ENGonElement Element, int32 Id, bool bAd
     if (Id != INDEX_NONE)
     {
         SelectedIds.Add(Id);
+        ActiveSelectedId = Id;
+    }
+    else if (SelectedIds.IsEmpty())
+    {
+        ActiveSelectedId = INDEX_NONE;
     }
 
     RebuildSoftSelection();
@@ -817,9 +1035,17 @@ FText FNGonPreviewScene::DescribeSelection() const
     case ENGonElement::Vertex:
         if (Topology.SourceVertexIds.IsValidIndex(Id))
         {
-            return FText::Format(LOCTEXT("VertexInfo", "Vertex {0}     heat {1}"),
-                FText::AsNumber(Topology.SourceVertexIds[Id]),
-                FText::AsNumber(FMath::Clamp(HeatSamples[Id] + HeatBias, 0.0f, 1.0f)));
+            float Influence = 0.0f;
+            for (const FNGonVertexInfluence& Entry : SoftInfluences)
+            {
+                if (Entry.Vertex == Id)
+                {
+                    Influence = FMath::Clamp(static_cast<float>(Entry.Weight), 0.0f, 1.0f);
+                    break;
+                }
+            }
+            return FText::Format(LOCTEXT("VertexInfo", "Vertex {0}     soft influence {1}"),
+                FText::AsNumber(Topology.SourceVertexIds[Id]), FText::AsNumber(Influence));
         }
         break;
     }
@@ -837,14 +1063,9 @@ FText FNGonPreviewScene::DescribeMesh() const
         FText::AsNumber(Topology.Faces.Num()), FText::AsNumber(Topology.TriangleCount),
         FText::AsNumber(Topology.Edges.Num()), FText::AsNumber(Topology.RestPositions.Num()),
         FText::AsNumber(NGonCount), FText::AsNumber(Topology.MaxFaceCorners));
-    if (ImportedSampleCount == Positions.Num() && ImportedSampleCount > 0)
+    if (SoftSettings.bEnabled && !SelectedIds.IsEmpty())
     {
-        return FText::Format(LOCTEXT("FbxHeatmap", "{0}  |  Heatmap uses FBX red"), MeshInfo);
-    }
-    if (ImportedSampleCount > 0)
-    {
-        return FText::Format(LOCTEXT("PartialFbxHeatmap", "{0}  |  FBX red on {1} of {2} vertices"),
-            MeshInfo, FText::AsNumber(ImportedSampleCount), FText::AsNumber(Positions.Num()));
+        return FText::Format(LOCTEXT("SoftHeatmapStatus", "{0}  |  Soft heatmap follows selection influence"), MeshInfo);
     }
     return MeshInfo;
 }
