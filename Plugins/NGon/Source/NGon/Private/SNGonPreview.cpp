@@ -123,11 +123,13 @@ public:
             if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
             {
                 bConsumedByGizmo = false;
+                bGizmoCaptured = false;
                 // Let InteractiveToolsContext / Gizmo hit-test the click first
                 const bool bHandledByTools = FEditorViewportClient::InputKey(EventArgs);
                 if (PreviewOwner->IsSoftTransformActive())
                 {
                     bConsumedByGizmo = true;
+                    bGizmoCaptured = true;
                     bMarqueeActive = false;
                     bMarqueePending = false;
                     return true;
@@ -148,6 +150,7 @@ public:
                 {
                     bMarqueeActive = false;
                     bMarqueePending = false;
+                    bGizmoCaptured = false;
                     Invalidate();
                     return true;
                 }
@@ -168,17 +171,20 @@ public:
                     }
                     bMarqueeActive = false;
                     bMarqueePending = false;
+                    bGizmoCaptured = false;
                     Invalidate();
                     return true;
                 }
 
                 bMarqueePending = false;
+                bGizmoCaptured = false;
                 return bHandledByTools;
             }
             else if (EventArgs.Event == IE_Released)
             {
                 bMarqueeActive = false;
                 bMarqueePending = false;
+                bGizmoCaptured = false;
             }
             else if (EventArgs.Event == IE_Pressed && IsCtrlPressed() && !IsAltPressed())
             {
@@ -252,12 +258,27 @@ public:
 
     void CapturedMouseMove(FViewport* InViewport, int32 InMouseX, int32 InMouseY) override
     {
+        // Give the editor tools context the captured movement first. A
+        // transform gizmo generally starts its transaction on this first
+        // movement, after the button hit-test on InputKey().
+        FEditorViewportClient::CapturedMouseMove(InViewport, InMouseX, InMouseY);
+
         if (PreviewOwner->IsSoftTransformActive())
+        {
+            bGizmoCaptured = true;
+            bMarqueeActive = false;
+            bMarqueePending = false;
+            Invalidate();
+            return;
+        }
+
+        // Once the gizmo has captured the button, all subsequent movement is
+        // owned by the tools context. This prevents the fallback marquee from
+        // stealing the drag after the transform transaction has started.
+        if (bGizmoCaptured)
         {
             bMarqueeActive = false;
             bMarqueePending = false;
-            FEditorViewportClient::CapturedMouseMove(InViewport, InMouseX, InMouseY);
-            Invalidate();
             return;
         }
 
@@ -273,14 +294,20 @@ public:
             }
             return;
         }
-
-        FEditorViewportClient::CapturedMouseMove(InViewport, InMouseX, InMouseY);
     }
 
     bool InputAxis(const FInputKeyEventArgs& Args) override
     {
-        // Prevent plain Left-Mouse-Drag (without Alt) from panning the camera during gizmo or marquee drags
-        if (!IsAltPressed() && (PreviewOwner->IsSoftTransformActive() || bMarqueePending || bMarqueeActive))
+        // Keep forwarding axis events while the gizmo transaction is active;
+        // the tools context consumes its own drag and updates the transform.
+        if (PreviewOwner->IsSoftTransformActive() || bGizmoCaptured)
+        {
+            return FEditorViewportClient::InputAxis(Args);
+        }
+
+        // Prevent a plain left-button drag from panning the camera while the
+        // fallback marquee is pending or active.
+        if (!IsAltPressed() && (bMarqueePending || bMarqueeActive))
         {
             return true;
         }
@@ -313,6 +340,7 @@ private:
     bool bMarqueeActive = false;
     bool bMarqueePending = false;
     bool bConsumedByGizmo = false;
+    bool bGizmoCaptured = false;
 };
 }
 
