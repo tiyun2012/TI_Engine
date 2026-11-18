@@ -15,10 +15,7 @@
         }
     ],
     "Plugins": [
-        {
-            "Name": "TiPaint",
-            "Enabled": true
-        },
+        
         {
             "Name": "MeshModelingToolset",
             "Enabled": true
