@@ -12,7 +12,7 @@ constexpr double ScaleCubeWidthPx = 9.5;
 constexpr double PlaneStartFrac = 0.24;
 constexpr double PlaneEndFrac = 0.42;
 constexpr double TranslateViewPlaneRadiusPx = 7.5;
-constexpr double TranslateViewPlaneHitRadiusPx = 10.5;
+constexpr double TranslateViewPlaneHitRadiusPx = 12.5;
 constexpr double UniformScaleHalfSizePx = 5.5;
 constexpr double RotateViewRingScale = 1.14;
 constexpr double AxisThicknessPx = 2.4;
@@ -20,7 +20,7 @@ constexpr double ActiveThicknessPx = 3.5;
 constexpr double DashLengthPx = 5.5;
 constexpr double DashGapPx = 4.5;
 constexpr double HiddenRotationAlpha = 0.34;
-constexpr double AxisHitRadiusPx = 8.5;
+constexpr double AxisHitRadiusPx = 9.5;
 constexpr double RingHitRadiusPx = 8.5;
 constexpr int32 ConeSegments = 10;
 constexpr int32 RingSegmentsCount = 96;
@@ -693,8 +693,25 @@ ENGonGizmoPart FNGonViewportGizmo::HitTest(const FVector2D& Pixel, int32* OutRin
             BestAxisPart = Axis.Part;
         }
     }
+    if (BestAxisPart != ENGonGizmoPart::None)
+    {
+        return BestAxisPart;
+    }
 
-    return BestAxisPart;
+    // 5. Common interior area of the Rotation Gizmo: clicking/dragging anywhere inside the rotation sphere
+    // captures the input for gizmo trackball rotation (weighting X/Y/Z rotation by drag direction) and blocks mesh picking
+    if (Mode == ENGonGizmoMode::Rotate || Mode == ENGonGizmoMode::Combined)
+    {
+        const double CommonRotateRadiusPx = (Mode == ENGonGizmoMode::Combined)
+            ? (ScreenSizeBase * 0.78 * PixelScale)
+            : (ScreenSizeBase * RotateViewRingScale * PixelScale);
+        if (FVector2D::Distance(Pixel, OriginPx) <= CommonRotateRadiusPx)
+        {
+            return ENGonGizmoPart::RotateTrackball;
+        }
+    }
+
+    return ENGonGizmoPart::None;
 }
 
 void FNGonViewportGizmo::Draw(FCanvas& Canvas, const TOptional<FVector2D>& HoverPixel) const
@@ -748,6 +765,13 @@ void FNGonViewportGizmo::Draw(FCanvas& Canvas, const TOptional<FVector2D>& Hover
     }
 
     // 2. Draw Rotation Rings (solid front arc + continuous dashed hidden back arc, plus outer view ring)
+    if (IsHighlighted(ENGonGizmoPart::RotateTrackball))
+    {
+        const double TrackballRadius = ScreenSizeBase * ((Mode == ENGonGizmoMode::Combined) ? 0.78 : 1.0) * PixelScale * InvDPI;
+        FLinearColor TrackballCol = GetHighlightColor();
+        TrackballCol.A = 0.55f;
+        DrawCircle2D(Canvas, ToCanvas(OriginPx), TrackballRadius, TrackballCol, 1.8f);
+    }
     for (const FProjectedRing& Ring : Rings)
     {
         const bool bHigh = IsHighlighted(Ring.Part);
@@ -921,6 +945,11 @@ bool FNGonViewportGizmo::BeginDrag(const FVector2D& Pixel)
         DragScreenAxisA = WorldDeltaPerPixel(AxisA);
         DragScreenAxisB = WorldDeltaPerPixel(AxisB);
     }
+    else if (ActivePart == ENGonGizmoPart::RotateTrackball)
+    {
+        DragRotationTangent = FVector2D(1.0, 0.0);
+        DragRotationPixelsPerRadian = FMath::Max(ScreenSizeBase * PixelScale, 35.0);
+    }
     else if (ActivePart == ENGonGizmoPart::RotateX || ActivePart == ENGonGizmoPart::RotateY ||
              ActivePart == ENGonGizmoPart::RotateZ || ActivePart == ENGonGizmoPart::RotateView)
     {
@@ -996,7 +1025,38 @@ FTransform FNGonViewportGizmo::DragTo(const FVector2D& Pixel) const
         return Result;
     }
 
-    // 2. Rotation (RotateX, RotateY, RotateZ, RotateView)
+    // 2. Rotation (RotateX, RotateY, RotateZ, RotateView, and common-area RotateTrackball)
+    if (ActivePart == ENGonGizmoPart::RotateTrackball)
+    {
+        const double DragPixels = Delta.Size();
+        if (DragPixels > 1.0e-4)
+        {
+            const FVector2D DragDir2D = Delta / DragPixels;
+            const FVector DragWorldDir = (ViewRight * DragDir2D.X - ViewUp * DragDir2D.Y).GetSafeNormal();
+
+            // Weight each of the 3 gizmo axes (X, Y, Z) by how strongly its front-hemisphere tangent aligns with the drag direction
+            const FVector AxisX = DragStartFrame.GetUnitAxis(EAxis::X);
+            const FVector AxisY = DragStartFrame.GetUnitAxis(EAxis::Y);
+            const FVector AxisZ = DragStartFrame.GetUnitAxis(EAxis::Z);
+            const FVector TowardCam = -ViewForward;
+
+            const double WeightX = FVector::DotProduct(FVector::CrossProduct(AxisX, TowardCam), DragWorldDir);
+            const double WeightY = FVector::DotProduct(FVector::CrossProduct(AxisY, TowardCam), DragWorldDir);
+            const double WeightZ = FVector::DotProduct(FVector::CrossProduct(AxisZ, TowardCam), DragWorldDir);
+
+            FVector AvgWorldAxis = (AxisX * WeightX + AxisY * WeightY + AxisZ * WeightZ).GetSafeNormal();
+            if (AvgWorldAxis.IsNearlyZero())
+            {
+                AvgWorldAxis = FVector::CrossProduct(TowardCam, DragWorldDir).GetSafeNormal();
+            }
+            if (!AvgWorldAxis.IsNearlyZero())
+            {
+                const double Angle = DragPixels / FMath::Max(DragRotationPixelsPerRadian, 1.0);
+                Result.SetRotation((FQuat(AvgWorldAxis, Angle) * DragStartFrame.GetRotation()).GetNormalized());
+            }
+        }
+        return Result;
+    }
     if (ActivePart == ENGonGizmoPart::RotateX || ActivePart == ENGonGizmoPart::RotateY ||
         ActivePart == ENGonGizmoPart::RotateZ || ActivePart == ENGonGizmoPart::RotateView)
     {

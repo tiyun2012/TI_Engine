@@ -27,6 +27,7 @@ enum class ENGonGizmoPart : uint8
     RotateY,
     RotateZ,
     RotateView,
+    RotateTrackball,
     ScaleX,
     ScaleY,
     ScaleZ,
@@ -63,6 +64,7 @@ public:
         TFunctionRef<bool(const FVector&, FVector2D&)> InProject);
 
     void Draw(FCanvas& Canvas, const TOptional<FVector2D>& HoverPixel) const;
+    bool IsHovered(const FVector2D& Pixel) const { return HitTest(Pixel) != ENGonGizmoPart::None; }
     bool BeginDrag(const FVector2D& Pixel);
     FTransform DragTo(const FVector2D& Pixel) const;
     void EndDrag()

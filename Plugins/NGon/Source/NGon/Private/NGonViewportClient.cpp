@@ -188,6 +188,10 @@ public:
         {
             return EMouseCursor::CardinalCross;
         }
+        if (PreviewOwner->HasGizmoTarget() && !IsNavigating(InViewport) && ForegroundGizmo.IsHovered(FVector2D(X, Y)))
+        {
+            return EMouseCursor::CardinalCross;
+        }
         return FEditorViewportClient::GetCursor(InViewport, X, Y);
     }
 
@@ -410,12 +414,8 @@ private:
 
     void BeginPointerAction(FViewport* InViewport, const FIntPoint& Mouse)
     {
-        const bool bBoneMode = NGon::IsBoneGizmoActive(&PreviewOwner.Get());
-        if (IsCtrlPressed() && !bBoneMode)
-        {
-            PointerAction = EPointerAction::EdgeLoop;
-            return;
-        }
+        // Gizmo has highest interaction priority: when the cursor is inside any gizmo handle or rotation area,
+        // consume the pointer action for the gizmo and never fall through to mesh/bone picking or marquee selection.
         if (PreviewOwner->HasGizmoTarget())
         {
             FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
@@ -425,16 +425,20 @@ private:
                 if (ForegroundGizmo.BeginDrag(FVector2D(Mouse.X, Mouse.Y)))
                 {
                     const FTransform Start = PreviewOwner->GetSelectionGizmoTransform();
-                    if (PreviewOwner->BeginSoftTransform(Start, PreviewOwner->GetSoftTransformMode()))
-                    {
-                        PointerAction = EPointerAction::Gizmo;
-                        LastGizmoMouse = Mouse;
-                        PostInvalidation();
-                        return;
-                    }
-                    ForegroundGizmo.EndDrag();
+                    PreviewOwner->BeginSoftTransform(Start, PreviewOwner->GetSoftTransformMode());
+                    PointerAction = EPointerAction::Gizmo;
+                    LastGizmoMouse = Mouse;
+                    PostInvalidation();
+                    return;
                 }
             }
+        }
+
+        const bool bBoneMode = NGon::IsBoneGizmoActive(&PreviewOwner.Get());
+        if (IsCtrlPressed() && !bBoneMode)
+        {
+            PointerAction = EPointerAction::EdgeLoop;
+            return;
         }
 
         PointerAction = EPointerAction::Select;

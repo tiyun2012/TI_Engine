@@ -160,6 +160,14 @@ bool FNGonViewportGizmoModesTest::RunTest(const FString& Parameters)
             && Rotated.GetRotation().RotateVector(FVector::UpVector).Equals(FVector::UpVector));
         Gizmo.EndDrag();
     }
+    const FVector2D CommonRotateArea = Center + FVector2D(18, -14);
+    if (TestTrue(TEXT("E picks the common interior area of the rotation gizmo"), Gizmo.BeginDrag(CommonRotateArea)))
+    {
+        const FTransform TrackballRotated = Gizmo.DragTo(CommonRotateArea + FVector2D(30, -20));
+        TestTrue(TEXT("Dragging inside common rotation area rotates average axes along drag direction"),
+            !TrackballRotated.GetRotation().Equals(FQuat::Identity, 1e-3));
+        Gizmo.EndDrag();
+    }
 
     Build(ENGonGizmoMode::Scale);
     const FVector2D ScaleHandle = Center + FVector2D(82, 0);
