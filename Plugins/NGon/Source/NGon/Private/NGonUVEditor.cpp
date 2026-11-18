@@ -1252,3 +1252,4 @@ void SNGonUVEditor::ShowError(const FText& Error)
 }
 
 #undef LOCTEXT_NAMESPACE
+// NGon Unified ABI Sync v5.8.2

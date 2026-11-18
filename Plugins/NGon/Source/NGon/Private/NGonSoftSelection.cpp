@@ -793,3 +793,4 @@ void FNGonSoftTransformSession::Cancel()
     InitialGizmo = FTransform::Identity;
     LastGizmo = FTransform::Identity;
 }
+// NGon Unified ABI Sync v5.8.2

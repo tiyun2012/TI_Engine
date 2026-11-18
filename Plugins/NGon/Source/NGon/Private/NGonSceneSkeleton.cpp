@@ -818,4 +818,4 @@ bool IsUtilityNonDeformingBoneName(const FName& Name)
     return NGonIsUtilityNonDeformingBoneName(Name);
 }
 } // namespace NGon
-
+// NGon Unified ABI Sync v5.8.2

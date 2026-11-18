@@ -556,3 +556,4 @@ bool NGon::LoadFbx(const FString& Filename, FNGonMeshData& Out, FText& Error)
 }
 
 #undef LOCTEXT_NAMESPACE
+// NGon Unified ABI Sync v5.8.2

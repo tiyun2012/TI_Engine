@@ -31,3 +31,4 @@ bool FTiPaintDocumentTest::RunTest(const FString&)
     TestFalse(TEXT("Locked active layer rejects stroke"), Document->IsStroking());
     return true;
 }
+// NGon Unified ABI Sync v5.8.2

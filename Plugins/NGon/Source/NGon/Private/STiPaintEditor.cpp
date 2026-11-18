@@ -249,3 +249,4 @@ TSharedRef<SWidget> STiPaintEditor::MakeLayerMenu()
 TSharedRef<SWidget> STiPaintEditor::MakeStatus() { return SNew(SBorder).Padding(6)[SNew(STextBlock).Text_Lambda([this] { return FText::Format(LOCTEXT("StatusText", "{0}  |  {1} undo / {2} redo"), Status, FText::AsNumber(Document->UndoCount()), FText::AsNumber(Document->RedoCount())); })]; }
 
 #undef LOCTEXT_NAMESPACE
+// NGon Unified ABI Sync v5.8.2

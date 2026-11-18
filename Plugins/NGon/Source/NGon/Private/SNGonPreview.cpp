@@ -574,14 +574,19 @@ void SNGonPreview::LoadSkeletalMesh(const FAssetData& Asset)
     bShowVertices = false;
     SkelUIState.BoneDrawMode = 2; // Selected Bone Only (matching image_3b0306.jpg)
 
-    TArray<UMaterialInterface*> Materials = BindPreviewMaterials(SourceMeshDesc, SkeletalMesh->GetMaterials(), Data);
+    // Use clean 3-point studio clay material for SkeletalMesh preview on UDynamicMeshComponent
+    // (SkeletalMesh materials compiled only for GPUSkinVertexFactory fall back to WorldGridMaterial on UDynamicMeshComponent)
     ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("SkeletalMeshType", "Skeletal Mesh"),
-        ENGonViewportShading::Smooth, MoveTemp(Materials));
+        ENGonViewportShading::Smooth);
 
     NGon::SetSceneSkeleton(&Viewport->Preview(), SceneBonesInit, ExtractedSkinWeights);
     if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
     {
         NGon::SelectSceneBone(&Viewport->Preview(), SelectedBoneIndex, true);
+        if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
+        {
+            Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
+        }
     }
     Viewport->Invalidate();
 }
@@ -709,3 +714,4 @@ void SNGonPreview::SetSelectionMode(ENGonElement Element)
 }
 
 #undef LOCTEXT_NAMESPACE
+// NGon Unified ABI Sync v5.8.2

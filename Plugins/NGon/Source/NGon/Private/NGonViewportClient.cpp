@@ -108,6 +108,7 @@ public:
         FEditorViewportClient::Tick(DeltaSeconds);
         ApplyPendingFrame();
         PreviewOwner->RefreshPaintMaterial();
+        PreviewOwner->UpdateCameraVertexScales(GetViewLocation(), GetViewRotation().Vector());
         if (bPendingGizmoMove)
         {
             UpdateGizmoDrag(PendingGizmoMouse);
@@ -372,15 +373,39 @@ private:
     void BuildGizmo(const FSceneView& View)
     {
         const FTransform Frame = PreviewOwner->GetGizmoDisplayTransform();
-        // One pixel at the pivot's depth, also valid for orthographic views where W is 1.
-        const double ClipW = View.WorldToScreen(Frame.GetLocation()).W;
-        const double ProjectionWidth = View.UnscaledViewRect.Width() * FMath::Abs(View.ViewMatrices.GetViewToClip().M[0][0]);
-        const double UnitsPerPixel = ClipW > 0.0 && ProjectionWidth > 0.0 ? 2.0 * ClipW / ProjectionWidth : 0.0;
+        const FVector Origin = Frame.GetLocation();
+
+        // Extract camera basis directly from ViewMatrices so Alt+LMB orbit camera rotation is always exact
+        const FMatrix& ViewMatrix = View.ViewMatrices.GetViewMatrix();
+        const FVector CamRight = ViewMatrix.GetColumn(0).GetSafeNormal();
+        const FVector CamUp = ViewMatrix.GetColumn(1).GetSafeNormal();
+        const FVector CamForward = ViewMatrix.GetColumn(2).GetSafeNormal();
+        const FVector CamOrigin = View.ViewMatrices.GetViewOrigin();
+
+        const double ClipW = View.WorldToScreen(Origin).W;
+        const double ProjectionWidth = static_cast<double>(View.UnscaledViewRect.Width())
+            * FMath::Abs(View.ViewMatrices.GetProjectionMatrix().M[0][0]);
+        double UnitsPerPixel = (ClipW > 0.0 && ProjectionWidth > 1e-4)
+            ? (2.0 * ClipW / ProjectionWidth)
+            : 0.0;
+        if (UnitsPerPixel <= 0.0)
+        {
+            FVector2D OriginPx, OffsetPx;
+            if (View.WorldToPixel(Origin, OriginPx) && View.WorldToPixel(Origin + CamRight * 10.0, OffsetPx))
+            {
+                const double PxDist = FVector2D::Distance(OriginPx, OffsetPx);
+                if (PxDist > 1e-4)
+                {
+                    UnitsPerPixel = 10.0 / PxDist;
+                }
+            }
+        }
+
         const bool bAxisScale = !NGon::IsBoneGizmoActive(&PreviewOwner.Get())
             || !NGon::IsSceneWorldCoordinateSystem(&PreviewOwner.Get());
         ForegroundGizmo.Build(Frame, PreviewOwner->GetGizmoMode(), UnitsPerPixel, GetDPIScale(),
-            View.ViewRotation.RotateVector(FVector::RightVector), View.ViewRotation.RotateVector(FVector::UpVector),
-            bAxisScale, [&View](const FVector& Point, FVector2D& Pixel) { return View.WorldToPixel(Point, Pixel); });
+            CamOrigin, CamForward, CamRight, CamUp, bAxisScale,
+            [&View](const FVector& Point, FVector2D& Pixel) { return View.WorldToPixel(Point, Pixel); });
     }
 
     void BeginPointerAction(FViewport* InViewport, const FIntPoint& Mouse)
@@ -488,19 +513,27 @@ private:
             return;
         }
 
-        if (NGon::IsBoneGizmoActive(&PreviewOwner.Get()))
+        FNGonSkeletonTreeUIState* UI = GetUIState();
+        const bool bBonesVisible = NGon::HasSceneBones(&PreviewOwner.Get()) && (!UI || UI->BoneDrawMode != 3);
+        if (!bMarqueeActive && bBonesVisible)
         {
-            FNGonSkeletonTreeUIState* UI = GetUIState();
-            if (!UI || UI->BoneDrawMode != 3)
+            const float PickRadius = NGon::IsBoneGizmoActive(&PreviewOwner.Get()) ? 22.0f : 14.0f;
+            const int32 HitBone = NGon::PickSceneBone(&PreviewOwner.Get(), View, Mouse, PickRadius, true);
+            if (HitBone != INDEX_NONE)
             {
-                const int32 HitBone = NGon::PickSceneBone(&PreviewOwner.Get(), View, Mouse, 20.0f, true);
-                if (HitBone != INDEX_NONE && UI && UI->OnViewportBonePicked)
+                if (Pinned->GetGizmoMode() == ENGonGizmoMode::None)
+                {
+                    Pinned->SetGizmoMode(ENGonGizmoMode::Translate);
+                }
+                if (UI && UI->OnViewportBonePicked)
                 {
                     UI->OnViewportBonePicked(HitBone);
                 }
+                return;
             }
         }
-        else if (bMarqueeActive)
+
+        if (bMarqueeActive)
         {
             Pinned->BoxSelect(View, MakeMarquee(), IsShiftPressed(), MarqueeEnd.X >= MarqueeStart.X);
         }
@@ -716,3 +749,4 @@ bool SNGonViewport::DeleteSelectedFaces()
     }
     return bDeleted;
 }
+// NGon Unified ABI Sync v5.8.2

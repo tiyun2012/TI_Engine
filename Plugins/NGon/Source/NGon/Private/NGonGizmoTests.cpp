@@ -119,7 +119,17 @@ bool FNGonViewportGizmoModesTest::RunTest(const FString& Parameters)
     };
     auto Build = [&Gizmo, &Project](ENGonGizmoMode Mode)
     {
-        Gizmo.Build(FTransform::Identity, Mode, 1.0, 1.0, FVector::ForwardVector, FVector::RightVector, true, Project);
+        Gizmo.Build(
+            FTransform::Identity,
+            Mode,
+            1.0,
+            1.0,
+            FVector(0.0, 0.0, 500.0),
+            -FVector::UpVector,
+            FVector::ForwardVector,
+            FVector::RightVector,
+            true,
+            Project);
     };
 
     Build(ENGonGizmoMode::None);
@@ -142,7 +152,7 @@ bool FNGonViewportGizmoModesTest::RunTest(const FString& Parameters)
     }
 
     Build(ENGonGizmoMode::Rotate);
-    const FVector2D Ring = Center + FVector2D(48, -48);
+    const FVector2D Ring = Center + FVector2D(61, -61);
     if (TestTrue(TEXT("E picks the drawn Z rotation ring"), Gizmo.BeginDrag(Ring)))
     {
         const FTransform Rotated = Gizmo.DragTo(Ring + FVector2D(-24, -24));
@@ -152,23 +162,23 @@ bool FNGonViewportGizmoModesTest::RunTest(const FString& Parameters)
     }
 
     Build(ENGonGizmoMode::Scale);
-    const FVector2D ScaleHandle = Center + FVector2D(78, 0);
+    const FVector2D ScaleHandle = Center + FVector2D(82, 0);
     if (TestTrue(TEXT("R picks the drawn X scale box"), Gizmo.BeginDrag(ScaleHandle)))
     {
         TestTrue(TEXT("Scale drag changes only X"),
-            Gizmo.DragTo(ScaleHandle + FVector2D(40, 0)).GetScale3D().Equals(FVector(1.5, 1, 1), 0.01));
+            Gizmo.DragTo(ScaleHandle + FVector2D(43, 0)).GetScale3D().Equals(FVector(1.5, 1, 1), 0.01));
         Gizmo.EndDrag();
     }
     if (TestTrue(TEXT("R also provides uniform scale"), Gizmo.BeginDrag(Center)))
     {
-        const FVector Scale = Gizmo.DragTo(Center + FVector2D(40, -40)).GetScale3D();
+        const FVector Scale = Gizmo.DragTo(Center + FVector2D(45, -45)).GetScale3D();
         TestTrue(TEXT("Uniform scale changes all axes equally"), Scale.X > 1.5 && Scale.Equals(FVector(Scale.X)));
         Gizmo.EndDrag();
     }
     Build(ENGonGizmoMode::Combined);
-    TestTrue(TEXT("Combined preserves a move handle"), Gizmo.BeginDrag(MoveHandle + FVector2D(14, 0)));
+    TestTrue(TEXT("Combined preserves a move handle"), Gizmo.BeginDrag(MoveHandle + FVector2D(18, 0)));
     Gizmo.EndDrag();
-    TestTrue(TEXT("Combined preserves the rotation ring"), Gizmo.BeginDrag(Center + FVector2D(41, -41)));
+    TestTrue(TEXT("Combined preserves the rotation ring"), Gizmo.BeginDrag(Center + FVector2D(47, -47)));
     Gizmo.EndDrag();
 
     FNGonMeshData Data;
@@ -202,3 +212,4 @@ bool FNGonViewportGizmoModesTest::RunTest(const FString& Parameters)
 }
 
 #endif
+// NGon Unified ABI Sync v5.8.2

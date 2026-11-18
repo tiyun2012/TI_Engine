@@ -87,6 +87,7 @@ void GetSceneSnapSettings(
     bool& OutSnapScale,
     float& OutScaleStep);
 bool IsUtilityNonDeformingBoneName(const FName& Name);
+void UpdateSceneCameraView(FNGonPreviewScene* Scene, const FVector& CameraOrigin, const FVector& CameraDir);
 } // namespace NGon
 #endif // NGON_SCENE_BONE_BRIDGE_DECLARED
 
@@ -114,6 +115,27 @@ struct FNGonSceneAccel
     // CSR mapping: logical vertex -> ColorElements indices
     TArray<int32> LogicalToColorOffsets;
     TArray<int32> LogicalToColorElements;
+
+    // Flat triangle logical vertex indices (3 ints per triangle) & CSR vertex->triangles for fast mesh-space vertex normals
+    TArray<int32> FlatTriLogicalVertices;
+    TArray<int32> LogicalToTriOffsets;
+    TArray<int32> LogicalToTris;
+
+    // Mesh-space unit vertex normals, tangents, and normal-displaced display positions per logical vertex
+    TArray<FVector3f> LogicalVertexNormals;
+    TArray<FVector3f> LogicalVertexTangents;
+    TArray<FVector> DisplacedVertexPositions;
+    float VertexNormalOffset = 0.25f;
+    int32 CachedSelectedVertexCount = 0;
+
+    // Camera-distance vertex size scaling (1.0x at near camera point -> 0.5x (1/2) at far camera point)
+    FVector LastCameraOrigin = FVector::ZeroVector;
+    FVector LastCameraDir = FVector::ForwardVector;
+    float NearCameraDist = 10.0f;
+    float FarCameraDist = 200.0f;
+    float CameraZoomScale = 1.0f;
+    bool bHasCameraView = false;
+    uint64 LastVertexSizeUpdateFrame = 0;
 
     // Stamp buffers for zero-allocation partial updates during gizmo drags
     int32 Stamp = 1;
@@ -368,6 +390,81 @@ struct FNGonSceneAccel
             }
         }
 
+        // 3. Flat triangle logical vertices & Logical -> Incident Triangles CSR for fast mesh-space vertex normals
+        const int32 MaxTris = Mesh.TriangleCount();
+        FlatTriLogicalVertices.Reset(MaxTris * 3);
+        LogicalToTriOffsets.Init(0, LogicalCount + 1);
+        for (const int32 TriId : Mesh.TriangleIndicesItr())
+        {
+            const UE::Geometry::FIndex3i Tri = Mesh.GetTriangle(TriId);
+            const int32 L0 = Topology.DynamicToLogicalVertex.IsValidIndex(Tri.A) ? Topology.DynamicToLogicalVertex[Tri.A] : INDEX_NONE;
+            const int32 L1 = Topology.DynamicToLogicalVertex.IsValidIndex(Tri.B) ? Topology.DynamicToLogicalVertex[Tri.B] : INDEX_NONE;
+            const int32 L2 = Topology.DynamicToLogicalVertex.IsValidIndex(Tri.C) ? Topology.DynamicToLogicalVertex[Tri.C] : INDEX_NONE;
+            if (L0 >= 0 && L0 < LogicalCount && L1 >= 0 && L1 < LogicalCount && L2 >= 0 && L2 < LogicalCount)
+            {
+                FlatTriLogicalVertices.Add(L0);
+                FlatTriLogicalVertices.Add(L1);
+                FlatTriLogicalVertices.Add(L2);
+                ++LogicalToTriOffsets[L0 + 1];
+                if (L1 != L0) ++LogicalToTriOffsets[L1 + 1];
+                if (L2 != L0 && L2 != L1) ++LogicalToTriOffsets[L2 + 1];
+            }
+        }
+        const int32 ValidTriCount = FlatTriLogicalVertices.Num() / 3;
+        for (int32 i = 0; i < LogicalCount; ++i)
+        {
+            LogicalToTriOffsets[i + 1] += LogicalToTriOffsets[i];
+        }
+        LogicalToTris.SetNumUninitialized(LogicalToTriOffsets[LogicalCount]);
+        {
+            TArray<int32> Cursor = LogicalToTriOffsets;
+            for (int32 t = 0; t < ValidTriCount; ++t)
+            {
+                const int32 L0 = FlatTriLogicalVertices[t * 3 + 0];
+                const int32 L1 = FlatTriLogicalVertices[t * 3 + 1];
+                const int32 L2 = FlatTriLogicalVertices[t * 3 + 2];
+                LogicalToTris[Cursor[L0]++] = t;
+                if (L1 != L0) LogicalToTris[Cursor[L1]++] = t;
+                if (L2 != L0 && L2 != L1) LogicalToTris[Cursor[L2]++] = t;
+            }
+        }
+
+        // Compute adaptive normal offset from mesh bounds and average edge length so vertices sit cleanly above the mesh surface
+        double EdgeSum = 0.0;
+        int32 SampledEdges = 0;
+        const int32 Step = FMath::Max(1, EdgeCount / 512);
+        for (int32 e = 0; e < EdgeCount; e += Step)
+        {
+            const FIntPoint Edge = Topology.Edges[e];
+            if (Topology.RestPositions.IsValidIndex(Edge.X) && Topology.RestPositions.IsValidIndex(Edge.Y))
+            {
+                EdgeSum += FVector::Distance(Topology.RestPositions[Edge.X], Topology.RestPositions[Edge.Y]);
+                ++SampledEdges;
+            }
+        }
+        const float AvgEdge = SampledEdges > 0 ? static_cast<float>(EdgeSum / SampledEdges) : 1.0f;
+        const float BoundsMax = Topology.RestBounds.IsValid ? static_cast<float>(Topology.RestBounds.GetSize().GetMax()) : 100.0f;
+        VertexNormalOffset = FMath::Clamp(FMath::Min(BoundsMax * 0.0038f, AvgEdge * 0.22f), 0.04f, 2.0f);
+
+        // Precompute initial mesh-space vertex tangents from incident polygon perimeters
+        LogicalVertexTangents.Init(FVector3f(1.0f, 0.0f, 0.0f), LogicalCount);
+        for (const TPair<int32, FNGonFace>& Pair : Topology.Faces)
+        {
+            const TArray<int32>& Perim = Pair.Value.Perimeter;
+            const int32 NumCorners = Perim.Num();
+            for (int32 c = 0; c < NumCorners; ++c)
+            {
+                const int32 CurrV = Perim[c];
+                const int32 NextV = Perim[(c + 1) % NumCorners];
+                if (Topology.RestPositions.IsValidIndex(CurrV) && Topology.RestPositions.IsValidIndex(NextV))
+                {
+                    LogicalVertexTangents[CurrV] += FVector3f(Topology.RestPositions[NextV] - Topology.RestPositions[CurrV]).GetSafeNormal();
+                }
+            }
+        }
+
+        RecomputeAllVertexNormals(Topology.RestPositions);
+
         VertexStamp.Init(0, LogicalCount);
         EdgeStamp.Init(0, EdgeCount);
         DirtyVertices.Reset();
@@ -376,6 +473,143 @@ struct FNGonSceneAccel
         bEdgesOverlayDirty = false;
         bVerticesOverlayDirty = false;
         CachedSoftPointCount = 0;
+        CachedSelectedVertexCount = 0;
+    }
+
+    void RecomputeAllVertexNormals(const TArray<FVector>& Positions)
+    {
+        const int32 LogicalCount = Positions.Num();
+        LogicalVertexNormals.SetNumUninitialized(LogicalCount);
+        DisplacedVertexPositions.SetNumUninitialized(LogicalCount);
+        if (LogicalCount == 0)
+        {
+            return;
+        }
+
+        FMemory::Memzero(LogicalVertexNormals.GetData(), LogicalCount * sizeof(FVector3f));
+        const FVector* RESTRICT PosData = Positions.GetData();
+        FVector3f* RESTRICT NormData = LogicalVertexNormals.GetData();
+        const int32* RESTRICT TriData = FlatTriLogicalVertices.GetData();
+        const int32 NumTris = FlatTriLogicalVertices.Num() / 3;
+
+        for (int32 t = 0; t < NumTris; ++t)
+        {
+            const int32 I0 = TriData[t * 3 + 0];
+            const int32 I1 = TriData[t * 3 + 1];
+            const int32 I2 = TriData[t * 3 + 2];
+            const FVector3f P0(PosData[I0]);
+            const FVector3f P1(PosData[I1]);
+            const FVector3f P2(PosData[I2]);
+            const FVector3f FaceN = FVector3f::CrossProduct(P1 - P0, P2 - P0);
+            NormData[I0] += FaceN;
+            NormData[I1] += FaceN;
+            NormData[I2] += FaceN;
+        }
+
+        FVector* RESTRICT DispData = DisplacedVertexPositions.GetData();
+        const float Offset = VertexNormalOffset;
+        for (int32 v = 0; v < LogicalCount; ++v)
+        {
+            FVector3f N = NormData[v];
+            if (!N.Normalize(1.e-12f))
+            {
+                N = FVector3f(0.0f, 0.0f, 1.0f);
+            }
+            NormData[v] = N;
+            DispData[v] = PosData[v] + FVector(N) * Offset;
+        }
+    }
+
+    void RecomputeDirtyVertexNormals(TConstArrayView<int32> DirtyVerts, const TArray<FVector>& Positions)
+    {
+        const int32 LogicalCount = Positions.Num();
+        if (LogicalVertexNormals.Num() != LogicalCount || DisplacedVertexPositions.Num() != LogicalCount)
+        {
+            RecomputeAllVertexNormals(Positions);
+            return;
+        }
+
+        const FVector* RESTRICT PosData = Positions.GetData();
+        FVector3f* RESTRICT NormData = LogicalVertexNormals.GetData();
+        FVector* RESTRICT DispData = DisplacedVertexPositions.GetData();
+        const int32* RESTRICT TriData = FlatTriLogicalVertices.GetData();
+        const int32* RESTRICT Offsets = LogicalToTriOffsets.GetData();
+        const int32* RESTRICT Tris = LogicalToTris.GetData();
+        const float Offset = VertexNormalOffset;
+
+        for (const int32 v : DirtyVerts)
+        {
+            if (v < 0 || v >= LogicalCount)
+            {
+                continue;
+            }
+            FVector3f SumN = FVector3f::ZeroVector;
+            if (v + 1 < LogicalToTriOffsets.Num())
+            {
+                const int32 StartT = Offsets[v];
+                const int32 EndT = Offsets[v + 1];
+                for (int32 i = StartT; i < EndT; ++i)
+                {
+                    const int32 t = Tris[i];
+                    const int32 I0 = TriData[t * 3 + 0];
+                    const int32 I1 = TriData[t * 3 + 1];
+                    const int32 I2 = TriData[t * 3 + 2];
+                    const FVector3f P0(PosData[I0]);
+                    const FVector3f P1(PosData[I1]);
+                    const FVector3f P2(PosData[I2]);
+                    SumN += FVector3f::CrossProduct(P1 - P0, P2 - P0);
+                }
+            }
+            if (!SumN.Normalize(1.e-12f))
+            {
+                SumN = FVector3f(0.0f, 0.0f, 1.0f);
+            }
+            NormData[v] = SumN;
+            DispData[v] = PosData[v] + FVector(SumN) * Offset;
+        }
+    }
+
+    FORCEINLINE FVector GetVertexNormal(int32 LogicalId) const
+    {
+        return LogicalVertexNormals.IsValidIndex(LogicalId)
+            ? FVector(LogicalVertexNormals[LogicalId])
+            : FVector::UpVector;
+    }
+
+    FORCEINLINE FVector GetVertexTangent(int32 LogicalId) const
+    {
+        return LogicalVertexTangents.IsValidIndex(LogicalId)
+            ? FVector(LogicalVertexTangents[LogicalId])
+            : FVector::ForwardVector;
+    }
+
+    FORCEINLINE FVector GetDisplacedVertexPosition(const TArray<FVector>& Positions, int32 LogicalId, float Scale = 1.0f) const
+    {
+        if (!Positions.IsValidIndex(LogicalId))
+        {
+            return FVector::ZeroVector;
+        }
+        if (FMath::IsNearlyEqual(Scale, 1.0f) && DisplacedVertexPositions.IsValidIndex(LogicalId))
+        {
+            return DisplacedVertexPositions[LogicalId];
+        }
+        return Positions[LogicalId] + GetVertexNormal(LogicalId) * (VertexNormalOffset * Scale);
+    }
+
+    // Returns 1.0f when the vertex is at the near point to the camera and 0.5f (1/2) at the far point of the camera
+    FORCEINLINE float GetVertexCameraDepthScale(const FVector& VertexPos) const
+    {
+        if (!bHasCameraView)
+        {
+            return 1.0f;
+        }
+        const float Dist = static_cast<float>(FVector::Distance(VertexPos, LastCameraOrigin));
+        const float Span = FMath::Max(FarCameraDist - NearCameraDist, 1.0f);
+        const float DepthT = FMath::Clamp((Dist - NearCameraDist) / Span, 0.0f, 1.0f);
+        // Smoothly scale from 1.0x at the near point down to 0.5x (1/2) at the far point,
+        // combined with CameraZoomScale (which also scales down to 0.5x when zooming far out)
+        const float DepthScale = FMath::Lerp(1.0f, 0.5f, DepthT);
+        return FMath::Clamp(DepthScale * CameraZoomScale, 0.45f, 1.0f);
     }
 
     void BuildColorTables(int32 LogicalCount, int32 NumColorElements, TFunctionRef<int32(int32)> GetLogicalVertex)

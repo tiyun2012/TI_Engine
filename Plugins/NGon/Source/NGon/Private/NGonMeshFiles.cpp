@@ -46,3 +46,4 @@ bool NGon::FindDefaultFbx(const FString& Directory, FString& OutPath, FText& Err
 }
 
 #undef LOCTEXT_NAMESPACE
+// NGon Unified ABI Sync v5.8.2

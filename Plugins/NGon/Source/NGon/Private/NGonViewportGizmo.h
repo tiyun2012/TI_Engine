@@ -13,50 +13,142 @@ enum class ENGonGizmoMode : uint8
     None
 };
 
-// The viewport draws these projected handles and uses the same segments for hits.
+enum class ENGonGizmoPart : uint8
+{
+    None,
+    TranslateX,
+    TranslateY,
+    TranslateZ,
+    TranslateXY,
+    TranslateXZ,
+    TranslateYZ,
+    TranslateViewPlane,
+    RotateX,
+    RotateY,
+    RotateZ,
+    RotateView,
+    ScaleX,
+    ScaleY,
+    ScaleZ,
+    ScaleXY,
+    ScaleXZ,
+    ScaleYZ,
+    ScaleUniform
+};
+
+// Direct port of TIGUIViewport::TransformGizmo for Unreal FCanvas overlay rendering and 3D ray-plane interaction.
 class FNGonViewportGizmo
 {
 public:
-    void Build(const FTransform& InFrame, ENGonGizmoMode Mode, double WorldUnitsPerPixel, double DPIScale,
-        const FVector& ViewRight, const FVector& ViewUp, bool bAllowAxisScale,
-        TFunctionRef<bool(const FVector&, FVector2D&)> Project);
+    void Build(
+        const FTransform& InFrame,
+        ENGonGizmoMode InMode,
+        double InWorldUnitsPerPixel,
+        double InDPIScale,
+        const FVector& InViewLocation,
+        const FVector& InViewForward,
+        const FVector& InViewRight,
+        const FVector& InViewUp,
+        bool bInAllowAxisScale,
+        TFunctionRef<bool(const FVector&, FVector2D&)> InProject);
+
+    void Build(
+        const FTransform& InFrame,
+        ENGonGizmoMode InMode,
+        double InWorldUnitsPerPixel,
+        double InDPIScale,
+        const FVector& InViewRight,
+        const FVector& InViewUp,
+        bool bInAllowAxisScale,
+        TFunctionRef<bool(const FVector&, FVector2D&)> InProject);
+
     void Draw(FCanvas& Canvas, const TOptional<FVector2D>& HoverPixel) const;
     bool BeginDrag(const FVector2D& Pixel);
     FTransform DragTo(const FVector2D& Pixel) const;
-    void EndDrag() { DragHandle.Reset(); }
+    void EndDrag()
+    {
+        ActivePart = ENGonGizmoPart::None;
+        bDragging = false;
+    }
+    bool IsDragging() const { return bDragging; }
 
 private:
-    enum class EAction : uint8 { MoveAxis, MovePlane, Rotate, ScaleAxis, ScaleUniform };
-
-    struct FSegment
+    struct FProjectedQuad
     {
-        FVector2D A;
-        FVector2D B;
-    };
-
-    struct FHandle
-    {
-        EAction Action = EAction::MoveAxis;
-        int32 AxisIndex = INDEX_NONE;
-        int32 SecondAxisIndex = INDEX_NONE;
+        ENGonGizmoPart Part = ENGonGizmoPart::None;
+        FVector2D Corners[4] = { FVector2D::ZeroVector, FVector2D::ZeroVector, FVector2D::ZeroVector, FVector2D::ZeroVector };
         FLinearColor Color = FLinearColor::White;
-        FVector WorldA = FVector::ZeroVector;
-        FVector WorldB = FVector::ZeroVector;
-        FVector2D PixelsPerUnitA = FVector2D::ZeroVector;
-        FVector2D PixelsPerUnitB = FVector2D::ZeroVector;
-        TArray<FSegment, TInlineAllocator<48>> Segments;
+        bool bValid = false;
     };
 
-    int32 HitTest(const FVector2D& Pixel, int32& SegmentIndex) const;
-    static void AddLoop(FHandle& Handle, TConstArrayView<FVector2D> Points);
+    struct FProjectedAxis
+    {
+        ENGonGizmoPart Part = ENGonGizmoPart::None;
+        FVector AxisWorld = FVector::UnitX();
+        FVector OrthoU = FVector::UnitY();
+        FVector OrthoV = FVector::UnitZ();
+        FVector2D StartPx = FVector2D::ZeroVector;
+        FVector2D EndPx = FVector2D::ZeroVector;
+        FVector2D ShaftEndPx = FVector2D::ZeroVector;
+        FVector2D TipPx = FVector2D::ZeroVector;
+        TArray<FVector2D, TInlineAllocator<12>> ConeBasePx;
+        FVector2D CubeCornersPx[8];
+        bool bHasCube = false;
+        bool bIsScaleCube = false;
+        FLinearColor Color = FLinearColor::White;
+        bool bValid = false;
+    };
+
+    struct FRingSegment
+    {
+        FVector2D A = FVector2D::ZeroVector;
+        FVector2D B = FVector2D::ZeroVector;
+        bool bBackFacing = false;
+    };
+
+    struct FProjectedRing
+    {
+        ENGonGizmoPart Part = ENGonGizmoPart::None;
+        FVector AxisWorld = FVector::UnitX();
+        FLinearColor Color = FLinearColor::White;
+        TArray<FRingSegment, TInlineAllocator<128>> Segments;
+        bool bIsViewRing = false;
+        float ViewRingRadiusPx = 0.0f;
+    };
+
+    ENGonGizmoPart HitTest(const FVector2D& Pixel, int32* OutRingSegIdx = nullptr, const FProjectedRing** OutRing = nullptr) const;
+    FVector PartAxis(const FTransform& InFrame, ENGonGizmoPart Part) const;
+    bool PartPlane(const FTransform& InFrame, ENGonGizmoPart Part, FVector& OutAxisA, FVector& OutAxisB) const;
+    FVector2D WorldDeltaPerPixel(const FVector& WorldDir) const;
 
     FTransform Frame = FTransform::Identity;
-    FTransform DragFrame = FTransform::Identity;
-    TArray<FHandle> Handles;
-    TOptional<FHandle> DragHandle;
-    FVector2D DragStart = FVector2D::ZeroVector;
-    FVector2D RotationTangent = FVector2D::ZeroVector;
-    double RotationPixelsPerRadian = 1.0;
+    FTransform DragStartFrame = FTransform::Identity;
+    ENGonGizmoMode Mode = ENGonGizmoMode::Translate;
+    double WorldUnitsPerPixel = 1.0;
     double PixelScale = 1.0;
-    double DragPixelScale = 1.0;
+    double GizmoWorldLength = 80.0;
+    FVector ViewLocation = FVector::ZeroVector;
+    FVector ViewForward = FVector::ForwardVector;
+    FVector ViewRight = FVector::RightVector;
+    FVector ViewUp = FVector::UpVector;
+    bool bAllowAxisScale = true;
+
+    FVector2D OriginPx = FVector2D::ZeroVector;
+    bool bOriginValid = false;
+    FVector2D CenterCubeCornersPx[8];
+    bool bCenterCubeValid = false;
+
+    TArray<FProjectedAxis, TInlineAllocator<6>> Axes;
+    TArray<FProjectedQuad, TInlineAllocator<6>> PlaneQuads;
+    TArray<FProjectedRing, TInlineAllocator<4>> Rings;
+
+    ENGonGizmoPart ActivePart = ENGonGizmoPart::None;
+    bool bDragging = false;
+    FVector2D DragStartPixel = FVector2D::ZeroVector;
+    double DragStartWorldUnitsPerPixel = 1.0;
+    double DragStartPixelScale = 1.0;
+    FVector2D DragScreenAxisA = FVector2D::ZeroVector;
+    FVector2D DragScreenAxisB = FVector2D::ZeroVector;
+    FVector2D DragRotationTangent = FVector2D::ZeroVector;
+    double DragRotationPixelsPerRadian = 60.0;
 };

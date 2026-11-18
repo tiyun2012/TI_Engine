@@ -129,3 +129,4 @@ private:
 IMPLEMENT_MODULE(FNGonModule, NGon)
 
 #undef LOCTEXT_NAMESPACE
+// NGon Unified ABI Sync v5.8.2

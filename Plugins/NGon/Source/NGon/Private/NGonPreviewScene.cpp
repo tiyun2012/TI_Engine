@@ -47,6 +47,54 @@ FLinearColor HeatColor(float Alpha)
     return T < 1.0f ? FMath::Lerp(Cold, Mid, T) : FMath::Lerp(Mid, Hot, T - 1.0f);
 }
 
+UMaterial* MakeStudioMaterial(bool bUseVertexColor)
+{
+    UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
+    Material->SetShadingModel(MSM_DefaultLit);
+    Material->TwoSided = true;
+
+    auto* Shade = CastChecked<UMaterialExpressionCustom>(UMaterialEditingLibrary::CreateMaterialExpression(
+        Material, UMaterialExpressionCustom::StaticClass(), -320, 0));
+    Shade->OutputType = CMOT_Float3;
+    Shade->Inputs.Reset();
+    Shade->Code = bUseVertexColor
+        ? TEXT(
+            "float3 N = normalize(Parameters.WorldNormal);\n"
+            "float3 V = normalize(Parameters.CameraVector);\n"
+            "float3 R = normalize(cross(V, float3(0.0, 0.0, 1.0)) + float3(1e-5, 0.0, 0.0));\n"
+            "float3 U = normalize(cross(R, V));\n"
+            "float3 Lkey = normalize(V * 0.45 + R * 0.42 + U * 0.62);\n"
+            "float3 Lfill = normalize(V * 0.35 - R * 0.60 - U * 0.25);\n"
+            "float ndotlKey = saturate(dot(N, Lkey));\n"
+            "float ndotlFill = saturate(dot(N, Lfill));\n"
+            "float ndotv = abs(dot(N, V));\n"
+            "float hemi = saturate(N.z * 0.5 + 0.5);\n"
+            "float3 vc = Parameters.VertexColor.rgb;\n"
+            "float lighting = 0.32 + 0.44 * ndotlKey + 0.18 * ndotlFill + 0.12 * hemi + 0.16 * ndotv;\n"
+            "return vc * lighting;")
+        : TEXT(
+            "float3 N = normalize(Parameters.WorldNormal);\n"
+            "float3 V = normalize(Parameters.CameraVector);\n"
+            "float3 R = normalize(cross(V, float3(0.0, 0.0, 1.0)) + float3(1e-5, 0.0, 0.0));\n"
+            "float3 U = normalize(cross(R, V));\n"
+            "float3 Lkey = normalize(V * 0.45 + R * 0.42 + U * 0.62);\n"
+            "float3 Lfill = normalize(V * 0.35 - R * 0.60 - U * 0.25);\n"
+            "float ndotlKey = saturate(dot(N, Lkey));\n"
+            "float ndotlFill = saturate(dot(N, Lfill));\n"
+            "float ndotv = abs(dot(N, V));\n"
+            "float hemi = saturate(N.z * 0.5 + 0.5);\n"
+            "float3 H = normalize(Lkey + V);\n"
+            "float spec = pow(saturate(dot(N, H)), 28.0) * 0.20;\n"
+            "float3 baseAlbedo = float3(0.54, 0.57, 0.61);\n"
+            "float lighting = 0.28 + 0.48 * ndotlKey + 0.20 * ndotlFill + 0.14 * hemi + 0.18 * ndotv;\n"
+            "return baseAlbedo * lighting + float3(spec, spec, spec);");
+
+    Material->GetEditorOnlyData()->BaseColor.Connect(0, Shade);
+    Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Shade);
+    Material->PostEditChange();
+    return Material;
+}
+
 UMaterial* MakePaintMaterial(UTexture2D* PaintTexture)
 {
     UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
@@ -77,7 +125,29 @@ UMaterial* MakePaintMaterial(UTexture2D* PaintTexture)
     Composite->A.Connect(0, Base);
     Composite->B.Connect(0, PaintSample);
     Composite->Alpha.Connect(4, PaintSample);
-    Material->GetEditorOnlyData()->BaseColor.Connect(0, Composite);
+
+    auto* Shade = CastChecked<UMaterialExpressionCustom>(UMaterialEditingLibrary::CreateMaterialExpression(
+        Material, UMaterialExpressionCustom::StaticClass(), -40, 0));
+    Shade->OutputType = CMOT_Float3;
+    Shade->Inputs.SetNum(1);
+    Shade->Inputs[0].InputName = TEXT("Albedo");
+    Shade->Inputs[0].Input.Connect(0, Composite);
+    Shade->Code = TEXT(
+        "float3 N = normalize(Parameters.WorldNormal);\n"
+        "float3 V = normalize(Parameters.CameraVector);\n"
+        "float3 R = normalize(cross(V, float3(0.0, 0.0, 1.0)) + float3(1e-5, 0.0, 0.0));\n"
+        "float3 U = normalize(cross(R, V));\n"
+        "float3 Lkey = normalize(V * 0.45 + R * 0.42 + U * 0.62);\n"
+        "float3 Lfill = normalize(V * 0.35 - R * 0.60 - U * 0.25);\n"
+        "float ndotlKey = saturate(dot(N, Lkey));\n"
+        "float ndotlFill = saturate(dot(N, Lfill));\n"
+        "float ndotv = abs(dot(N, V));\n"
+        "float hemi = saturate(N.z * 0.5 + 0.5);\n"
+        "float lighting = 0.30 + 0.46 * ndotlKey + 0.20 * ndotlFill + 0.14 * hemi + 0.16 * ndotv;\n"
+        "return Albedo * lighting;");
+
+    Material->GetEditorOnlyData()->BaseColor.Connect(0, Shade);
+    Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Shade);
     Material->PostEditChange();
     return Material;
 }
@@ -129,9 +199,14 @@ bool UploadPaintPixels(UTexture2D* Texture, const FColor* Pixels, int64 PixelCou
 }
 
 FNGonPreviewScene::FNGonPreviewScene()
-    : Scene(FPreviewScene::ConstructionValues().SetCreatePhysicsScene(false))
+    : Scene(FPreviewScene::ConstructionValues()
+        .SetCreatePhysicsScene(false)
+        .SetLightBrightness(4.5f)
+        .SetSkyBrightness(2.0f))
 {
     GetSceneAccel(this);
+    StudioMaterial.Reset(MakeStudioMaterial(false));
+    ColorMaterial.Reset(MakeStudioMaterial(true));
 
     Surface = NewObject<UDynamicMeshComponent>(GetTransientPackage(), NAME_None, RF_Transient);
     Surface->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -139,7 +214,7 @@ FNGonPreviewScene::FNGonPreviewScene()
     Surface->SetEnableFlatShading(bFlatShading);
     Surface->SetVertexColorSpaceTransformMode(EDynamicMeshVertexColorTransformMode::NoTransform);
     Surface->SetTangentsType(EDynamicMeshComponentTangentsMode::AutoCalculated);
-    Surface->SetMaterial(0, UMaterial::GetDefaultMaterial(MD_Surface));
+    Surface->SetMaterial(0, StudioMaterial.IsValid() ? StudioMaterial.Get() : UMaterial::GetDefaultMaterial(MD_Surface));
     Scene.AddComponent(Surface, FTransform::Identity);
 
     Overlay.Reset(NewObject<UPreviewGeometry>());
@@ -162,7 +237,9 @@ FNGonPreviewScene::~FNGonPreviewScene()
 
 bool FNGonPreviewScene::HasGizmoTarget() const
 {
-    return GizmoMode != ENGonGizmoMode::None && (NGon::IsBoneGizmoActive(this) || !SelectedIds.IsEmpty());
+    const FNGonSceneAccel& Accel = GetSceneAccel(this);
+    const bool bHasBone = Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || SelectedIds.IsEmpty());
+    return GizmoMode != ENGonGizmoMode::None && (bHasBone || !SelectedIds.IsEmpty());
 }
 
 void FNGonPreviewScene::RefreshBoneDeformation()
@@ -222,6 +299,7 @@ void FNGonPreviewScene::RefreshBoneDeformation()
             }
             NotifySurfacePositionsChanged(Mesh);
             Picker.PositionsChanged();
+            Accel.RecomputeAllVertexNormals(Positions);
             UpdateOverlayPositions();
             DrawSelection();
             ++PositionUpdates;
@@ -297,12 +375,18 @@ FBox FNGonPreviewScene::GetSelectionOrMeshBounds() const
 
 void FNGonPreviewScene::SetPreviewMaterials(UInteractiveToolManager* ToolManager)
 {
+    if (!StudioMaterial.IsValid())
+    {
+        StudioMaterial.Reset(MakeStudioMaterial(false));
+    }
+    if (!ColorMaterial.IsValid())
+    {
+        ColorMaterial.Reset(MakeStudioMaterial(true));
+    }
     if (!ToolManager)
     {
         return;
     }
-    StudioMaterial.Reset(ToolSetupUtil::GetSimpleCustomMaterial(ToolManager, StudioColor));
-    ColorMaterial.Reset(ToolSetupUtil::GetVertexColorMaterial(ToolManager, true));
     if (UMaterialInterface* Highlight = ToolSetupUtil::GetSelectionMaterial(FLinearColor(SelectionColor), ToolManager, 0.10f))
     {
         Surface->SetSecondaryRenderMaterial(Highlight);
@@ -564,28 +648,121 @@ void FNGonPreviewScene::RebuildOverlays()
     EdgeLines->Clear();
     VertexPoints->Clear();
 
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    if (Accel.LogicalVertexNormals.Num() != Positions.Num() || Accel.DisplacedVertexPositions.Num() != Positions.Num())
+    {
+        Accel.RecomputeAllVertexNormals(Positions);
+    }
+
     TArray<FVector> Starts;
     TArray<FVector> Ends;
     Starts.Reserve(Topology.Edges.Num());
     Ends.Reserve(Topology.Edges.Num());
     for (const FIntPoint& Edge : Topology.Edges)
     {
-        Starts.Add(Positions[Edge.X]);
-        Ends.Add(Positions[Edge.Y]);
+        Starts.Add(Accel.GetDisplacedVertexPosition(Positions, Edge.X, 0.25f));
+        Ends.Add(Accel.GetDisplacedVertexPosition(Positions, Edge.Y, 0.25f));
     }
 
-    EdgeLines->AddLines(Starts, Ends, EdgeColor, 1.6f, 0.35f);
-    VertexPoints->AddPoints(Positions, PointColor, 5.0f, 0.6f);
-    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    EdgeLines->AddLines(Starts, Ends, EdgeColor, 1.6f, 0.8f);
+    const int32 NumVerts = Accel.DisplacedVertexPositions.Num();
+    for (int32 v = 0; v < NumVerts; ++v)
+    {
+        const float Scale = Accel.GetVertexCameraDepthScale(Positions[v]);
+        VertexPoints->AddPoint(Accel.DisplacedVertexPositions[v], PointColor, 5.4f * Scale, 3.5f * Scale);
+    }
     Accel.bEdgesOverlayDirty = false;
     Accel.bVerticesOverlayDirty = false;
     DrawSelection();
     DrawSoftSelection();
 }
 
+void FNGonPreviewScene::UpdateCameraVertexScales(const FVector& CameraOrigin, const FVector& CameraDir)
+{
+    if (Positions.IsEmpty() || SoftSession.IsActive())
+    {
+        return;
+    }
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
+    if (Accel.bBoneDragActive)
+    {
+        return;
+    }
+
+    const FBox Bounds = Topology.RestBounds.IsValid ? Topology.RestBounds : GetMeshBounds();
+    const double MeshRadius = FMath::Max(Bounds.GetExtent().Size(), 10.0);
+    const double MoveThresholdSq = FMath::Square(FMath::Max(MeshRadius * 0.035, 1.5));
+    if (Accel.bHasCameraView && FVector::DistSquared(CameraOrigin, Accel.LastCameraOrigin) < MoveThresholdSq)
+    {
+        return;
+    }
+
+    Accel.LastCameraOrigin = CameraOrigin;
+    Accel.LastCameraDir = CameraDir.GetSafeNormal();
+    Accel.bHasCameraView = true;
+
+    // Compute near and far vertex distances from camera using a fast strided sample
+    const int32 NumVerts = Positions.Num();
+    const int32 Step = FMath::Max(1, NumVerts / 512);
+    float MinDist = TNumericLimits<float>::Max();
+    float MaxDist = 0.0f;
+    for (int32 i = 0; i < NumVerts; i += Step)
+    {
+        const float D = static_cast<float>(FVector::Distance(Positions[i], CameraOrigin));
+        MinDist = FMath::Min(MinDist, D);
+        MaxDist = FMath::Max(MaxDist, D);
+    }
+    if (MinDist >= MaxDist)
+    {
+        MinDist = FMath::Max(1.0f, static_cast<float>(FVector::Distance(Bounds.GetCenter(), CameraOrigin) - MeshRadius));
+        MaxDist = static_cast<float>(FVector::Distance(Bounds.GetCenter(), CameraOrigin) + MeshRadius);
+    }
+    Accel.NearCameraDist = MinDist;
+    Accel.FarCameraDist = MaxDist;
+
+    // Also scale down toward 0.65x when the camera zooms far out from the mesh center
+    // so combined with DepthScale (1.0 -> 0.5), far vertices shrink cleanly to 1/2 size (2.7 px)
+    const float CamCenterDist = static_cast<float>(FVector::Distance(Bounds.GetCenter(), CameraOrigin));
+    Accel.CameraZoomScale = FMath::GetMappedRangeValueClamped(
+        FVector2f(static_cast<float>(MeshRadius * 0.9), static_cast<float>(MeshRadius * 3.8)),
+        FVector2f(1.0f, 0.72f),
+        CamCenterDist);
+
+    // Rebuild VertexPoints sizes when visible (throttled on very high-poly meshes during rapid camera motion)
+    if (Accel.bShowVertices && VertexPoints && (NumVerts <= 15000 || (GFrameCounter - Accel.LastVertexSizeUpdateFrame) >= 6))
+    {
+        Accel.LastVertexSizeUpdateFrame = GFrameCounter;
+        if (Accel.DisplacedVertexPositions.Num() != NumVerts)
+        {
+            Accel.RecomputeAllVertexNormals(Positions);
+        }
+        VertexPoints->Clear();
+        for (int32 v = 0; v < NumVerts; ++v)
+        {
+            const float Scale = Accel.GetVertexCameraDepthScale(Positions[v]);
+            VertexPoints->AddPoint(Accel.DisplacedVertexPositions[v], PointColor, 5.4f * Scale, 3.5f * Scale);
+        }
+    }
+
+    if (SelectedElement == ENGonElement::Vertex && !SelectedIds.IsEmpty())
+    {
+        Accel.CachedSelectedVertexCount = 0;
+        DrawSelection();
+    }
+    if (SoftSettings.bEnabled && !SoftInfluences.IsEmpty())
+    {
+        DrawSoftSelection();
+    }
+}
+
 void FNGonPreviewScene::UpdateOverlayPositions()
 {
     FNGonSceneAccel& Accel = GetSceneAccel(this);
+    if (Accel.LogicalVertexNormals.Num() != Positions.Num() || Accel.DisplacedVertexPositions.Num() != Positions.Num())
+    {
+        Accel.RecomputeAllVertexNormals(Positions);
+    }
+
     if (Accel.bShowEdges)
     {
         for (int32 EdgeIndex = 0; EdgeIndex < Topology.Edges.Num(); ++EdgeIndex)
@@ -593,8 +770,8 @@ void FNGonPreviewScene::UpdateOverlayPositions()
             const FIntPoint Edge = Topology.Edges[EdgeIndex];
             if (Positions.IsValidIndex(Edge.X) && Positions.IsValidIndex(Edge.Y))
             {
-                EdgeLines->SetLineStart(EdgeIndex, Positions[Edge.X]);
-                EdgeLines->SetLineEnd(EdgeIndex, Positions[Edge.Y]);
+                EdgeLines->SetLineStart(EdgeIndex, Accel.GetDisplacedVertexPosition(Positions, Edge.X, 0.25f));
+                EdgeLines->SetLineEnd(EdgeIndex, Accel.GetDisplacedVertexPosition(Positions, Edge.Y, 0.25f));
             }
         }
         Accel.bEdgesOverlayDirty = false;
@@ -608,7 +785,7 @@ void FNGonPreviewScene::UpdateOverlayPositions()
     {
         for (int32 VertexIndex = 0; VertexIndex < Positions.Num(); ++VertexIndex)
         {
-            VertexPoints->SetPointPosition(VertexIndex, Positions[VertexIndex]);
+            VertexPoints->SetPointPosition(VertexIndex, Accel.DisplacedVertexPositions[VertexIndex]);
         }
         Accel.bVerticesOverlayDirty = false;
     }
@@ -651,7 +828,12 @@ void FNGonPreviewScene::DrawSoftSelection()
         const float Weight = FMath::Clamp(static_cast<float>(Influence.Weight), 0.0f, 1.0f);
         const FLinearColor Color = FLinearColor::LerpUsingHSV(
             FLinearColor(0.04f, 0.35f, 1.0f), FLinearColor(1.0f, 0.12f, 0.02f), Weight);
-        SoftInfluencePoints->AddPoint(Positions[Influence.Vertex], Color.ToFColor(true), 5.0f + 8.0f * Weight, 1.8f);
+        const float DepthScale = Accel.GetVertexCameraDepthScale(Positions[Influence.Vertex]);
+        SoftInfluencePoints->AddPoint(
+            Accel.GetDisplacedVertexPosition(Positions, Influence.Vertex, 1.35f),
+            Color.ToFColor(true),
+            (5.5f + 8.0f * Weight) * DepthScale,
+            5.0f * DepthScale);
         ++AddedCount;
     }
     Accel.CachedSoftPointCount = AddedCount;
@@ -668,8 +850,8 @@ void FNGonPreviewScene::SetShowEdges(bool bShow)
             const FIntPoint Edge = Topology.Edges[EdgeIndex];
             if (Positions.IsValidIndex(Edge.X) && Positions.IsValidIndex(Edge.Y))
             {
-                EdgeLines->SetLineStart(EdgeIndex, Positions[Edge.X]);
-                EdgeLines->SetLineEnd(EdgeIndex, Positions[Edge.Y]);
+                EdgeLines->SetLineStart(EdgeIndex, Accel.GetDisplacedVertexPosition(Positions, Edge.X, 0.25f));
+                EdgeLines->SetLineEnd(EdgeIndex, Accel.GetDisplacedVertexPosition(Positions, Edge.Y, 0.25f));
             }
         }
         Accel.bEdgesOverlayDirty = false;
@@ -683,9 +865,13 @@ void FNGonPreviewScene::SetShowVertices(bool bShow)
     Accel.bShowVertices = bShow;
     if (bShow && Accel.bVerticesOverlayDirty)
     {
+        if (Accel.DisplacedVertexPositions.Num() != Positions.Num())
+        {
+            Accel.RecomputeAllVertexNormals(Positions);
+        }
         for (int32 VertexIndex = 0; VertexIndex < Positions.Num(); ++VertexIndex)
         {
-            VertexPoints->SetPointPosition(VertexIndex, Positions[VertexIndex]);
+            VertexPoints->SetPointPosition(VertexIndex, Accel.DisplacedVertexPositions[VertexIndex]);
         }
         Accel.bVerticesOverlayDirty = false;
     }
@@ -816,6 +1002,7 @@ void FNGonPreviewScene::SetBend(float Value)
 
     NotifySurfacePositionsChanged(Mesh);
     Picker.PositionsChanged();
+    GetSceneAccel(this).RecomputeAllVertexNormals(Positions);
     UpdateOverlayPositions();
     if (!SelectedIds.IsEmpty())
     {
@@ -857,7 +1044,7 @@ void FNGonPreviewScene::RebuildSoftSelection()
 FTransform FNGonPreviewScene::GetSelectionGizmoTransform() const
 {
     const FNGonSceneAccel& Accel = GetSceneAccel(this);
-    if (Accel.bBoneGizmoActive && Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex))
+    if (Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || SelectedIds.IsEmpty()))
     {
         const FTransform& BoneComp = Accel.Bones[Accel.SelectedBoneIndex].CurrentComponentTransform;
         const FQuat GizmoRot = Accel.bUseWorldCoordinateSystem ? FQuat::Identity : BoneComp.GetRotation();
@@ -929,11 +1116,12 @@ FTransform FNGonPreviewScene::BuildComponentGizmoTransform() const
             const int32 Next = (Corner + 1) % Face.Perimeter.Num();
             if (Positions.IsValidIndex(Face.Perimeter[Corner]) && Positions.IsValidIndex(Face.Perimeter[Next]))
             {
-                Normal += FVector::CrossProduct(Positions[Face.Perimeter[Corner]] - Origin,
-                    Positions[Face.Perimeter[Next]] - Origin);
+                const FVector EdgeA = (Positions[Face.Perimeter[Corner]] - Origin).GetSafeNormal(1.e-12);
+                const FVector EdgeB = (Positions[Face.Perimeter[Next]] - Origin).GetSafeNormal(1.e-12);
+                Normal += FVector::CrossProduct(EdgeA, EdgeB);
             }
         }
-        return Normal.GetSafeNormal();
+        return Normal.GetSafeNormal(1.e-12);
     };
 
     TArray<FSample> Samples;
@@ -945,24 +1133,27 @@ FTransform FNGonPreviewScene::BuildComponentGizmoTransform() const
         if (SelectedElement == ENGonElement::Vertex)
         {
             if (!Positions.IsValidIndex(Id)) continue;
+            const FNGonSceneAccel& Accel = GetSceneAccel(this);
             Sample.Position = Positions[Id];
-            if (const TArray<int32>* IncidentFaces = GizmoVertexFaces.Find(Id))
+            if (Accel.LogicalVertexNormals.IsValidIndex(Id))
+            {
+                Sample.Normal = Accel.GetVertexNormal(Id);
+                Sample.Tangent = Accel.GetVertexTangent(Id);
+            }
+            else if (const TArray<int32>* IncidentFaces = GizmoVertexFaces.Find(Id))
             {
                 for (const int32 FaceId : *IncidentFaces)
                 {
                     const FNGonFace* FacePtr = Topology.Faces.Find(FaceId);
                     if (!FacePtr) continue;
                     const FNGonFace& Face = *FacePtr;
-                    const FVector FaceN = FaceNormal(Face);
-                    Sample.Normal += FaceN;
+                    Sample.Normal += FaceNormal(Face);
                     for (int32 Corner = 0; Corner < Face.Perimeter.Num(); ++Corner)
                     {
                         if (Face.Perimeter[Corner] != Id) continue;
                         const int32 Next = Face.Perimeter[(Corner + 1) % Face.Perimeter.Num()];
                         if (Positions.IsValidIndex(Next))
                         {
-                            // Accumulate incident perimeter directions so the vertex
-                            // frame does not depend on TMap face iteration order.
                             Sample.Tangent += Positions[Next] - Sample.Position;
                         }
                         break;
@@ -1016,7 +1207,10 @@ FTransform FNGonPreviewScene::BuildComponentGizmoTransform() const
             }
             Sample.Weight = FMath::Max(Area, 1.e-4);
         }
-        if (!Sample.Normal.Normalize()) continue;
+        if (!Sample.Normal.Normalize(1.e-12))
+        {
+            Sample.Normal = FVector::UpVector;
+        }
         Sample.Tangent = Sample.Tangent - Sample.Normal * FVector::DotProduct(Sample.Tangent, Sample.Normal);
         if (!Sample.Tangent.Normalize())
         {
@@ -1076,6 +1270,10 @@ bool FNGonPreviewScene::BeginSoftTransform(const FTransform& GizmoTransform, ENG
 {
     FNGonSceneAccel& Accel = GetSceneAccel(this);
     Accel.DragStartGizmoTransform = GizmoTransform;
+    if (Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || SelectedIds.IsEmpty()))
+    {
+        Accel.bBoneGizmoActive = true;
+    }
     if (Accel.bBoneGizmoActive && Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex))
     {
         Accel.bBoneDragActive = true;
@@ -1227,12 +1425,13 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
 
             NotifySurfacePositionsChanged(Mesh);
             Picker.PositionsChanged();
+            Accel.RecomputeDirtyVertexNormals(Accel.ActiveSubtreeVertices, Positions);
 
             if (Accel.bShowVertices)
             {
                 for (const int32 LogicalId : Accel.ActiveSubtreeVertices)
                 {
-                    VertexPoints->SetPointPosition(LogicalId, Positions[LogicalId]);
+                    VertexPoints->SetPointPosition(LogicalId, Accel.DisplacedVertexPositions[LogicalId]);
                 }
             }
             else
@@ -1262,8 +1461,8 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
                 for (const int32 EdgeIndex : Accel.DirtyEdges)
                 {
                     const FIntPoint Edge = Topology.Edges[EdgeIndex];
-                    EdgeLines->SetLineStart(EdgeIndex, Positions[Edge.X]);
-                    EdgeLines->SetLineEnd(EdgeIndex, Positions[Edge.Y]);
+                    EdgeLines->SetLineStart(EdgeIndex, Accel.GetDisplacedVertexPosition(Positions, Edge.X, 0.25f));
+                    EdgeLines->SetLineEnd(EdgeIndex, Accel.GetDisplacedVertexPosition(Positions, Edge.Y, 0.25f));
                 }
             }
             else
@@ -1355,13 +1554,14 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
     }
     NotifySurfacePositionsChanged(Mesh);
     Picker.PositionsChanged();
+    Accel.RecomputeDirtyVertexNormals(Accel.DirtyVertices, Positions);
 
-    // 2. Update only the affected vertex points and incident edge lines.
+    // 2. Update only the affected vertex points and incident edge lines using stored mesh-space vertex normals.
     if (Accel.bShowVertices)
     {
         for (const int32 LogicalId : Accel.DirtyVertices)
         {
-            VertexPoints->SetPointPosition(LogicalId, Positions[LogicalId]);
+            VertexPoints->SetPointPosition(LogicalId, Accel.DisplacedVertexPositions[LogicalId]);
         }
     }
     else
@@ -1390,8 +1590,8 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
         for (const int32 EdgeIndex : Accel.DirtyEdges)
         {
             const FIntPoint Edge = Topology.Edges[EdgeIndex];
-            EdgeLines->SetLineStart(EdgeIndex, Positions[Edge.X]);
-            EdgeLines->SetLineEnd(EdgeIndex, Positions[Edge.Y]);
+            EdgeLines->SetLineStart(EdgeIndex, Accel.GetDisplacedVertexPosition(Positions, Edge.X, 0.25f));
+            EdgeLines->SetLineEnd(EdgeIndex, Accel.GetDisplacedVertexPosition(Positions, Edge.Y, 0.25f));
         }
     }
     else
@@ -1409,7 +1609,7 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
         if (SoftTransformMode == ENGonSoftTransformMode::Fixed)
         {
             // In Fixed mode, weights and colors do not change during a drag;
-            // only update the positions of existing SoftInfluencePoints.
+            // only update the normal-displaced positions of existing SoftInfluencePoints.
             if (SoftInfluencePoints && SoftInfluencePoints->IsVisible() &&
                 Accel.CachedSoftPointCount == SoftInfluences.Num())
             {
@@ -1418,7 +1618,7 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
                     const int32 VertId = SoftInfluences[idx].Vertex;
                     if (Positions.IsValidIndex(VertId))
                     {
-                        SoftInfluencePoints->SetPointPosition(idx, Positions[VertId]);
+                        SoftInfluencePoints->SetPointPosition(idx, Accel.GetDisplacedVertexPosition(Positions, VertId, 1.35f));
                     }
                 }
             }
@@ -1510,6 +1710,7 @@ void FNGonPreviewScene::CancelSoftTransform()
     }
     NotifySurfacePositionsChanged(Mesh);
     Picker.PositionsChanged();
+    Accel.RecomputeAllVertexNormals(Positions);
     UpdateOverlayPositions();
     SoftSession.Cancel();
     if (!SelectedIds.IsEmpty())
@@ -1733,11 +1934,13 @@ void FNGonPreviewScene::UpdateSelection(ENGonElement Element, int32 Id, bool bAd
 
 void FNGonPreviewScene::DrawSelection()
 {
+    FNGonSceneAccel& Accel = GetSceneAccel(this);
     SelectedEdge->Clear();
-    SelectedVertex->Clear();
 
     if (SelectedElement == ENGonElement::Face && !SelectedIds.IsEmpty())
     {
+        SelectedVertex->Clear();
+        Accel.CachedSelectedVertexCount = 0;
         TArray<FVector> Starts;
         TArray<FVector> Ends;
         for (const int32 Id : SelectedIds)
@@ -1746,15 +1949,19 @@ void FNGonPreviewScene::DrawSelection()
             {
                 for (int32 Corner = 0; Corner < Face->Perimeter.Num(); ++Corner)
                 {
-                    Starts.Add(Positions[Face->Perimeter[Corner]]);
-                    Ends.Add(Positions[Face->Perimeter[(Corner + 1) % Face->Perimeter.Num()]]);
+                    const int32 V0 = Face->Perimeter[Corner];
+                    const int32 V1 = Face->Perimeter[(Corner + 1) % Face->Perimeter.Num()];
+                    Starts.Add(Accel.GetDisplacedVertexPosition(Positions, V0, 0.55f));
+                    Ends.Add(Accel.GetDisplacedVertexPosition(Positions, V1, 0.55f));
                 }
             }
         }
-        SelectedEdge->AddLines(Starts, Ends, SelectionColor, 2.5f, 1.2f);
+        SelectedEdge->AddLines(Starts, Ends, SelectionColor, 2.6f, 2.5f);
     }
     else if (SelectedElement == ENGonElement::Edge && !SelectedIds.IsEmpty())
     {
+        SelectedVertex->Clear();
+        Accel.CachedSelectedVertexCount = 0;
         TArray<FVector> Starts;
         TArray<FVector> Ends;
         Starts.Reserve(SelectedIds.Num());
@@ -1764,21 +1971,84 @@ void FNGonPreviewScene::DrawSelection()
             if (!Topology.Edges.IsValidIndex(Id)) continue;
             const FIntPoint Edge = Topology.Edges[Id];
             if (!Positions.IsValidIndex(Edge.X) || !Positions.IsValidIndex(Edge.Y)) continue;
-            Starts.Add(Positions[Edge.X]);
-            Ends.Add(Positions[Edge.Y]);
+            Starts.Add(Accel.GetDisplacedVertexPosition(Positions, Edge.X, 0.65f));
+            Ends.Add(Accel.GetDisplacedVertexPosition(Positions, Edge.Y, 0.65f));
         }
-        SelectedEdge->AddLines(Starts, Ends, SelectionColor, 3.5f, 1.2f);
+        SelectedEdge->AddLines(Starts, Ends, SelectionColor, 3.6f, 3.0f);
     }
-
-    if (SelectedElement == ENGonElement::Vertex && !SelectedIds.IsEmpty())
+    else if (SelectedElement == ENGonElement::Vertex && !SelectedIds.IsEmpty())
     {
-        TArray<FVector> Points;
-        Points.Reserve(SelectedIds.Num());
-        for (const int32 Id : SelectedIds)
+        // Fast in-place update if count matches, or rebuild normal-displaced points + tangent-plane normal markers
+        if (Accel.CachedSelectedVertexCount == SelectedIds.Num() && Accel.CachedSelectedVertexCount > 0)
         {
-            if (Positions.IsValidIndex(Id)) Points.Add(Positions[Id]);
+            int32 PtIdx = 0;
+            for (const int32 Id : SelectedIds)
+            {
+                if (Positions.IsValidIndex(Id))
+                {
+                    SelectedVertex->SetPointPosition(PtIdx++, Accel.GetDisplacedVertexPosition(Positions, Id, 1.65f));
+                }
+            }
         }
-        SelectedVertex->AddPoints(Points, SelectionColor, 9.0f, 1.5f);
+        else
+        {
+            SelectedVertex->Clear();
+            int32 AddedSel = 0;
+            for (const int32 Id : SelectedIds)
+            {
+                if (Positions.IsValidIndex(Id))
+                {
+                    const float DepthScale = Accel.GetVertexCameraDepthScale(Positions[Id]);
+                    SelectedVertex->AddPoint(
+                        Accel.GetDisplacedVertexPosition(Positions, Id, 1.65f),
+                        SelectionColor,
+                        9.5f * DepthScale,
+                        7.5f * DepthScale);
+                    ++AddedSel;
+                }
+            }
+            Accel.CachedSelectedVertexCount = AddedSel;
+        }
+
+        // Also draw surface-tangent diamonds oriented by the mesh-space vertex normal so selected vertices
+        // remain 100% visible even at steep grazing camera angles without clipping into adjacent triangles.
+        if (SelectedIds.Num() <= 256)
+        {
+            const double MarkerRadius = FMath::Max(static_cast<double>(Accel.VertexNormalOffset) * 1.45, 0.12);
+            TArray<FVector> Starts;
+            TArray<FVector> Ends;
+            Starts.Reserve(SelectedIds.Num() * 4);
+            Ends.Reserve(SelectedIds.Num() * 4);
+            for (const int32 Id : SelectedIds)
+            {
+                if (!Positions.IsValidIndex(Id)) continue;
+                const FVector N = Accel.GetVertexNormal(Id);
+                FVector TangentU = Accel.GetVertexTangent(Id);
+                TangentU = (TangentU - N * FVector::DotProduct(TangentU, N)).GetSafeNormal();
+                if (TangentU.IsNearlyZero())
+                {
+                    FVector FallbackV;
+                    N.FindBestAxisVectors(TangentU, FallbackV);
+                }
+                const FVector TangentV = FVector::CrossProduct(N, TangentU).GetSafeNormal();
+                const double ScaledRad = MarkerRadius * static_cast<double>(Accel.GetVertexCameraDepthScale(Positions[Id]));
+                const FVector Center = Accel.GetDisplacedVertexPosition(Positions, Id, 1.45f);
+                const FVector C0 = Center + TangentU * ScaledRad;
+                const FVector C1 = Center + TangentV * ScaledRad;
+                const FVector C2 = Center - TangentU * ScaledRad;
+                const FVector C3 = Center - TangentV * ScaledRad;
+                Starts.Add(C0); Ends.Add(C1);
+                Starts.Add(C1); Ends.Add(C2);
+                Starts.Add(C2); Ends.Add(C3);
+                Starts.Add(C3); Ends.Add(C0);
+            }
+            SelectedEdge->AddLines(Starts, Ends, SelectionColor, 2.2f, 4.5f);
+        }
+    }
+    else
+    {
+        SelectedVertex->Clear();
+        Accel.CachedSelectedVertexCount = 0;
     }
 }
 
@@ -1876,3 +2146,4 @@ FText FNGonPreviewScene::DescribeUpdates() const
 
 
 #undef LOCTEXT_NAMESPACE
+// NGon Unified ABI Sync v5.8.2

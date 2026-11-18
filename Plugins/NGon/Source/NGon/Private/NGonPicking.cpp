@@ -259,3 +259,4 @@ void FNGonPicker::BoxPick(
         if ((bFullyContained && bAll) || (!bFullyContained && bHit)) OutIds.Add(Pair.Key);
     }
 }
+// NGon Unified ABI Sync v5.8.2

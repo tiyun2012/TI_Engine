@@ -201,3 +201,4 @@ bool FTiPaintDocument::ExportPNG(const FString& Filename, FText& Error) const
 }
 
 void FTiPaintDocument::MarkChanged() { CompositePixels.Reset(); if (Changed) Changed(); }
+// NGon Unified ABI Sync v5.8.2

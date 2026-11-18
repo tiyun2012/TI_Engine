@@ -43,3 +43,4 @@ bool FNGonUVDocumentTest::RunTest(const FString&)
     TestTrue(TEXT("Normalize keeps bounds valid"), Document.GetBounds().Min.X <= Document.GetBounds().Max.X);
     return true;
 }
+// NGon Unified ABI Sync v5.8.2

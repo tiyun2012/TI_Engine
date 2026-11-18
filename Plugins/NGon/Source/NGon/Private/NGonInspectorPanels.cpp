@@ -555,7 +555,12 @@ void SNGonPreview::RebuildSkeletonTreeList()
                         ActiveLowerTab = ENGonRightLowerTab::Details;
                         if (Viewport.IsValid())
                         {
+                            Viewport->Preview().ClearSelection();
                             NGon::SelectSceneBone(&Viewport->Preview(), BoneIdx, true);
+                            if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
+                            {
+                                Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
+                            }
                             Viewport->Invalidate();
                             Viewport->FocusViewport();
                         }
@@ -1679,3 +1684,4 @@ TSharedRef<SWidget> SNGonPreview::MakePainterTab()
 
 
 #undef LOCTEXT_NAMESPACE
+// NGon Unified ABI Sync v5.8.2

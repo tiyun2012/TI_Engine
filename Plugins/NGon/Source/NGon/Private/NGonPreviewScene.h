@@ -49,6 +49,7 @@ public:
     void SetHeatBias(float Value);
     void SetBend(float Value);
     void RefreshBoneDeformation();
+    void UpdateCameraVertexScales(const FVector& CameraOrigin, const FVector& CameraDir);
     void SetSoftSelection(const FNGonSoftSelectionSettings& Settings);
     void SetSoftTransformMode(ENGonSoftTransformMode Mode) { SoftTransformMode = Mode; }
     ENGonSoftTransformMode GetSoftTransformMode() const { return SoftTransformMode; }
