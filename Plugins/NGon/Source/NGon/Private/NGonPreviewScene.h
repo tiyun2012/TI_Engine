@@ -15,6 +15,7 @@ class UPreviewGeometry;
 class UInteractiveGizmoManager;
 class UCombinedTransformGizmo;
 class UTransformProxy;
+class UTexture2D;
 class IToolContextTransactionProvider;
 
 /** Coordinate frame used by the component gizmo. WeightedAverage matches Maya's
@@ -50,6 +51,9 @@ public:
     void SetShowEdges(bool bShow);
     void SetShowVertices(bool bShow);
     void SetHeatmapVisible(bool bShow);
+    /** Apply the TiPaint composite to the preview surface using each corner's UV. */
+    void SetPaintTexture(const TArray<FColor>& Pixels, int32 Width, int32 Height);
+    void ClearPaintTexture();
     void SetHeatBias(float Value);
     void SetBend(float Value);
     void SetupGizmo(UInteractiveGizmoManager* GizmoManager, IToolContextTransactionProvider* TransactionProvider);
@@ -88,6 +92,7 @@ private:
         int32 OverlayId;
         int32 LogicalVertex;
         int32 Face;
+        FVector2f UV = FVector2f::ZeroVector;
     };
 
     void InitializeColorOverlay(UE::Geometry::FDynamicMesh3& Mesh);
@@ -109,6 +114,7 @@ private:
 
     FPreviewScene Scene;
     TStrongObjectPtr<UPreviewGeometry> Overlay;
+    TStrongObjectPtr<UTexture2D> PaintTexture;
     UDynamicMeshComponent* Surface = nullptr;
     ULineSetComponent* EdgeLines = nullptr;
     UPointSetComponent* VertexPoints = nullptr;
@@ -141,6 +147,10 @@ private:
     FNGonSoftTransformSession SoftSession;
     TArray<FNGonVertexInfluence> SoftInfluences;
     TArray<float> SoftHeatSamples;
+    TArray<FColor> PaintPixels;
+    int32 PaintWidth = 0;
+    int32 PaintHeight = 0;
+    bool bPaintVisible = false;
     TArray<FVector> SoftOriginalPositions;
     FTransform ActiveGizmoTransform = FTransform::Identity;
     ENGonGizmoFramePolicy GizmoFramePolicy = ENGonGizmoFramePolicy::WeightedAverage;

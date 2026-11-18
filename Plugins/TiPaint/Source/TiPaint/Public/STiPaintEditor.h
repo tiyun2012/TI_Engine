@@ -6,13 +6,15 @@
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/SLeafWidget.h"
 
-class STiPaintCanvas final : public SLeafWidget
+class TIPAINT_API STiPaintCanvas final : public SLeafWidget
 {
 public:
     SLATE_BEGIN_ARGS(STiPaintCanvas) {}
     SLATE_END_ARGS()
     void Construct(const FArguments&, const TSharedRef<FTiPaintDocument>& InDocument);
+    void SetDocument(const TSharedRef<FTiPaintDocument>& InDocument);
     void Fit();
+    void SetUVTriangles(const TArray<FTiPaintUVTriangle>& InTriangles);
 
 protected:
     FVector2D ComputeDesiredSize(float) const override { return FVector2D(640.0f, 480.0f); }
@@ -33,14 +35,19 @@ private:
     bool bPan = false;
     FVector2D LastMouse = FVector2D::ZeroVector;
     FVector2f LastUV = FVector2f::ZeroVector;
+    TArray<FTiPaintUVTriangle> UVTriangles;
 };
 
-class STiPaintEditor final : public SCompoundWidget
+class TIPAINT_API STiPaintEditor final : public SCompoundWidget
 {
 public:
     SLATE_BEGIN_ARGS(STiPaintEditor) {}
     SLATE_END_ARGS()
     void Construct(const FArguments&);
+    /** Show the active mesh's UVs and receive the composited paint texture. */
+    void SetUVTriangles(const TArray<FTiPaintUVTriangle>& InTriangles);
+    void SetPaintedCallback(TFunction<void(const TArray<FColor>&, int32, int32)> InCallback);
+    void ResetForMesh(const TArray<FTiPaintUVTriangle>& InTriangles);
 
 private:
     TSharedRef<SWidget> MakeToolbar();
@@ -53,4 +60,5 @@ private:
     TSharedRef<FTiPaintDocument> Document = MakeShared<FTiPaintDocument>();
     TSharedPtr<STiPaintCanvas> Canvas;
     FText Status;
+    TFunction<void(const TArray<FColor>&, int32, int32)> PaintedCallback;
 };

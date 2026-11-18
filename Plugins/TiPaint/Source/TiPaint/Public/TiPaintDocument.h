@@ -8,6 +8,13 @@ enum class ETiPaintMode : uint8
     Erase
 };
 
+/** One authored UV triangle used to keep the painter canvas aligned with the
+ * active N-Gon mesh.  UVs use the same 0..1 convention as the paint document. */
+struct FTiPaintUVTriangle
+{
+    FVector2f UV[3] = { FVector2f::ZeroVector, FVector2f::ZeroVector, FVector2f::ZeroVector };
+};
+
 struct FTiPaintBrush
 {
     FColor Color = FColor(77, 128, 255, 255);
@@ -27,7 +34,7 @@ struct FTiPaintLayer
 };
 
 /** Portable RGBA document modeled after TiGUI's tiled PaintDocument API. */
-class FTiPaintDocument : public TSharedFromThis<FTiPaintDocument>
+class TIPAINT_API FTiPaintDocument : public TSharedFromThis<FTiPaintDocument>
 {
 public:
     explicit FTiPaintDocument(int32 InWidth = 512, int32 InHeight = 512);

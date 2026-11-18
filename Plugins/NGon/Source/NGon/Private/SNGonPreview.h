@@ -10,6 +10,7 @@
 struct FAssetData;
 struct FNGonMeshData;
 class SVerticalBox;
+class STiPaintEditor;
 
 class SNGonViewport final : public SEditorViewport
 {
@@ -30,6 +31,7 @@ public:
     void SetMesh(FNGonMeshData&& Data);
     void FrameMesh();
     bool DeleteSelectedFaces();
+    void SetPaintTexture(const TArray<FColor>& Pixels, int32 Width, int32 Height) { PreviewScene->SetPaintTexture(Pixels, Width, Height); }
     int32 Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd);
     void BoxSelect(const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
@@ -68,7 +70,8 @@ enum class ENGonRightLowerTab : uint8
 {
     Details,
     AssetDetails,
-    PreviewSettings
+    PreviewSettings,
+    Painter
 };
 
 struct FNGonBoneEntry
@@ -125,11 +128,13 @@ private:
     TSharedRef<SWidget> MakeDetailsTab();
     TSharedRef<SWidget> MakeAssetDetailsTab();
     TSharedRef<SWidget> MakePreviewSettingsTab();
+    TSharedRef<SWidget> MakePainterTab();
     TSharedRef<SWidget> MakeStatus();
 
     TSharedPtr<SNGonViewport> Viewport;
     TSharedPtr<SVerticalBox> SkeletonListBox;
     TSharedPtr<SVerticalBox> MorphListBox;
+    TSharedPtr<STiPaintEditor> Painter;
 
     FString StaticMeshAssetPath;
     FString SkeletalMeshAssetPath;

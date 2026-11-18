@@ -31,12 +31,95 @@
 #include "NGonFbx.h"
 #include "NGonMeshFiles.h"
 #include "NGonPreviewScene.h"
+#include "DynamicMesh/DynamicMeshAttributeSet.h"
+#include "STiPaintEditor.h"
+#include "TiPaintDocument.h"
+
+#include "Widgets/Input/SSpinBox.h"
 
 namespace NGon
 {
     void SetActiveViewportUVMesh(const FNGonMeshData& Data, const FText& InSourceName, const FText& InSourceType);
     void UpdateActiveViewportUVMeshFromTopology(const FNGonTopology& Topology);
     void NotifyHostViewportClosed();
+
+#ifndef NGON_SCENE_BONE_BRIDGE_DECLARED
+#define NGON_SCENE_BONE_BRIDGE_DECLARED
+    struct FNGonSceneBoneInit
+    {
+        int32 BoneIndex = INDEX_NONE;
+        int32 ParentIndex = INDEX_NONE;
+        FName Name = NAME_None;
+        FTransform RefLocalTransform = FTransform::Identity;
+        FTransform RefComponentTransform = FTransform::Identity;
+    };
+
+    struct FNGonVertexBoneWeight
+    {
+        int32 BoneIndex = INDEX_NONE;
+        float Weight = 0.0f;
+    };
+
+    void SetSceneSkeleton(
+        FNGonPreviewScene* Scene,
+        const TArray<FNGonSceneBoneInit>& InBones,
+        const TArray<TArray<FNGonVertexBoneWeight>>& InVertexWeights);
+    void ClearSceneSkeleton(FNGonPreviewScene* Scene);
+    bool HasSceneBones(const FNGonPreviewScene* Scene);
+    int32 GetSceneBoneCount(const FNGonPreviewScene* Scene);
+    void SelectSceneBone(FNGonPreviewScene* Scene, int32 BoneIndex, bool bActivateBoneGizmo);
+    int32 GetSelectedSceneBone(const FNGonPreviewScene* Scene);
+    bool IsBoneGizmoActive(const FNGonPreviewScene* Scene);
+    void SetBoneGizmoActive(FNGonPreviewScene* Scene, bool bActive);
+    bool IsBoneTransformActive(const FNGonPreviewScene* Scene);
+    bool GetSceneBoneTransforms(
+        const FNGonPreviewScene* Scene,
+        int32 BoneIndex,
+        FTransform& OutLocal,
+        FTransform& OutComponent,
+        FTransform& OutRefLocal,
+        FTransform& OutRefComponent);
+    void SetSceneBoneLocalTransform(FNGonPreviewScene* Scene, int32 BoneIndex, const FTransform& NewLocalTransform);
+    bool ResetSelectedSceneBoneTransform(FNGonPreviewScene* Scene);
+    bool ResetAllSceneBonesTransforms(FNGonPreviewScene* Scene);
+    int32 PickSceneBone(
+        FNGonPreviewScene* Scene,
+        const FSceneView& View,
+        const FVector2D& ScreenCursor,
+        float MaxPixelDist,
+        bool bSelectOnHit);
+    void DrawSceneSkeleton(
+        const FNGonPreviewScene* Scene,
+        const FSceneView* View,
+        FPrimitiveDrawInterface* PDI,
+        int32 BoneDrawMode);
+    void DrawSceneSkeletonLabels(
+        const FNGonPreviewScene* Scene,
+        const FSceneView* View,
+        FViewport* InViewport,
+        FCanvas* Canvas,
+        bool bShowBoneNames);
+    void SetSceneCoordinateSystem(FNGonPreviewScene* Scene, bool bUseWorldSpace);
+    bool IsSceneWorldCoordinateSystem(const FNGonPreviewScene* Scene);
+    void SetSceneSnapSettings(
+        FNGonPreviewScene* Scene,
+        bool bSnapGrid,
+        float GridStep,
+        bool bSnapRot,
+        float RotStepDeg,
+        bool bSnapScale,
+        float ScaleStep);
+    void GetSceneSnapSettings(
+        const FNGonPreviewScene* Scene,
+        bool& OutSnapGrid,
+        float& OutGridStep,
+        bool& OutSnapRot,
+        float& OutRotStepDeg,
+        bool& OutSnapScale,
+        float& OutScaleStep);
+    void SetSceneFlatShading(FNGonPreviewScene* Scene, bool bFlatShading);
+    bool IsSceneFlatShading(const FNGonPreviewScene* Scene);
+#endif // NGON_SCENE_BONE_BRIDGE_DECLARED
 }
 #include "PropertyCustomizationHelpers.h"
 #include "ReferenceSkeleton.h"
@@ -73,7 +156,30 @@ enum class ENGonTreeIconKind : uint8
     TabSkeleton,
     TabMorph,
     TabCurves,
-    Plus
+    Plus,
+    ToolSelect,
+    ToolTranslate,
+    ToolRotate,
+    ToolScale,
+    CoordSpace,
+    MoreDots,
+    CompVertex,
+    CompEdge,
+    CompFace,
+    OcclusionCube,
+    OverlayEdges,
+    OverlayVerts,
+    OverlayHeatmap,
+    SnapMagnet,
+    SnapSurface,
+    SnapGrid,
+    SnapRotate,
+    SnapScale,
+    ViewCamera,
+    ViewCamSpeed,
+    ViewLit,
+    ViewEye,
+    ViewSkull
 };
 
 struct FNGonSocketEntry
@@ -90,6 +196,21 @@ struct FNGonSkeletonTreeUIState
     TSet<int32> CollapsedBones;
     TArray<FNGonSocketEntry> Sockets;
     int32 SelectedSocketIndex = INDEX_NONE;
+
+    // Viewport <-> Preview bridge & Toolbar settings
+    SNGonViewport* ViewportPtr = nullptr;
+    TFunction<void(int32)> OnViewportBonePicked;
+    TFunction<void()> OnViewportBoneTransformChanged;
+    TFunction<void()> OnToggleEdgesShortcut;
+
+    int32 BoneDrawMode = 0; // 0 = All Hierarchy, 1 = Selected & Subtree, 2 = Selected Only, 3 = Hidden
+    bool bShowBoneNames = true;
+    bool bBackfaceSelect = true;
+    float SurfaceSnapOffset = 0.0f;
+    bool bSurfaceSnapEnabled = false;
+    float CameraSpeedScalar = 1.0f;
+    ELevelViewportType ViewportType = LVT_Perspective;
+    int32 ShadingMode = 0; // 0 = Lit Smooth, 1 = Lit Flat, 2 = Unlit, 3 = Wireframe
 };
 
 TMap<const SNGonPreview*, FNGonSkeletonTreeUIState> GSkeletonTreeUIStateMap;
@@ -97,6 +218,22 @@ TMap<const SNGonPreview*, FNGonSkeletonTreeUIState> GSkeletonTreeUIStateMap;
 FNGonSkeletonTreeUIState& GetSkeletonTreeUIState(const SNGonPreview* Preview)
 {
     return GSkeletonTreeUIStateMap.FindOrAdd(Preview);
+}
+
+FNGonSkeletonTreeUIState* FindUIStateByViewport(const SNGonViewport* InViewport)
+{
+    if (!InViewport)
+    {
+        return nullptr;
+    }
+    for (TPair<const SNGonPreview*, FNGonSkeletonTreeUIState>& Pair : GSkeletonTreeUIStateMap)
+    {
+        if (Pair.Value.ViewportPtr == InViewport)
+        {
+            return &Pair.Value;
+        }
+    }
+    return nullptr;
 }
 
 void DrawBoneIconVector(
@@ -274,6 +411,276 @@ protected:
             FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
                 { Center + FVector2D(0.0f, -4.5f), Center + FVector2D(0.0f, 4.5f) },
                 ESlateDrawEffect::None, IconColor, false, 2.0f);
+            break;
+        }
+        case ENGonTreeIconKind::ToolSelect:
+        {
+            // Cursor arrow icon
+            const FVector2D Tip = Center + FVector2D(-3.5f, -5.0f);
+            const FVector2D Left = Center + FVector2D(-3.5f, 4.2f);
+            const FVector2D Mid = Center + FVector2D(-0.8f, 1.8f);
+            const FVector2D Tail = Center + FVector2D(2.2f, 5.2f);
+            const FVector2D Right = Center + FVector2D(3.8f, 1.2f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Tip, Left, Mid, Right, Tip }, ESlateDrawEffect::None, IconColor, true, 1.6f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Mid, Tail }, ESlateDrawEffect::None, IconColor, true, 1.6f);
+            break;
+        }
+        case ENGonTreeIconKind::ToolTranslate:
+        {
+            // 4-way cross move arrows
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(-5.2f, 0.0f), Center + FVector2D(5.2f, 0.0f) }, ESlateDrawEffect::None, IconColor, false, 1.5f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(0.0f, -5.2f), Center + FVector2D(0.0f, 5.2f) }, ESlateDrawEffect::None, IconColor, false, 1.5f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(-2.0f, -3.5f), Center + FVector2D(0.0f, -5.5f), Center + FVector2D(2.0f, -3.5f) }, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(-2.0f, 3.5f), Center + FVector2D(0.0f, 5.5f), Center + FVector2D(2.0f, 3.5f) }, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(-3.5f, -2.0f), Center + FVector2D(-5.5f, 0.0f), Center + FVector2D(-3.5f, 2.0f) }, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(3.5f, -2.0f), Center + FVector2D(5.5f, 0.0f), Center + FVector2D(3.5f, 2.0f) }, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            break;
+        }
+        case ENGonTreeIconKind::ToolRotate:
+        case ENGonTreeIconKind::SnapRotate:
+        {
+            TArray<FVector2D> Arc;
+            for (int32 i = 0; i <= 10; ++i)
+            {
+                const float A = (-0.35f + 1.55f * (static_cast<float>(i) / 10.0f)) * PI;
+                Arc.Add(Center + FVector2D(FMath::Cos(A) * 4.8f, FMath::Sin(A) * 4.8f));
+            }
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(), Arc, ESlateDrawEffect::None, IconColor, true, 1.6f);
+            const FVector2D Tip = Arc.Last();
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Tip + FVector2D(-2.6f, -1.2f), Tip, Tip + FVector2D(1.4f, -2.4f) }, ESlateDrawEffect::None, IconColor, true, 1.5f);
+            break;
+        }
+        case ENGonTreeIconKind::ToolScale:
+        case ENGonTreeIconKind::SnapScale:
+        {
+            const FVector2D TL = Center + FVector2D(-4.8f, -4.8f);
+            const FVector2D TR = Center + FVector2D(4.8f, -4.8f);
+            const FVector2D BR = Center + FVector2D(4.8f, 4.8f);
+            const FVector2D BL = Center + FVector2D(-4.8f, 4.8f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { TL, TR, BR, BL, TL }, ESlateDrawEffect::None, IconColor, false, 1.4f);
+            static FSlateBrush InnerBox;
+            InnerBox.DrawAs = ESlateBrushDrawType::Box;
+            FSlateDrawElement::MakeBox(
+                OutDrawElements,
+                LayerId + 1,
+                AllottedGeometry.ToPaintGeometry(FVector2D(4.2f, 4.2f), FSlateLayoutTransform(Center + FVector2D(-4.8f, 0.6f))),
+                &InnerBox,
+                ESlateDrawEffect::None,
+                IconColor);
+            break;
+        }
+        case ENGonTreeIconKind::CoordSpace:
+        {
+            // Axis gizmo / cube icon
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center, Center + FVector2D(0.0f, -5.5f) }, ESlateDrawEffect::None, IconColor, false, 1.6f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center, Center + FVector2D(-4.8f, 3.2f) }, ESlateDrawEffect::None, IconColor, false, 1.6f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center, Center + FVector2D(4.8f, 3.2f) }, ESlateDrawEffect::None, IconColor, false, 1.6f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(0.0f, -3.2f), Center + FVector2D(3.0f, -1.2f), Center + FVector2D(3.0f, 2.2f),
+                  Center + FVector2D(0.0f, 4.0f), Center + FVector2D(-3.0f, 2.2f), Center + FVector2D(-3.0f, -1.2f),
+                  Center + FVector2D(0.0f, -3.2f) }, ESlateDrawEffect::None, IconColor, true, 1.2f);
+            break;
+        }
+        case ENGonTreeIconKind::MoreDots:
+        {
+            static FSlateBrush DotBrush;
+            DotBrush.DrawAs = ESlateBrushDrawType::Box;
+            for (int32 i = -1; i <= 1; ++i)
+            {
+                FSlateDrawElement::MakeBox(
+                    OutDrawElements,
+                    LayerId,
+                    AllottedGeometry.ToPaintGeometry(FVector2D(2.2f, 2.2f), FSlateLayoutTransform(Center + FVector2D(-1.1f, i * 3.8f - 1.1f))),
+                    &DotBrush,
+                    ESlateDrawEffect::None,
+                    IconColor);
+            }
+            break;
+        }
+        case ENGonTreeIconKind::CompVertex:
+        {
+            static FSlateBrush PtBrush;
+            PtBrush.DrawAs = ESlateBrushDrawType::Box;
+            const FVector2D Offsets[] = { FVector2D(-4.0f, -3.8f), FVector2D(3.5f, -1.2f), FVector2D(-1.5f, 3.8f) };
+            for (const FVector2D& Off : Offsets)
+            {
+                FSlateDrawElement::MakeBox(
+                    OutDrawElements,
+                    LayerId,
+                    AllottedGeometry.ToPaintGeometry(FVector2D(3.0f, 3.0f), FSlateLayoutTransform(Center + Off - FVector2D(1.5f, 1.5f))),
+                    &PtBrush,
+                    ESlateDrawEffect::None,
+                    IconColor);
+            }
+            break;
+        }
+        case ENGonTreeIconKind::CompEdge:
+        {
+            const FVector2D A = Center + FVector2D(-4.5f, -4.0f);
+            const FVector2D B = Center + FVector2D(4.8f, -1.5f);
+            const FVector2D C = Center + FVector2D(-1.2f, 4.8f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { A, B, C, A }, ESlateDrawEffect::None, IconColor, true, 1.6f);
+            break;
+        }
+        case ENGonTreeIconKind::CompFace:
+        {
+            const FVector2D A = Center + FVector2D(-4.2f, -4.5f);
+            const FVector2D B = Center + FVector2D(4.8f, 0.0f);
+            const FVector2D C = Center + FVector2D(-4.2f, 4.5f);
+            for (int32 r = 0; r <= 6; ++r)
+            {
+                const float T = static_cast<float>(r) / 6.0f;
+                FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                    { FMath::Lerp(A, C, T), B }, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            }
+            break;
+        }
+        case ENGonTreeIconKind::OcclusionCube:
+        case ENGonTreeIconKind::OverlayHeatmap:
+        {
+            const FVector2D Top = Center + FVector2D(0.0f, -5.0f);
+            const FVector2D L = Center + FVector2D(-4.8f, -2.2f);
+            const FVector2D R = Center + FVector2D(4.8f, -2.2f);
+            const FVector2D BL = Center + FVector2D(-4.8f, 2.8f);
+            const FVector2D BR = Center + FVector2D(4.8f, 2.8f);
+            const FVector2D Bot = Center + FVector2D(0.0f, 5.2f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Top, R, BR, Bot, BL, L, Top }, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { L, Center, R }, ESlateDrawEffect::None, IconColor, true, 1.2f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center, Bot }, ESlateDrawEffect::None, IconColor, false, 1.4f);
+            break;
+        }
+        case ENGonTreeIconKind::OverlayEdges:
+        case ENGonTreeIconKind::OverlayVerts:
+        {
+            const FVector2D TL = Center + FVector2D(-4.5f, -4.2f);
+            const FVector2D TR = Center + FVector2D(4.5f, -4.2f);
+            const FVector2D BR = Center + FVector2D(4.5f, 4.2f);
+            const FVector2D BL = Center + FVector2D(-4.5f, 4.2f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { TL, TR, BR, BL, TL }, ESlateDrawEffect::None, IconColor, false, 1.3f);
+            if (Kind == ENGonTreeIconKind::OverlayVerts)
+            {
+                FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                    { Center + FVector2D(0.0f, -4.2f), Center + FVector2D(0.0f, 4.2f) }, ESlateDrawEffect::None, IconColor, false, 1.2f);
+            }
+            break;
+        }
+        case ENGonTreeIconKind::SnapMagnet:
+        {
+            TArray<FVector2D> UShape = {
+                Center + FVector2D(-4.0f, -4.5f),
+                Center + FVector2D(-4.0f, 1.5f),
+                Center + FVector2D(-2.0f, 4.2f),
+                Center + FVector2D(2.0f, 4.2f),
+                Center + FVector2D(4.0f, 1.5f),
+                Center + FVector2D(4.0f, -4.5f)
+            };
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(), UShape, ESlateDrawEffect::None, IconColor, true, 1.8f);
+            break;
+        }
+        case ENGonTreeIconKind::SnapSurface:
+        {
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(-4.8f, 4.2f), Center + FVector2D(4.8f, -4.2f) }, ESlateDrawEffect::None, IconColor, true, 1.5f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center, Center + FVector2D(-3.8f, -3.8f) }, ESlateDrawEffect::None, IconColor, true, 1.5f);
+            break;
+        }
+        case ENGonTreeIconKind::SnapGrid:
+        {
+            for (int32 i = -1; i <= 1; ++i)
+            {
+                const float Offset = i * 3.2f;
+                FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                    { Center + FVector2D(-4.5f, Offset), Center + FVector2D(4.5f, Offset) }, ESlateDrawEffect::None, IconColor, false, 1.2f);
+                FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                    { Center + FVector2D(Offset, -4.5f), Center + FVector2D(Offset, 4.5f) }, ESlateDrawEffect::None, IconColor, false, 1.2f);
+            }
+            break;
+        }
+        case ENGonTreeIconKind::ViewCamera:
+        case ENGonTreeIconKind::ViewCamSpeed:
+        {
+            const FVector2D TL = Center + FVector2D(-5.2f, -3.2f);
+            const FVector2D TR = Center + FVector2D(1.5f, -3.2f);
+            const FVector2D BR = Center + FVector2D(1.5f, 3.2f);
+            const FVector2D BL = Center + FVector2D(-5.2f, 3.2f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { TL, TR, BR, BL, TL }, ESlateDrawEffect::None, IconColor, false, 1.5f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(1.5f, -1.0f), Center + FVector2D(5.2f, -3.2f), Center + FVector2D(5.2f, 3.2f), Center + FVector2D(1.5f, 1.0f) },
+                ESlateDrawEffect::None, IconColor, true, 1.4f);
+            break;
+        }
+        case ENGonTreeIconKind::ViewLit:
+        {
+            TArray<FVector2D> Ring;
+            for (int32 i = 0; i <= 12; ++i)
+            {
+                const float A = (static_cast<float>(i) / 12.0f) * 2.0f * PI;
+                Ring.Add(Center + FVector2D(FMath::Cos(A) * 4.6f, FMath::Sin(A) * 4.6f));
+            }
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(), Ring, ESlateDrawEffect::None, IconColor, true, 1.6f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(-1.8f, -2.5f), Center + FVector2D(-2.5f, 0.0f), Center + FVector2D(-1.2f, 2.5f) },
+                ESlateDrawEffect::None, IconColor, true, 1.8f);
+            break;
+        }
+        case ENGonTreeIconKind::ViewEye:
+        {
+            TArray<FVector2D> TopLid = { Center + FVector2D(-5.5f, 0.0f), Center + FVector2D(-2.2f, -3.4f), Center + FVector2D(2.2f, -3.4f), Center + FVector2D(5.5f, 0.0f) };
+            TArray<FVector2D> BotLid = { Center + FVector2D(-5.5f, 0.0f), Center + FVector2D(-2.2f, 3.4f), Center + FVector2D(2.2f, 3.4f), Center + FVector2D(5.5f, 0.0f) };
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(), TopLid, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(), BotLid, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            static FSlateBrush Pupil;
+            Pupil.DrawAs = ESlateBrushDrawType::Box;
+            FSlateDrawElement::MakeBox(
+                OutDrawElements,
+                LayerId + 1,
+                AllottedGeometry.ToPaintGeometry(FVector2D(3.0f, 3.0f), FSlateLayoutTransform(Center - FVector2D(1.5f, 1.5f))),
+                &Pupil,
+                ESlateDrawEffect::None,
+                IconColor);
+            break;
+        }
+        case ENGonTreeIconKind::ViewSkull:
+        {
+            // Skull / Skeleton hierarchy icon matching image_3aff81.png
+            TArray<FVector2D> Dome = {
+                Center + FVector2D(-4.2f, 1.0f),
+                Center + FVector2D(-4.2f, -3.2f),
+                Center + FVector2D(-2.0f, -5.0f),
+                Center + FVector2D(2.0f, -5.0f),
+                Center + FVector2D(4.2f, -3.2f),
+                Center + FVector2D(4.2f, 1.0f),
+                Center + FVector2D(2.4f, 4.6f),
+                Center + FVector2D(-2.4f, 4.6f),
+                Center + FVector2D(-4.2f, 1.0f)
+            };
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(), Dome, ESlateDrawEffect::None, IconColor, true, 1.4f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(-2.2f, -1.2f), Center + FVector2D(-1.0f, -1.2f) }, ESlateDrawEffect::None, IconColor, false, 2.0f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(1.0f, -1.2f), Center + FVector2D(2.2f, -1.2f) }, ESlateDrawEffect::None, IconColor, false, 2.0f);
+            FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+                { Center + FVector2D(-1.8f, 2.5f), Center + FVector2D(1.8f, 2.5f) }, ESlateDrawEffect::None, IconColor, false, 1.2f);
             break;
         }
         }
@@ -573,8 +980,9 @@ public:
                     }
                 }
 
+                ToolManager->ConfigureChangeTrackingMode(EToolChangeTrackingMode::NoChangeTracking);
                 PreviewOwner->SetOverlayMaterials(ToolManager);
-                PreviewOwner->SetupGizmo(GizmoManager, ToolManager);
+                PreviewOwner->SetupGizmo(GizmoManager, nullptr);
             }
         }
     }
@@ -589,7 +997,7 @@ public:
     {
         if (InViewport && !IsAltPressed())
         {
-            if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || PreviewOwner->IsSoftTransformActive())
+            if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())) || NGon::IsBoneTransformActive(&PreviewOwner.Get()))
             {
                 return EMouseCursor::CardinalCross;
             }
@@ -617,7 +1025,7 @@ public:
 
     bool InputKey(const FInputKeyEventArgs& EventArgs) override
     {
-        if (EventArgs.Event == IE_Pressed && EventArgs.Key == EKeys::Escape && PreviewOwner->IsSoftTransformActive())
+        if (EventArgs.Event == IE_Pressed && EventArgs.Key == EKeys::Escape && (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())))
         {
             if (InputRouter)
             {
@@ -662,21 +1070,23 @@ public:
                     }
                     if (InputRouter)
                     {
-                        if (InteractiveToolsContext)
-                        {
-                            InteractiveToolsContext->MouseMove(this, EventArgs.Viewport, MouseX, MouseY);
-                            InteractiveToolsContext->UpdateStateWithoutRoutingInputKey(
-                                this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
-                        }
+                        // Use the tools context's canonical button route. It updates
+                        // the cached mouse state, performs gizmo hit testing, and
+                        // starts capture as one atomic operation. Sending a second
+                        // hand-built press here can leave the router and the mesh
+                        // picker disagreeing about who owns the gesture.
+                        const bool bCapturedOnPress = GetModeTools()
+                            ? GetModeTools()->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event, true)
+                            : InteractiveToolsContext
+                                ? InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event)
+                            : [&]()
+                            {
+                                FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
+                                State.Mouse.Left.SetStates(true, true, false);
+                                return InputRouter->PostInputEvent(State);
+                            }();
 
-                        FInputDeviceState HoverState = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
-                        InputRouter->PostHoverInputEvent(HoverState);
-
-                        FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
-                        State.Mouse.Left.SetStates(true, true, false);
-                        const bool bCapturedOnPress = InputRouter->PostInputEvent(State);
-
-                        if (bCapturedOnPress || InputRouter->HasActiveMouseCapture() || PreviewOwner->IsSoftTransformActive())
+                        if (bCapturedOnPress || InputRouter->HasActiveMouseCapture() || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())))
                         {
                             bConsumedByGizmo = true;
                             bMarqueeActive = false;
@@ -703,7 +1113,7 @@ public:
                 LastMousePosition = CurrentPos;
                 const bool bWasGizmoInteraction = bConsumedByGizmo
                     || (InputRouter && InputRouter->HasActiveMouseCapture())
-                    || PreviewOwner->IsSoftTransformActive();
+                    || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get()));
                 bLeftMouseButtonDown = false;
                 bHasPendingGizmoDrag = false;
 
@@ -712,15 +1122,26 @@ public:
                     .SetRealtimeUpdate(IsRealtime()));
                 FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily);
 
+                // Always deliver the release to the tools context, including a
+                // normal mesh click. The press above was routed through
+                // InputKey() to perform gizmo hit testing; skipping the matching
+                // release leaves CurrentMouseState.Mouse.Left.bDown set and
+                // causes later hover/capture tests to reject gizmo interaction.
                 if (InteractiveToolsContext)
                 {
-                    InteractiveToolsContext->UpdateStateWithoutRoutingInputKey(
-                        this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                    if (FEditorModeTools* ViewportModeTools = GetModeTools())
+                    {
+                        ViewportModeTools->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event, true);
+                    }
+                    else
+                    {
+                        InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                    }
                 }
 
                 if (bWasGizmoInteraction)
                 {
-                    if (View && InputRouter)
+                    if (!InteractiveToolsContext && View && InputRouter)
                     {
                         FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, Delta);
                         State.Mouse.Left.SetStates(false, false, true);
@@ -729,6 +1150,16 @@ public:
                     if (GizmoManager)
                     {
                         GizmoManager->Tick(0.0f);
+                    }
+                    if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+                    {
+                        if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
+                        {
+                            if (UIState->OnViewportBoneTransformChanged)
+                            {
+                                UIState->OnViewportBoneTransformChanged();
+                            }
+                        }
                     }
                     bConsumedByGizmo = false;
                     bMarqueeActive = false;
@@ -761,7 +1192,25 @@ public:
                     {
                         if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
                         {
-                            Pinned->Pick(*View, CurrentPos, IsShiftPressed());
+                            FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get());
+                            const bool bBonesVisible = !UIState || UIState->BoneDrawMode != 3;
+                            int32 HitBone = INDEX_NONE;
+                            if (bBonesVisible && NGon::HasSceneBones(&PreviewOwner.Get()))
+                            {
+                                const float PickRadius = NGon::IsBoneGizmoActive(&PreviewOwner.Get()) ? 20.0f : 12.0f;
+                                HitBone = NGon::PickSceneBone(&PreviewOwner.Get(), *View, CurrentPos, PickRadius, true);
+                            }
+                            if (HitBone != INDEX_NONE)
+                            {
+                                if (UIState && UIState->OnViewportBonePicked)
+                                {
+                                    UIState->OnViewportBonePicked(HitBone);
+                                }
+                            }
+                            else
+                            {
+                                Pinned->Pick(*View, CurrentPos, IsShiftPressed());
+                            }
                         }
                     }
                     Invalidate();
@@ -775,12 +1224,23 @@ public:
                 {
                     FlushPendingGizmoDrag(EventArgs.Viewport);
                 }
+                const bool bWasGizmoInteraction = bConsumedByGizmo
+                    || (InputRouter && InputRouter->HasActiveMouseCapture())
+                    || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get()));
                 if (InteractiveToolsContext)
                 {
-                    InteractiveToolsContext->UpdateStateWithoutRoutingInputKey(
-                        this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                    // Keep the tools context's button state balanced for
+                    // modifier-assisted clicks as well.
+                    if (FEditorModeTools* ViewportModeTools = GetModeTools())
+                    {
+                        ViewportModeTools->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event, true);
+                    }
+                    else
+                    {
+                        InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
+                    }
                 }
-                if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || PreviewOwner->IsSoftTransformActive())
+                if (bWasGizmoInteraction && !InteractiveToolsContext)
                 {
                     FSceneViewFamilyContext ViewFamily(
                         FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
@@ -827,22 +1287,76 @@ public:
             }
         }
 
+        // Ctrl+I (Reset Selected Bone Transform) & Ctrl+Shift+I (Reset All Bones Transforms) matching UE Skeletal Mesh Editor
+        if (EventArgs.Event == IE_Pressed && IsCtrlPressed() && !IsAltPressed() && EventArgs.Key == EKeys::I)
+        {
+            const bool bReset = IsShiftPressed()
+                ? NGon::ResetAllSceneBonesTransforms(&PreviewOwner.Get())
+                : NGon::ResetSelectedSceneBoneTransform(&PreviewOwner.Get());
+            if (bReset)
+            {
+                if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+                {
+                    if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
+                    {
+                        if (UIState->OnViewportBoneTransformChanged)
+                        {
+                            UIState->OnViewportBoneTransformChanged();
+                        }
+                    }
+                }
+                Invalidate();
+            }
+            return true;
+        }
+
+        // Alt+9: Toggle Mesh Edges Rendering (matching UE Skeletal Mesh Editor hotkey)
+        if (EventArgs.Event == IE_Pressed && IsAltPressed() && !IsCtrlPressed() && EventArgs.Key == EKeys::Nine)
+        {
+            if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+            {
+                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
+                {
+                    if (UIState->OnToggleEdgesShortcut)
+                    {
+                        UIState->OnToggleEdgesShortcut();
+                    }
+                }
+            }
+            Invalidate();
+            return true;
+        }
+
         if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
         {
             if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
             {
+                if (EventArgs.Key == EKeys::Q)
+                {
+                    Pinned->SetGizmoMode(ENGonGizmoMode::None);
+                    return true;
+                }
+                if (EventArgs.Key == EKeys::Four)
+                {
+                    NGon::SetBoneGizmoActive(&PreviewOwner.Get(), true);
+                    Invalidate();
+                    return true;
+                }
                 if (EventArgs.Key == EKeys::One)
                 {
+                    NGon::SetBoneGizmoActive(&PreviewOwner.Get(), false);
                     Pinned->SetSelectionMode(ENGonElement::Vertex);
                     return true;
                 }
                 if (EventArgs.Key == EKeys::Two)
                 {
+                    NGon::SetBoneGizmoActive(&PreviewOwner.Get(), false);
                     Pinned->SetSelectionMode(ENGonElement::Edge);
                     return true;
                 }
                 if (EventArgs.Key == EKeys::Three)
                 {
+                    NGon::SetBoneGizmoActive(&PreviewOwner.Get(), false);
                     Pinned->SetSelectionMode(ENGonElement::Face);
                     return true;
                 }
@@ -908,9 +1422,13 @@ public:
                     InteractiveToolsContext->MouseMove(this, InViewport, X, Y);
                 }
                 const FVector2D CurrentPos(X, Y);
-                FInputDeviceState State = MakeMouseInputState(*View, X, Y, CurrentPos - LastMousePosition);
+                const FVector2D HoverDelta = CurrentPos - LastMousePosition;
                 LastMousePosition = CurrentPos;
-                InputRouter->PostHoverInputEvent(State);
+                if (!InteractiveToolsContext)
+                {
+                    FInputDeviceState State = MakeMouseInputState(*View, X, Y, HoverDelta);
+                    InputRouter->PostHoverInputEvent(State);
+                }
                 Invalidate();
             }
             return;
@@ -931,7 +1449,10 @@ public:
 
     bool InputAxis(const FInputKeyEventArgs& Args) override
     {
-        if (!IsAltPressed() && (bLeftMouseButtonDown || bConsumedByGizmo || PreviewOwner->IsSoftTransformActive() || bMarqueePending || bMarqueeActive))
+        // A left-button press by itself is also how mesh picking and marquee
+        // selection begin. Do not swallow viewport axis events until a gizmo,
+        // soft-transform, or marquee capture actually owns the gesture.
+        if (!IsAltPressed() && (bConsumedByGizmo || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())) || bMarqueeActive))
         {
             return true;
         }
@@ -945,11 +1466,48 @@ public:
             GizmoViewContext->ResetFromSceneView(*View);
         }
         FEditorViewportClient::Draw(View, PDI);
+
+        if (View && PDI && NGon::HasSceneBones(&PreviewOwner.Get()))
+        {
+            int32 DrawMode = 0;
+            if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+            {
+                if (const FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
+                {
+                    DrawMode = UIState->BoneDrawMode;
+                }
+            }
+            NGon::DrawSceneSkeleton(&PreviewOwner.Get(), View, PDI, DrawMode);
+        }
     }
 
     void Draw(FViewport* InViewport, FCanvas* Canvas) override
     {
         FEditorViewportClient::Draw(InViewport, Canvas);
+
+        if (InViewport && Canvas && NGon::HasSceneBones(&PreviewOwner.Get()))
+        {
+            bool bShowBoneNames = true;
+            int32 DrawMode = 0;
+            if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+            {
+                if (const FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
+                {
+                    bShowBoneNames = UIState->bShowBoneNames;
+                    DrawMode = UIState->BoneDrawMode;
+                }
+            }
+            if (bShowBoneNames && DrawMode != 3)
+            {
+                FSceneViewFamilyContext ViewFamily(
+                    FSceneViewFamily::ConstructionValues(InViewport, GetScene(), EngineShowFlags)
+                    .SetRealtimeUpdate(IsRealtime()));
+                if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+                {
+                    NGon::DrawSceneSkeletonLabels(&PreviewOwner.Get(), View, InViewport, Canvas, true);
+                }
+            }
+        }
 
         if (bMarqueeActive && Canvas)
         {
@@ -1023,15 +1581,34 @@ private:
             .SetRealtimeUpdate(IsRealtime()));
         if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
         {
-            if (InteractiveToolsContext)
+            if (FEditorModeTools* ViewportModeTools = GetModeTools())
             {
-                InteractiveToolsContext->MouseMove(this, InViewport, InMouseX, InMouseY);
+                ViewportModeTools->CapturedMouseMove(this, InViewport, InMouseX, InMouseY);
             }
-            if (InputRouter)
+            else if (InteractiveToolsContext)
+            {
+                // CapturedMouseMove maintains the tools context's unbounded
+                // cursor/ray state and posts exactly one captured event.
+                InteractiveToolsContext->CapturedMouseMove(this, InViewport, InMouseX, InMouseY);
+            }
+            else if (InputRouter)
             {
                 FInputDeviceState State = MakeMouseInputState(*View, InMouseX, InMouseY, Delta);
                 State.Mouse.Left.SetStates(false, true, false);
                 InputRouter->PostInputEvent(State);
+                if (NGon::IsBoneTransformActive(&PreviewOwner.Get()))
+                {
+                    if (const TSharedPtr<SNGonViewport> Pinned = Widget.Pin())
+                    {
+                        if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
+                        {
+                            if (UIState->OnViewportBoneTransformChanged)
+                            {
+                                UIState->OnViewportBoneTransformChanged();
+                            }
+                        }
+                    }
+                }
             }
             if (GizmoManager)
             {
@@ -1049,7 +1626,7 @@ private:
         }
 
         const FVector2D CurrentPos(InMouseX, InMouseY);
-        if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || PreviewOwner->IsSoftTransformActive())
+        if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())))
         {
             PendingDragPosition = CurrentPos;
             bHasPendingGizmoDrag = true;
@@ -1259,6 +1836,50 @@ bool SNGonViewport::DeleteSelectedFaces()
 void SNGonPreview::Construct(const FArguments& InArgs)
 {
     SAssignNew(Viewport, SNGonViewport);
+    SAssignNew(Painter, STiPaintEditor);
+    Painter->SetPaintedCallback([this](const TArray<FColor>& Pixels, int32 Width, int32 Height)
+    {
+        if (Viewport.IsValid())
+        {
+            Viewport->SetPaintTexture(Pixels, Width, Height);
+            Viewport->Invalidate();
+        }
+    });
+
+    FNGonSkeletonTreeUIState& InitUIState = GetSkeletonTreeUIState(this);
+    InitUIState.ViewportPtr = Viewport.Get();
+    InitUIState.OnViewportBonePicked = [this](int32 PickedBoneIdx)
+    {
+        if (SkeletonBones.IsValidIndex(PickedBoneIdx))
+        {
+            GetSkeletonTreeUIState(this).SelectedSocketIndex = INDEX_NONE;
+            SelectedBoneIndex = PickedBoneIdx;
+            ActiveLowerTab = ENGonRightLowerTab::Details;
+            if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
+            {
+                Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
+            }
+            RebuildSkeletonTreeList();
+        }
+    };
+    InitUIState.OnViewportBoneTransformChanged = [this]()
+    {
+        for (int32 i = 0; i < SkeletonBones.Num(); ++i)
+        {
+            FTransform CurLocal, CurComp, RefLocal, RefComp;
+            if (NGon::GetSceneBoneTransforms(&Viewport->Preview(), i, CurLocal, CurComp, RefLocal, RefComp))
+            {
+                SkeletonBones[i].LocalTransform = CurLocal;
+                SkeletonBones[i].ComponentTransform = CurComp;
+            }
+        }
+    };
+    InitUIState.OnToggleEdgesShortcut = [this]()
+    {
+        bShowEdges = !bShowEdges;
+        Viewport->Preview().SetShowEdges(bShowEdges);
+        Viewport->Invalidate();
+    };
 
     ChildSlot
     [
@@ -1574,181 +2195,1090 @@ void SNGonPreview::SetActiveToolTab(ENGonToolShelfTab Tab)
 
 TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
 {
-    auto MakeComponentToggle = [this](ENGonElement Element, const FText& Label) -> TSharedRef<SWidget>
+    auto MakeVerticalDivider = []() -> TSharedRef<SWidget>
     {
-        return SNew(SCheckBox)
-            .Style(FCoreStyle::Get(), "ToggleButtonCheckbox")
-            .Padding(FMargin(6.0f, 3.0f))
-            .IsChecked_Lambda([this, Element]
-            {
-                return Viewport->GetSelectionMode() == Element ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-            })
-            .OnCheckStateChanged_Lambda([this, Element](ECheckBoxState)
-            {
-                SetSelectionMode(Element);
-            })
+        return SNew(SBox)
+            .WidthOverride(1.0f)
+            .HeightOverride(18.0f)
+            .Padding(FMargin(3.0f, 2.0f))
             [
-                SNew(STextBlock)
-                .Text(Label)
-                .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+                SNew(SBorder)
+                .BorderBackgroundColor(FLinearColor(0.24f, 0.26f, 0.30f, 0.85f))
             ];
     };
 
-    auto MakeGizmoToggle = [this](ENGonGizmoMode Mode, const FText& Label) -> TSharedRef<SWidget>
+    auto MakeIconToolButton = [](
+        ENGonTreeIconKind IconKind,
+        const FText& Tooltip,
+        TFunction<bool()> IsActiveFn,
+        TFunction<void()> OnClickFn) -> TSharedRef<SWidget>
     {
-        return SNew(SCheckBox)
-            .Style(FCoreStyle::Get(), "ToggleButtonCheckbox")
-            .Padding(FMargin(6.0f, 3.0f))
-            .IsChecked_Lambda([this, Mode]
+        return SNew(SBorder)
+            .Padding(FMargin(1.0f))
+            .BorderBackgroundColor_Lambda([IsActiveFn]()
             {
-                return Viewport->GetGizmoMode() == Mode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-            })
-            .OnCheckStateChanged_Lambda([this, Mode](ECheckBoxState)
-            {
-                Viewport->SetGizmoMode(Mode);
+                return IsActiveFn()
+                    ? FLinearColor(0.04f, 0.44f, 0.92f, 0.95f)
+                    : FLinearColor(0.11f, 0.12f, 0.14f, 0.85f);
             })
             [
-                SNew(STextBlock)
-                .Text(Label)
-                .Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+                SNew(SCheckBox)
+                .Style(FCoreStyle::Get(), "ToggleButtonCheckbox")
+                .Padding(FMargin(5.0f, 3.0f))
+                .ToolTipText(Tooltip)
+                .IsChecked_Lambda([IsActiveFn]()
+                {
+                    return IsActiveFn() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+                })
+                .OnCheckStateChanged_Lambda([OnClickFn](ECheckBoxState)
+                {
+                    OnClickFn();
+                })
+                [
+                    SNew(SNGonVectorIcon)
+                    .Kind(IconKind)
+                    .Color(FLinearColor(0.92f, 0.95f, 1.0f, 1.0f))
+                ]
             ];
     };
 
     return SNew(SBorder)
-        .Padding(FMargin(8.0f, 4.0f))
+        .Padding(FMargin(6.0f, 3.0f))
+        .BorderBackgroundColor(FLinearColor(0.055f, 0.06f, 0.07f, 0.96f))
         [
-            SNew(SWrapBox)
-            .UseAllottedSize(true)
-            .InnerSlotPadding(FVector2D(6.0f, 3.0f))
-            + SWrapBox::Slot().VAlign(VAlign_Center)
+            SNew(SHorizontalBox)
+
+            // 1. Target Mode Dropdown (Bone Joint vs Mesh Component)
+            + SHorizontalBox::Slot()
+            .AutoWidth()
+            .VAlign(VAlign_Center)
+            .Padding(0.0f, 0.0f, 3.0f, 0.0f)
             [
-                MakeComponentToggle(ENGonElement::Vertex, LOCTEXT("VtxBtn", "Vertex (1)"))
-            ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
-            [
-                MakeComponentToggle(ENGonElement::Edge, LOCTEXT("EdgeBtn", "Edge (2)"))
-            ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
-            [
-                MakeComponentToggle(ENGonElement::Face, LOCTEXT("FaceBtn", "Face (3)"))
-            ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
-            [
-                SNew(STextBlock).Text(LOCTEXT("Sep1", "|")).ColorAndOpacity(FLinearColor(0.35f, 0.35f, 0.38f))
-            ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
-            [
-                MakeGizmoToggle(ENGonGizmoMode::Translate, LOCTEXT("MoveBtn", "Move (W)"))
-            ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
-            [
-                MakeGizmoToggle(ENGonGizmoMode::Rotate, LOCTEXT("RotBtn", "Rotate (E)"))
-            ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
-            [
-                MakeGizmoToggle(ENGonGizmoMode::Scale, LOCTEXT("ScaleBtn", "Scale (R)"))
-            ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
-            [
-                MakeGizmoToggle(ENGonGizmoMode::Combined, LOCTEXT("CombBtn", "Combined"))
-            ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
-            [
-                SNew(SCheckBox)
-                .IsChecked_Lambda([this]
+                SNew(SComboButton)
+                .ContentPadding(FMargin(4.0f, 2.0f))
+                .ToolTipText(LOCTEXT("TargetModeComboTip", "Switch Gizmo Target between Skeleton Bone Joint and Mesh Components"))
+                .OnGetMenuContent_Lambda([this]()
                 {
-                    return Viewport->Preview().GetGizmoFramePolicy() == ENGonGizmoFramePolicy::ActiveElement
-                        ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.BeginSection("GizmoTargetMode", LOCTEXT("GizmoTargetSec", "Gizmo Interaction Target"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("TargetBoneJointItem", "Skeleton Bone / Joint Mode (4)"),
+                        LOCTEXT("TargetBoneJointTip", "Attach transform gizmo to the selected bone in the Skeleton Tree or 3D viewport"),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                NGon::SetBoneGizmoActive(&Viewport->Preview(), true);
+                                if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
+                                {
+                                    Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
+                                }
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction::CreateLambda([this]() { return !SkeletonBones.IsEmpty(); }),
+                            FIsActionChecked::CreateLambda([this]() { return NGon::IsBoneGizmoActive(&Viewport->Preview()); })),
+                        NAME_None,
+                        EUserInterfaceActionType::RadioButton);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("TargetMeshCompItem", "Mesh Component Mode (1/2/3)"),
+                        LOCTEXT("TargetMeshCompTip", "Attach transform gizmo to selected N-Gon vertices, edges, or polygon faces"),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                NGon::SetBoneGizmoActive(&Viewport->Preview(), false);
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()); })),
+                        NAME_None,
+                        EUserInterfaceActionType::RadioButton);
+                    Menu.EndSection();
+                    return Menu.MakeWidget();
                 })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
-                {
-                    Viewport->Preview().SetGizmoFramePolicy(
-                        State == ECheckBoxState::Checked
-                            ? ENGonGizmoFramePolicy::ActiveElement
-                            : ENGonGizmoFramePolicy::WeightedAverage);
-                    Viewport->Invalidate();
-                })
+                .ButtonContent()
                 [
-                    SNew(STextBlock).Text(LOCTEXT("ActivePivot", "Active Pivot"))
+                    SNew(SNGonVectorIcon)
+                    .Kind(ENGonTreeIconKind::OcclusionCube)
+                    .Color(FLinearColor(0.85f, 0.88f, 0.94f, 1.0f))
                 ]
             ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
+
+            // 2. Transform Tool Strip: [Select (Q)] [Translate (W)] [Rotate (E)] [Scale (R)]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
-                SNew(STextBlock).Text(LOCTEXT("Sep2", "|")).ColorAndOpacity(FLinearColor(0.35f, 0.35f, 0.38f))
+                MakeIconToolButton(
+                    ENGonTreeIconKind::ToolSelect,
+                    LOCTEXT("SelectToolTip", "Select Objects / Components without Gizmo (Q)"),
+                    [this]() { return Viewport->GetGizmoMode() == ENGonGizmoMode::None; },
+                    [this]() { Viewport->SetGizmoMode(ENGonGizmoMode::None); })
             ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
-                SNew(SCheckBox)
-                .IsChecked_Lambda([this] { return bShowEdges ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+                MakeIconToolButton(
+                    ENGonTreeIconKind::ToolTranslate,
+                    LOCTEXT("TranslateToolTip", "Select and Translate Joint or Component (W)"),
+                    [this]() { return Viewport->GetGizmoMode() == ENGonGizmoMode::Translate; },
+                    [this]() { Viewport->SetGizmoMode(ENGonGizmoMode::Translate); })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::ToolRotate,
+                    LOCTEXT("RotateToolTip", "Select and Rotate Joint or Component (E)"),
+                    [this]() { return Viewport->GetGizmoMode() == ENGonGizmoMode::Rotate; },
+                    [this]() { Viewport->SetGizmoMode(ENGonGizmoMode::Rotate); })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::ToolScale,
+                    LOCTEXT("ScaleToolTip", "Select and Scale Joint or Component (R)"),
+                    [this]() { return Viewport->GetGizmoMode() == ENGonGizmoMode::Scale; },
+                    [this]() { Viewport->SetGizmoMode(ENGonGizmoMode::Scale); })
+            ]
+
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+            [
+                MakeVerticalDivider()
+            ]
+
+            // 3. Coordinate Space Switcher (Local / World) + More Gizmo Options (⋮)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::CoordSpace,
+                    LOCTEXT("CoordSpaceTip", "Toggle Coordinate System between Local Space and World Space"),
+                    [this]() { return NGon::IsSceneWorldCoordinateSystem(&Viewport->Preview()); },
+                    [this]()
+                    {
+                        const bool bWorld = !NGon::IsSceneWorldCoordinateSystem(&Viewport->Preview());
+                        NGon::SetSceneCoordinateSystem(&Viewport->Preview(), bWorld);
+                        Viewport->Invalidate();
+                    })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                SNew(SComboButton)
+                .HasDownArrow(false)
+                .ContentPadding(FMargin(3.0f, 3.0f))
+                .ToolTipText(LOCTEXT("GizmoMoreMenuTip", "Gizmo Coordinate System, Pivot Policy & Bone Reset Actions"))
+                .OnGetMenuContent_Lambda([this]()
                 {
-                    bShowEdges = (State == ECheckBoxState::Checked);
-                    Viewport->Preview().SetShowEdges(bShowEdges);
-                    Viewport->Invalidate();
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.BeginSection("CoordSys", LOCTEXT("CoordSysSec", "Coordinate System"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("LocalCoordEntry", "Local Coordinate System"),
+                        LOCTEXT("LocalCoordTip", "Align gizmo axes with the selected bone or component normal frame"),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                NGon::SetSceneCoordinateSystem(&Viewport->Preview(), false);
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return !NGon::IsSceneWorldCoordinateSystem(&Viewport->Preview()); })),
+                        NAME_None,
+                        EUserInterfaceActionType::RadioButton);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("WorldCoordEntry", "World Coordinate System"),
+                        LOCTEXT("WorldCoordTip", "Align gizmo axes with world X/Y/Z axes"),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                NGon::SetSceneCoordinateSystem(&Viewport->Preview(), true);
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return NGon::IsSceneWorldCoordinateSystem(&Viewport->Preview()); })),
+                        NAME_None,
+                        EUserInterfaceActionType::RadioButton);
+                    Menu.EndSection();
+
+                    Menu.BeginSection("GizmoModes", LOCTEXT("GizmoModesSec", "Gizmo Handle Mode & Pivot"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("CombinedGizmoEntry", "Combined Multi-Axis Gizmo"),
+                        LOCTEXT("CombinedGizmoTip", "Show Translate, Rotate, and Scale handles simultaneously"),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]() { Viewport->SetGizmoMode(ENGonGizmoMode::Combined); }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return Viewport->GetGizmoMode() == ENGonGizmoMode::Combined; })),
+                        NAME_None,
+                        EUserInterfaceActionType::Check);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ActivePivotEntry", "Component Pivot: Active Element"),
+                        LOCTEXT("ActivePivotTip", "Center component gizmo on the most recently selected element instead of average"),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                const bool bActive = Viewport->Preview().GetGizmoFramePolicy() == ENGonGizmoFramePolicy::ActiveElement;
+                                Viewport->Preview().SetGizmoFramePolicy(
+                                    bActive ? ENGonGizmoFramePolicy::WeightedAverage : ENGonGizmoFramePolicy::ActiveElement);
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]()
+                            {
+                                return Viewport->Preview().GetGizmoFramePolicy() == ENGonGizmoFramePolicy::ActiveElement;
+                            })),
+                        NAME_None,
+                        EUserInterfaceActionType::Check);
+                    Menu.EndSection();
+
+                    Menu.BeginSection("BoneResets", LOCTEXT("BoneResetsSec", "Skeleton Bone Reset"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ResetSelBoneMenu", "Reset Selected Bone Transform (Ctrl+I)"),
+                        LOCTEXT("ResetSelBoneMenuTip", "Restore the selected bone to its Reference Pose transform"),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            if (NGon::ResetSelectedSceneBoneTransform(&Viewport->Preview()))
+                            {
+                                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Viewport.Get()))
+                                {
+                                    if (UIState->OnViewportBoneTransformChanged)
+                                    {
+                                        UIState->OnViewportBoneTransformChanged();
+                                    }
+                                }
+                                Viewport->Invalidate();
+                            }
+                        })));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ResetAllBonesMenu", "Reset All Bones Transforms (Ctrl+Shift+I)"),
+                        LOCTEXT("ResetAllBonesMenuTip", "Restore all skeleton bones to Reference Pose"),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            if (NGon::ResetAllSceneBonesTransforms(&Viewport->Preview()))
+                            {
+                                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Viewport.Get()))
+                                {
+                                    if (UIState->OnViewportBoneTransformChanged)
+                                    {
+                                        UIState->OnViewportBoneTransformChanged();
+                                    }
+                                }
+                                Viewport->Invalidate();
+                            }
+                        })));
+                    Menu.EndSection();
+                    return Menu.MakeWidget();
                 })
+                .ButtonContent()
                 [
-                    SNew(STextBlock).Text(LOCTEXT("ShowEdgesToggle", "Edges"))
+                    SNew(SNGonVectorIcon)
+                    .Kind(ENGonTreeIconKind::MoreDots)
+                    .Color(FLinearColor(0.80f, 0.84f, 0.90f, 1.0f))
                 ]
             ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
+
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
             [
-                SNew(SCheckBox)
-                .IsChecked_Lambda([this] { return bShowVertices ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+                MakeVerticalDivider()
+            ]
+
+            // 4. Bone / Joint Mode & Occlusion Filter
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::Bone,
+                    LOCTEXT("BoneJointModeBtnTip", "Bone / Joint Selection & Gizmo Mode (4)"),
+                    [this]() { return NGon::IsBoneGizmoActive(&Viewport->Preview()); },
+                    [this]()
+                    {
+                        const bool bNewBoneMode = !NGon::IsBoneGizmoActive(&Viewport->Preview());
+                        NGon::SetBoneGizmoActive(&Viewport->Preview(), bNewBoneMode);
+                        if (bNewBoneMode && Viewport->GetGizmoMode() == ENGonGizmoMode::None)
+                        {
+                            Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
+                        }
+                        Viewport->Invalidate();
+                    })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::OcclusionCube,
+                    LOCTEXT("BackfaceToggleTip", "Toggle Camera/Ray Selection Filter"),
+                    [this]() { return GetSkeletonTreeUIState(this).bBackfaceSelect; },
+                    [this]()
+                    {
+                        FNGonSkeletonTreeUIState& State = GetSkeletonTreeUIState(this);
+                        State.bBackfaceSelect = !State.bBackfaceSelect;
+                    })
+            ]
+
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+            [
+                MakeVerticalDivider()
+            ]
+
+            // 5. Component Mode Strip: [Vertex (1)] [Edge (2)] [Face (3)]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::CompVertex,
+                    LOCTEXT("CompVertexTip", "Vertex Component Selection Mode (1)"),
+                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Vertex; },
+                    [this]()
+                    {
+                        NGon::SetBoneGizmoActive(&Viewport->Preview(), false);
+                        SetSelectionMode(ENGonElement::Vertex);
+                    })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::CompEdge,
+                    LOCTEXT("CompEdgeTip", "Edge Component Selection Mode (2)"),
+                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Edge; },
+                    [this]()
+                    {
+                        NGon::SetBoneGizmoActive(&Viewport->Preview(), false);
+                        SetSelectionMode(ENGonElement::Edge);
+                    })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::CompFace,
+                    LOCTEXT("CompFaceTip", "Polygon Face Component Selection Mode (3)"),
+                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Face; },
+                    [this]()
+                    {
+                        NGon::SetBoneGizmoActive(&Viewport->Preview(), false);
+                        SetSelectionMode(ENGonElement::Face);
+                    })
+            ]
+
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+            [
+                MakeVerticalDivider()
+            ]
+
+            // 6. Topology & Heatmap Overlay Toggles: [Edges (Alt+9)] [Vertices] [Heatmap (H)]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::OverlayEdges,
+                    LOCTEXT("OverlayEdgesBtnTip", "Toggle Authored N-Gon Edges Wireframe Overlay (Alt+9)"),
+                    [this]() { return bShowEdges; },
+                    [this]()
+                    {
+                        bShowEdges = !bShowEdges;
+                        Viewport->Preview().SetShowEdges(bShowEdges);
+                        Viewport->Invalidate();
+                    })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::OverlayVerts,
+                    LOCTEXT("OverlayVertsBtnTip", "Toggle Logical Vertices Point Overlay"),
+                    [this]() { return bShowVertices; },
+                    [this]()
+                    {
+                        bShowVertices = !bShowVertices;
+                        Viewport->Preview().SetShowVertices(bShowVertices);
+                        Viewport->Invalidate();
+                    })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                MakeIconToolButton(
+                    ENGonTreeIconKind::OverlayHeatmap,
+                    LOCTEXT("OverlayHeatmapBtnTip", "Toggle Soft Selection Influence Heatmap (H)"),
+                    [this]() { return Viewport->IsHeatmapVisible(); },
+                    [this]()
+                    {
+                        bShowHeatmap = !Viewport->IsHeatmapVisible();
+                        Viewport->SetHeatmapVisible(bShowHeatmap);
+                    })
+            ]
+
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+            [
+                MakeVerticalDivider()
+            ]
+
+            // 7. Snapping Group (matching image_3aff81.png: Magnet menu, Surface snap, Grid snap, Rotation snap, Scale snap)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
+            [
+                SNew(SComboButton)
+                .ContentPadding(FMargin(4.0f, 2.0f))
+                .ToolTipText(LOCTEXT("SnapMagnetMenuTip", "Snapping Presets & Options"))
+                .OnGetMenuContent_Lambda([this]()
                 {
-                    bShowVertices = (State == ECheckBoxState::Checked);
-                    Viewport->Preview().SetShowVertices(bShowVertices);
-                    Viewport->Invalidate();
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.BeginSection("SnapAll", LOCTEXT("SnapAllSec", "Transform Snapping"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("EnableAllSnaps", "Enable All Transform Snaps (Grid, Rot, Scale)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            NGon::SetSceneSnapSettings(&Viewport->Preview(), true, G, true, R, true, S);
+                        })));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("DisableAllSnaps", "Disable All Transform Snaps"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            NGon::SetSceneSnapSettings(&Viewport->Preview(), false, G, false, R, false, S);
+                        })));
+                    Menu.EndSection();
+                    return Menu.MakeWidget();
                 })
+                .ButtonContent()
                 [
-                    SNew(STextBlock).Text(LOCTEXT("ShowVertsToggle", "Vertices"))
+                    SNew(SNGonVectorIcon)
+                    .Kind(ENGonTreeIconKind::SnapMagnet)
+                    .Color(FLinearColor(0.82f, 0.85f, 0.90f, 1.0f))
                 ]
             ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
+            // Surface Snap Offset ("0 v")
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
-                SNew(SCheckBox)
-                .IsChecked_Lambda([this] { return Viewport->IsHeatmapVisible() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .IsEnabled_Lambda([this] { return Viewport->Preview().HasSoftSelectionInfluence(); })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+                SNew(SComboButton)
+                .ContentPadding(FMargin(4.0f, 2.0f))
+                .ToolTipText(LOCTEXT("SurfaceSnapTip", "Surface Snap Offset"))
+                .OnGetMenuContent_Lambda([this]()
                 {
-                    bShowHeatmap = (State == ECheckBoxState::Checked);
-                    Viewport->SetHeatmapVisible(bShowHeatmap);
+                    FMenuBuilder Menu(true, nullptr);
+                    for (const float Val : { 0.0f, 1.0f, 5.0f, 10.0f, 25.0f })
+                    {
+                        Menu.AddMenuEntry(
+                            FText::AsNumber(Val),
+                            FText(),
+                            FSlateIcon(),
+                            FUIAction(FExecuteAction::CreateLambda([this, Val]()
+                            {
+                                GetSkeletonTreeUIState(this).SurfaceSnapOffset = Val;
+                            })));
+                    }
+                    return Menu.MakeWidget();
                 })
+                .ButtonContent()
                 [
-                    SNew(STextBlock).Text(LOCTEXT("HeatmapToggle", "Heatmap (H)"))
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 3.0f, 0.0f)
+                    [
+                        SNew(SNGonVectorIcon)
+                        .Kind(ENGonTreeIconKind::SnapSurface)
+                        .Color(FLinearColor(0.76f, 0.80f, 0.86f, 1.0f))
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        .Text_Lambda([this]() { return FText::AsNumber(GetSkeletonTreeUIState(this).SurfaceSnapOffset); })
+                    ]
                 ]
             ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
+            // Grid Snap Toggle + Value ("10 v")
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
-                SNew(SCheckBox)
-                .IsChecked_Lambda([this] { return Viewport->IsGridVisible() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
-                {
-                    Viewport->SetGridVisible(State == ECheckBoxState::Checked);
-                })
+                SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                 [
-                    SNew(STextBlock).Text(LOCTEXT("GridToggle", "Grid"))
+                    MakeIconToolButton(
+                        ENGonTreeIconKind::SnapGrid,
+                        LOCTEXT("GridSnapToggleTip", "Toggle Position Grid Snapping"),
+                        [this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            return bG;
+                        },
+                        [this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            NGon::SetSceneSnapSettings(&Viewport->Preview(), !bG, G, bR, R, bS, S);
+                        })
+                ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [
+                    SNew(SComboButton)
+                    .ContentPadding(FMargin(3.0f, 2.0f))
+                    .ToolTipText(LOCTEXT("GridSnapValueTip", "Select Position Grid Snap Increment"))
+                    .OnGetMenuContent_Lambda([this]()
+                    {
+                        FMenuBuilder Menu(true, nullptr);
+                        for (const float Step : { 1.0f, 5.0f, 10.0f, 25.0f, 50.0f, 100.0f })
+                        {
+                            Menu.AddMenuEntry(
+                                FText::AsNumber(Step),
+                                FText(),
+                                FSlateIcon(),
+                                FUIAction(FExecuteAction::CreateLambda([this, Step]()
+                                {
+                                    bool bG, bR, bS; float G, R, S;
+                                    NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                                    NGon::SetSceneSnapSettings(&Viewport->Preview(), true, Step, bR, R, bS, S);
+                                })));
+                        }
+                        return Menu.MakeWidget();
+                    })
+                    .ButtonContent()
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        .Text_Lambda([this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            return FText::AsNumber(FMath::RoundToInt(G));
+                        })
+                    ]
                 ]
             ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
+            // Rotation Snap Toggle + Value ("10° v")
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
-                SNew(SButton)
-                .Text(LOCTEXT("FrameBtn", "Frame (F)"))
-                .OnClicked_Lambda([this]
-                {
-                    Viewport->FrameMesh();
-                    return FReply::Handled();
-                })
+                SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [
+                    MakeIconToolButton(
+                        ENGonTreeIconKind::SnapRotate,
+                        LOCTEXT("RotSnapToggleTip", "Toggle Rotation Angle Snapping"),
+                        [this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            return bR;
+                        },
+                        [this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            NGon::SetSceneSnapSettings(&Viewport->Preview(), bG, G, !bR, R, bS, S);
+                        })
+                ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [
+                    SNew(SComboButton)
+                    .ContentPadding(FMargin(3.0f, 2.0f))
+                    .ToolTipText(LOCTEXT("RotSnapValueTip", "Select Rotation Snap Increment (Degrees)"))
+                    .OnGetMenuContent_Lambda([this]()
+                    {
+                        FMenuBuilder Menu(true, nullptr);
+                        for (const float Step : { 5.0f, 10.0f, 15.0f, 30.0f, 45.0f, 90.0f })
+                        {
+                            Menu.AddMenuEntry(
+                                FText::Format(LOCTEXT("DegFmt", "{0}°"), FText::AsNumber(FMath::RoundToInt(Step))),
+                                FText(),
+                                FSlateIcon(),
+                                FUIAction(FExecuteAction::CreateLambda([this, Step]()
+                                {
+                                    bool bG, bR, bS; float G, R, S;
+                                    NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                                    NGon::SetSceneSnapSettings(&Viewport->Preview(), bG, G, true, Step, bS, S);
+                                })));
+                        }
+                        return Menu.MakeWidget();
+                    })
+                    .ButtonContent()
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        .Text_Lambda([this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            return FText::Format(LOCTEXT("DegBtnFmt", "{0}°"), FText::AsNumber(FMath::RoundToInt(R)));
+                        })
+                    ]
+                ]
             ]
-            + SWrapBox::Slot().VAlign(VAlign_Center)
+            // Scale Snap Toggle + Value ("0.25 v")
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
-                SNew(SButton)
-                .Text(LOCTEXT("DelFacesBtn", "Delete Faces (Del)"))
-                .OnClicked_Lambda([this]
+                SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [
+                    MakeIconToolButton(
+                        ENGonTreeIconKind::SnapScale,
+                        LOCTEXT("ScaleSnapToggleTip", "Toggle Scale Snapping"),
+                        [this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            return bS;
+                        },
+                        [this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            NGon::SetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, !bS, S);
+                        })
+                ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [
+                    SNew(SComboButton)
+                    .ContentPadding(FMargin(3.0f, 2.0f))
+                    .ToolTipText(LOCTEXT("ScaleSnapValueTip", "Select Scale Snap Increment"))
+                    .OnGetMenuContent_Lambda([this]()
+                    {
+                        FMenuBuilder Menu(true, nullptr);
+                        for (const float Step : { 0.05f, 0.1f, 0.25f, 0.5f, 1.0f })
+                        {
+                            Menu.AddMenuEntry(
+                                FText::AsNumber(Step),
+                                FText(),
+                                FSlateIcon(),
+                                FUIAction(FExecuteAction::CreateLambda([this, Step]()
+                                {
+                                    bool bG, bR, bS; float G, R, S;
+                                    NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                                    NGon::SetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, true, Step);
+                                })));
+                        }
+                        return Menu.MakeWidget();
+                    })
+                    .ButtonContent()
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        .Text_Lambda([this]()
+                        {
+                            bool bG, bR, bS; float G, R, S;
+                            NGon::GetSceneSnapSettings(&Viewport->Preview(), bG, G, bR, R, bS, S);
+                            return FText::AsNumber(S);
+                        })
+                    ]
+                ]
+            ]
+
+            // Flexible spacer pushing View controls to the right (matching image_3aff81.png!)
+            + SHorizontalBox::Slot()
+            .FillWidth(1.0f)
+            [
+                SNew(SBox)
+            ]
+
+            // 8. Right-Aligned Viewport Controls: [Perspective v] [Cam Speed v] [Lit v] [Eye v] [Skull v] [LOD Auto v]
+            // Camera Projection Dropdown ("Perspective v")
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+            [
+                SNew(SComboButton)
+                .ContentPadding(FMargin(5.0f, 2.0f))
+                .ToolTipText(LOCTEXT("PerspectiveMenuTip", "Switch Viewport Camera Projection (Perspective / Orthographic)"))
+                .OnGetMenuContent_Lambda([this]()
                 {
-                    Viewport->DeleteSelectedFaces();
-                    return FReply::Handled();
+                    FMenuBuilder Menu(true, nullptr);
+                    auto AddProj = [this, &Menu](ELevelViewportType Type, const FText& Label)
+                    {
+                        Menu.AddMenuEntry(
+                            Label,
+                            FText(),
+                            FSlateIcon(),
+                            FUIAction(
+                                FExecuteAction::CreateLambda([this, Type]()
+                                {
+                                    GetSkeletonTreeUIState(this).ViewportType = Type;
+                                    if (TSharedPtr<FEditorViewportClient> Client = Viewport->GetViewportClient())
+                                    {
+                                        Client->SetViewportType(Type);
+                                        Client->Invalidate();
+                                    }
+                                }),
+                                FCanExecuteAction(),
+                                FIsActionChecked::CreateLambda([this, Type]()
+                                {
+                                    return GetSkeletonTreeUIState(this).ViewportType == Type;
+                                })),
+                            NAME_None,
+                            EUserInterfaceActionType::RadioButton);
+                    };
+                    AddProj(LVT_Perspective, LOCTEXT("ProjPersp", "Perspective"));
+                    AddProj(LVT_OrthoXY, LOCTEXT("ProjTop", "Top"));
+                    AddProj(LVT_OrthoNegativeXY, LOCTEXT("ProjBottom", "Bottom"));
+                    AddProj(LVT_OrthoXZ, LOCTEXT("ProjLeft", "Left"));
+                    AddProj(LVT_OrthoNegativeXZ, LOCTEXT("ProjRight", "Right"));
+                    AddProj(LVT_OrthoYZ, LOCTEXT("ProjFront", "Front"));
+                    AddProj(LVT_OrthoNegativeYZ, LOCTEXT("ProjBack", "Back"));
+                    return Menu.MakeWidget();
                 })
+                .ButtonContent()
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 4.0f, 0.0f)
+                    [
+                        SNew(SNGonVectorIcon)
+                        .Kind(ENGonTreeIconKind::ViewCamera)
+                        .Color(FLinearColor(0.82f, 0.85f, 0.90f, 1.0f))
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        .Text_Lambda([this]()
+                        {
+                            switch (GetSkeletonTreeUIState(this).ViewportType)
+                            {
+                            case LVT_OrthoXY: return LOCTEXT("LblTop", "Top");
+                            case LVT_OrthoNegativeXY: return LOCTEXT("LblBot", "Bottom");
+                            case LVT_OrthoXZ: return LOCTEXT("LblLeft", "Left");
+                            case LVT_OrthoNegativeXZ: return LOCTEXT("LblRight", "Right");
+                            case LVT_OrthoYZ: return LOCTEXT("LblFront", "Front");
+                            case LVT_OrthoNegativeYZ: return LOCTEXT("LblBack", "Back");
+                            default: return LOCTEXT("LblPersp", "Perspective");
+                            }
+                        })
+                    ]
+                ]
+            ]
+
+            // Camera Speed Dropdown ("1 v")
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+            [
+                SNew(SComboButton)
+                .ContentPadding(FMargin(4.0f, 2.0f))
+                .ToolTipText(LOCTEXT("CamSpeedMenuTip", "Camera Movement Speed Multiplier"))
+                .OnGetMenuContent_Lambda([this]()
+                {
+                    FMenuBuilder Menu(true, nullptr);
+                    for (const float Spd : { 0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f })
+                    {
+                        Menu.AddMenuEntry(
+                            FText::Format(LOCTEXT("CamSpdFmt", "{0}x"), FText::AsNumber(Spd)),
+                            FText(),
+                            FSlateIcon(),
+                            FUIAction(FExecuteAction::CreateLambda([this, Spd]()
+                            {
+                                GetSkeletonTreeUIState(this).CameraSpeedScalar = Spd;
+                                if (TSharedPtr<FEditorViewportClient> Client = Viewport->GetViewportClient())
+                                {
+                                    FEditorViewportCameraSpeedSettings SpeedSettings = Client->GetCameraSpeedSettings();
+                                    SpeedSettings.SetCurrentSpeed(Spd);
+                                    Client->SetCameraSpeedSettings(SpeedSettings);
+                                }
+                            })));
+                    }
+                    return Menu.MakeWidget();
+                })
+                .ButtonContent()
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 3.0f, 0.0f)
+                    [
+                        SNew(SNGonVectorIcon)
+                        .Kind(ENGonTreeIconKind::ViewCamSpeed)
+                        .Color(FLinearColor(0.80f, 0.83f, 0.88f, 1.0f))
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        .Text_Lambda([this]() { return FText::AsNumber(GetSkeletonTreeUIState(this).CameraSpeedScalar); })
+                    ]
+                ]
+            ]
+
+            // Shading / View Mode Dropdown ("Lit v")
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+            [
+                SNew(SComboButton)
+                .ContentPadding(FMargin(5.0f, 2.0f))
+                .ToolTipText(LOCTEXT("ShadingModeTip", "Viewport Shading Mode (Lit Smooth, Lit Faceted, Wireframe)"))
+                .OnGetMenuContent_Lambda([this]()
+                {
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShadeLitSmooth", "Lit (Smooth Normals)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            GetSkeletonTreeUIState(this).ShadingMode = 0;
+                            NGon::SetSceneFlatShading(&Viewport->Preview(), false);
+                            if (TSharedPtr<FEditorViewportClient> Client = Viewport->GetViewportClient())
+                            {
+                                Client->SetViewMode(VMI_Unlit);
+                                Client->Invalidate();
+                            }
+                        })));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShadeLitFlat", "Lit (Flat Faceted Polygons)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            GetSkeletonTreeUIState(this).ShadingMode = 1;
+                            NGon::SetSceneFlatShading(&Viewport->Preview(), true);
+                            if (TSharedPtr<FEditorViewportClient> Client = Viewport->GetViewportClient())
+                            {
+                                Client->SetViewMode(VMI_Unlit);
+                                Client->Invalidate();
+                            }
+                        })));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShadeWireframe", "Wireframe"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            GetSkeletonTreeUIState(this).ShadingMode = 3;
+                            if (TSharedPtr<FEditorViewportClient> Client = Viewport->GetViewportClient())
+                            {
+                                Client->SetViewMode(VMI_Wireframe);
+                                Client->Invalidate();
+                            }
+                        })));
+                    return Menu.MakeWidget();
+                })
+                .ButtonContent()
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 4.0f, 0.0f)
+                    [
+                        SNew(SNGonVectorIcon)
+                        .Kind(ENGonTreeIconKind::ViewLit)
+                        .Color(FLinearColor(0.82f, 0.85f, 0.90f, 1.0f))
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        .Text_Lambda([this]()
+                        {
+                            switch (GetSkeletonTreeUIState(this).ShadingMode)
+                            {
+                            case 3: return LOCTEXT("LblWire", "Wireframe");
+                            default: return LOCTEXT("LblLit", "Lit");
+                            }
+                        })
+                    ]
+                ]
+            ]
+
+            // Show Flags Eye Dropdown ("[Eye v]")
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+            [
+                SNew(SComboButton)
+                .ContentPadding(FMargin(4.0f, 2.0f))
+                .ToolTipText(LOCTEXT("ShowFlagsEyeTip", "Viewport Show Flags (Grid, N-Gon Edges, Vertices, HUD Overlays)"))
+                .OnGetMenuContent_Lambda([this]()
+                {
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.BeginSection("ViewportShow", LOCTEXT("ViewportShowSec", "Show Flags"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShowGridMenu", "Ground Grid"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]() { Viewport->SetGridVisible(!Viewport->IsGridVisible()); }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return Viewport->IsGridVisible(); })),
+                        NAME_None,
+                        EUserInterfaceActionType::Check);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShowEdgesMenu", "Authored N-Gon Edges (Alt+9)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                bShowEdges = !bShowEdges;
+                                Viewport->Preview().SetShowEdges(bShowEdges);
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return bShowEdges; })),
+                        NAME_None,
+                        EUserInterfaceActionType::Check);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShowVertsMenu", "Logical Vertices"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                bShowVertices = !bShowVertices;
+                                Viewport->Preview().SetShowVertices(bShowVertices);
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return bShowVertices; })),
+                        NAME_None,
+                        EUserInterfaceActionType::Check);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShowStatsMenu", "Top-Left Mesh & Bone Stats HUD"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]() { bShowStatsOverlay = !bShowStatsOverlay; }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return bShowStatsOverlay; })),
+                        NAME_None,
+                        EUserInterfaceActionType::Check);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShowHotkeysMenu", "Top-Right Hotkeys Legend"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]() { bShowHotkeysOverlay = !bShowHotkeysOverlay; }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return bShowHotkeysOverlay; })),
+                        NAME_None,
+                        EUserInterfaceActionType::Check);
+                    Menu.EndSection();
+                    return Menu.MakeWidget();
+                })
+                .ButtonContent()
+                [
+                    SNew(SNGonVectorIcon)
+                    .Kind(ENGonTreeIconKind::ViewEye)
+                    .Color(FLinearColor(0.82f, 0.85f, 0.90f, 1.0f))
+                ]
+            ]
+
+            // Skeleton / Bone Display Dropdown ("[Skull v]" matching image_3aff81.png!)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+            [
+                SNew(SComboButton)
+                .ContentPadding(FMargin(4.0f, 2.0f))
+                .ToolTipText(LOCTEXT("SkullBoneMenuTip", "Character / Skeleton Bone Drawing & Joint Options"))
+                .OnGetMenuContent_Lambda([this]()
+                {
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.BeginSection("BoneDrawing", LOCTEXT("BoneDrawSec", "Bone Drawing"));
+                    auto AddBoneDrawMode = [this, &Menu](int32 Mode, const FText& Label)
+                    {
+                        Menu.AddMenuEntry(
+                            Label,
+                            FText(),
+                            FSlateIcon(),
+                            FUIAction(
+                                FExecuteAction::CreateLambda([this, Mode]()
+                                {
+                                    GetSkeletonTreeUIState(this).BoneDrawMode = Mode;
+                                    Viewport->Invalidate();
+                                }),
+                                FCanExecuteAction(),
+                                FIsActionChecked::CreateLambda([this, Mode]()
+                                {
+                                    return GetSkeletonTreeUIState(this).BoneDrawMode == Mode;
+                                })),
+                            NAME_None,
+                            EUserInterfaceActionType::RadioButton);
+                    };
+                    AddBoneDrawMode(0, LOCTEXT("BoneDrawAll", "All Hierarchy"));
+                    AddBoneDrawMode(1, LOCTEXT("BoneDrawSubtree", "Selected & Subtree"));
+                    AddBoneDrawMode(2, LOCTEXT("BoneDrawSelected", "Selected Bone Only"));
+                    AddBoneDrawMode(3, LOCTEXT("BoneDrawNone", "None (Hide Bones)"));
+                    Menu.EndSection();
+
+                    Menu.BeginSection("BoneLabels", LOCTEXT("BoneLabelsSec", "Labels & Pose"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShowBoneNamesEntry", "Show 3D Bone Name Labels"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                FNGonSkeletonTreeUIState& State = GetSkeletonTreeUIState(this);
+                                State.bShowBoneNames = !State.bShowBoneNames;
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]()
+                            {
+                                return GetSkeletonTreeUIState(this).bShowBoneNames;
+                            })),
+                        NAME_None,
+                        EUserInterfaceActionType::Check);
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ResetBoneSkullMenu", "Reset Selected Bone (Ctrl+I)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            if (NGon::ResetSelectedSceneBoneTransform(&Viewport->Preview()))
+                            {
+                                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Viewport.Get()))
+                                {
+                                    if (UIState->OnViewportBoneTransformChanged)
+                                    {
+                                        UIState->OnViewportBoneTransformChanged();
+                                    }
+                                }
+                                Viewport->Invalidate();
+                            }
+                        })));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ResetAllBonesSkullMenu", "Reset All Bones (Ctrl+Shift+I)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            if (NGon::ResetAllSceneBonesTransforms(&Viewport->Preview()))
+                            {
+                                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Viewport.Get()))
+                                {
+                                    if (UIState->OnViewportBoneTransformChanged)
+                                    {
+                                        UIState->OnViewportBoneTransformChanged();
+                                    }
+                                }
+                                Viewport->Invalidate();
+                            }
+                        })));
+                    Menu.EndSection();
+                    return Menu.MakeWidget();
+                })
+                .ButtonContent()
+                [
+                    SNew(SNGonVectorIcon)
+                    .Kind(ENGonTreeIconKind::ViewSkull)
+                    .Color(FLinearColor(0.86f, 0.89f, 0.94f, 1.0f))
+                ]
+            ]
+
+            // LOD Auto Dropdown ("LOD Auto v" + Frame / Actions)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+            [
+                SNew(SComboButton)
+                .ContentPadding(FMargin(5.0f, 2.0f))
+                .ToolTipText(LOCTEXT("LodMenuTip", "Mesh Level of Detail & Quick Viewport Actions"))
+                .OnGetMenuContent_Lambda([this]()
+                {
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.BeginSection("LodSec", LOCTEXT("LodSecTitle", "LOD Selection"));
+                    Menu.AddMenuEntry(LOCTEXT("LodAutoItem", "LOD Auto"), FText(), FSlateIcon(), FUIAction());
+                    Menu.AddMenuEntry(LOCTEXT("Lod0Item", "LOD 0 (Base N-Gon / Skeletal)"), FText(), FSlateIcon(), FUIAction());
+                    Menu.EndSection();
+                    Menu.BeginSection("QuickActions", LOCTEXT("QuickActionsSec", "Viewport Actions"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("FrameMeshMenu", "Frame Selection / Mesh (F)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]() { Viewport->FrameMesh(); })));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("DeleteFacesMenu", "Delete Selected Faces (Del)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this]() { Viewport->DeleteSelectedFaces(); })));
+                    Menu.EndSection();
+                    return Menu.MakeWidget();
+                })
+                .ButtonContent()
+                [
+                    SNew(STextBlock)
+                    .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                    .Text(LOCTEXT("LodAutoLabel", "LOD Auto"))
+                ]
             ]
         ];
 }
@@ -1847,11 +3377,23 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportHotkeysOverlay()
             SNew(SVerticalBox)
             + SVerticalBox::Slot().AutoHeight()
             [
-                MakeHotkeyRow(LOCTEXT("HkMode", "Component Mode:"), LOCTEXT("HkModeKeys", "1 Vtx / 2 Edge / 3 Face"))
+                MakeHotkeyRow(LOCTEXT("HkMode", "Selection Mode:"), LOCTEXT("HkModeKeys", "1 Vtx / 2 Edge / 3 Face / 4 Joint"))
             ]
             + SVerticalBox::Slot().AutoHeight()
             [
-                MakeHotkeyRow(LOCTEXT("HkGizmo", "Transform Gizmo:"), LOCTEXT("HkGizmoKeys", "W Move / E Rot / R Scale"))
+                MakeHotkeyRow(LOCTEXT("HkGizmo", "Transform Gizmo:"), LOCTEXT("HkGizmoKeys", "Q Select / W Move / E Rot / R Scale"))
+            ]
+            + SVerticalBox::Slot().AutoHeight()
+            [
+                MakeHotkeyRow(LOCTEXT("HkToggleEdges", "Toggle Mesh Edges Rendering:"), LOCTEXT("HkToggleEdgesKey", "Alt+9"))
+            ]
+            + SVerticalBox::Slot().AutoHeight()
+            [
+                MakeHotkeyRow(LOCTEXT("HkResetBone", "Reset Bone Transforms:"), LOCTEXT("HkResetBoneKey", "Ctrl+I"))
+            ]
+            + SVerticalBox::Slot().AutoHeight()
+            [
+                MakeHotkeyRow(LOCTEXT("HkResetAllBones", "Reset All Bones Transforms:"), LOCTEXT("HkResetAllBonesKey", "Ctrl+Shift+I"))
             ]
             + SVerticalBox::Slot().AutoHeight()
             [
@@ -1859,19 +3401,7 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportHotkeysOverlay()
             ]
             + SVerticalBox::Slot().AutoHeight()
             [
-                MakeHotkeyRow(LOCTEXT("HkHeatmap", "Toggle Soft Heatmap:"), LOCTEXT("HkHeatmapKey", "H"))
-            ]
-            + SVerticalBox::Slot().AutoHeight()
-            [
                 MakeHotkeyRow(LOCTEXT("HkFrame", "Frame Selection / Mesh:"), LOCTEXT("HkFrameKey", "F"))
-            ]
-            + SVerticalBox::Slot().AutoHeight()
-            [
-                MakeHotkeyRow(LOCTEXT("HkDelete", "Delete Selected Faces:"), LOCTEXT("HkDeleteKey", "Delete"))
-            ]
-            + SVerticalBox::Slot().AutoHeight()
-            [
-                MakeHotkeyRow(LOCTEXT("HkCamera", "Maya Camera Orbit:"), LOCTEXT("HkCameraKey", "Alt+LMB / MMB / RMB"))
             ]
         ];
 }
@@ -2029,6 +3559,10 @@ TSharedRef<SWidget> SNGonPreview::MakeRightInspectorPanel()
                     [
                         MakeLowerTabButton(ENGonRightLowerTab::PreviewSettings, LOCTEXT("PreviewSettingsTab", "Preview Settings"))
                     ]
+                    + SHorizontalBox::Slot().AutoWidth()
+                    [
+                        MakeLowerTabButton(ENGonRightLowerTab::Painter, LOCTEXT("PainterTab", "Painter"))
+                    ]
                 ]
                 + SVerticalBox::Slot()
                 .FillHeight(1.0f)
@@ -2068,6 +3602,17 @@ TSharedRef<SWidget> SNGonPreview::MakeRightInspectorPanel()
                             })
                             [
                                 MakePreviewSettingsTab()
+                            ]
+                        ]
+                        + SOverlay::Slot()
+                        [
+                            SNew(SBox)
+                            .Visibility_Lambda([this]
+                            {
+                                return ActiveLowerTab == ENGonRightLowerTab::Painter ? EVisibility::Visible : EVisibility::Collapsed;
+                            })
+                            [
+                                MakePainterTab()
                             ]
                         ]
                     ]
@@ -2313,6 +3858,15 @@ void SNGonPreview::RebuildSkeletonTreeList()
                             SelectedBoneIndex = BoneIdx;
                         }
                         ActiveLowerTab = ENGonRightLowerTab::Details;
+                        if (Viewport.IsValid())
+                        {
+                            NGon::SelectSceneBone(&Viewport->Preview(), BoneIdx, true);
+                            if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
+                            {
+                                Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
+                            }
+                            Viewport->Invalidate();
+                        }
                         RebuildSkeletonTreeList();
                     })
                     [
@@ -2715,8 +4269,58 @@ FReply SNGonPreview::SelectVerticesNearSelectedBone()
 
 TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
 {
+    auto MakeBoneAxisSpinBox = [this](
+        const FText& AxisLabel,
+        const FLinearColor& AxisColor,
+        float MinVal,
+        float MaxVal,
+        TFunction<float()> Getter,
+        TFunction<void(float)> Setter) -> TSharedRef<SWidget>
+    {
+        return SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 3.0f, 0.0f)
+            [
+                SNew(STextBlock)
+                .Text(AxisLabel)
+                .Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+                .ColorAndOpacity(AxisColor)
+            ]
+            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+            [
+                SNew(SSpinBox<float>)
+                .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                .MinValue(MinVal)
+                .MaxValue(MaxVal)
+                .Delta(0.25f)
+                .Value_Lambda([Getter]() { return Getter(); })
+                .OnValueChanged_Lambda([this, Setter](float NewVal)
+                {
+                    Setter(NewVal);
+                })
+            ];
+    };
+
+    auto ApplyEditedBoneLocalTransform = [this](const FTransform& NewLocal)
+    {
+        if (!SkeletonBones.IsValidIndex(SelectedBoneIndex) || !Viewport.IsValid())
+        {
+            return;
+        }
+        NGon::SetSceneBoneLocalTransform(&Viewport->Preview(), SelectedBoneIndex, NewLocal);
+        for (int32 i = 0; i < SkeletonBones.Num(); ++i)
+        {
+            FTransform CurLocal, CurComp, RefLocal, RefComp;
+            if (NGon::GetSceneBoneTransforms(&Viewport->Preview(), i, CurLocal, CurComp, RefLocal, RefComp))
+            {
+                SkeletonBones[i].LocalTransform = CurLocal;
+                SkeletonBones[i].ComponentTransform = CurComp;
+            }
+        }
+        Viewport->Invalidate();
+    };
+
     return SNew(SVerticalBox)
-        // 1. Selected Bone Inspector (visible when a bone is selected in Skeleton Tree)
+        // 1. Selected Bone & Transforms Inspector (matching UE 5.8 SkeletalMesh Editor Details panel in image_3b0306.jpg / image_3b02c7.jpg / image_3b001c.jpg)
         + SVerticalBox::Slot()
         .AutoHeight()
         .Padding(0.0f, 0.0f, 0.0f, 8.0f)
@@ -2727,59 +4331,281 @@ TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
                 return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? EVisibility::Visible : EVisibility::Collapsed;
             })
             .Padding(FMargin(6.0f))
+            .BorderBackgroundColor(FLinearColor(0.08f, 0.09f, 0.11f, 1.0f))
             [
                 SNew(SVerticalBox)
+                // Category: Bone
                 + SVerticalBox::Slot().AutoHeight()
                 [
-                    SNew(STextBlock)
-                    .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-                    .ColorAndOpacity(FLinearColor(0.25f, 0.85f, 1.0f))
-                    .Text(LOCTEXT("SelectedBoneHeader", "Selected Bone Transform (Ref Pose)"))
+                    SNew(SBorder)
+                    .Padding(FMargin(4.0f, 3.0f))
+                    .BorderBackgroundColor(FLinearColor(0.14f, 0.15f, 0.18f, 1.0f))
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+                        .ColorAndOpacity(FLinearColor(0.88f, 0.90f, 0.94f))
+                        .Text(LOCTEXT("CatBoneHeader", "▼  Bone"))
+                    ]
                 ]
-                + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f)
+                + SVerticalBox::Slot().AutoHeight().Padding(4.0f, 4.0f)
                 [
-                    SNew(STextBlock)
-                    .AutoWrapText(true)
-                    .Text_Lambda([this]
-                    {
-                        if (!SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 12.0f, 0.0f)
+                    [
+                        SNew(STextBlock)
+                        .Text(LOCTEXT("BoneNameFieldLbl", "Bone Name"))
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+                        .ColorAndOpacity(FLinearColor(0.72f, 0.75f, 0.80f))
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+                        .ColorAndOpacity(FLinearColor(0.25f, 0.88f, 1.0f))
+                        .Text_Lambda([this]()
                         {
-                            return FText::GetEmpty();
-                        }
-                        const FNGonBoneEntry& Bone = SkeletonBones[SelectedBoneIndex];
-                        const FString ParentName = SkeletonBones.IsValidIndex(Bone.ParentIndex)
-                            ? SkeletonBones[Bone.ParentIndex].Name.ToString()
-                            : TEXT("None (Root)");
-                        const FVector LocalT = Bone.LocalTransform.GetTranslation();
-                        const FRotator LocalR = Bone.LocalTransform.GetRotation().Rotator();
-                        const FVector CompT = Bone.ComponentTransform.GetTranslation();
-                        return FText::Format(
-                            LOCTEXT("BoneDetailFmt",
-                                "Bone: {0} (Index {1})\n"
-                                "Parent: {2}  |  Children: {3}\n"
-                                "Local Pos: ({4}, {5}, {6})\n"
-                                "Local Rot: ({7}, {8}, {9})\n"
-                                "Comp Pos: ({10}, {11}, {12})"),
-                            FText::FromName(Bone.Name),
-                            FText::AsNumber(Bone.BoneIndex),
-                            FText::FromString(ParentName),
-                            FText::AsNumber(Bone.ChildCount),
-                            FText::AsNumber(FMath::RoundToFloat(LocalT.X * 100.0f) / 100.0f),
-                            FText::AsNumber(FMath::RoundToFloat(LocalT.Y * 100.0f) / 100.0f),
-                            FText::AsNumber(FMath::RoundToFloat(LocalT.Z * 100.0f) / 100.0f),
-                            FText::AsNumber(FMath::RoundToFloat(LocalR.Pitch * 10.0f) / 10.0f),
-                            FText::AsNumber(FMath::RoundToFloat(LocalR.Yaw * 10.0f) / 10.0f),
-                            FText::AsNumber(FMath::RoundToFloat(LocalR.Roll * 10.0f) / 10.0f),
-                            FText::AsNumber(FMath::RoundToFloat(CompT.X * 100.0f) / 100.0f),
-                            FText::AsNumber(FMath::RoundToFloat(CompT.Y * 100.0f) / 10.0f),
-                            FText::AsNumber(FMath::RoundToFloat(CompT.Z * 100.0f) / 100.0f));
-                    })
+                            if (!SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                            {
+                                return FText::GetEmpty();
+                            }
+                            const FNGonBoneEntry& B = SkeletonBones[SelectedBoneIndex];
+                            const FString ParentStr = SkeletonBones.IsValidIndex(B.ParentIndex)
+                                ? SkeletonBones[B.ParentIndex].Name.ToString()
+                                : TEXT("Root");
+                            return FText::FromString(FString::Printf(TEXT("%s   (#%d, Parent: %s)"), *B.Name.ToString(), B.BoneIndex, *ParentStr));
+                        })
+                    ]
                 ]
-                + SVerticalBox::Slot().AutoHeight()
+
+                // Category: Transforms
+                + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f, 0.0f, 2.0f)
                 [
-                    SNew(SButton)
-                    .Text(LOCTEXT("SelectVertsNearBone", "Select Vertices Near Joint"))
-                    .OnClicked(this, &SNGonPreview::SelectVerticesNearSelectedBone)
+                    SNew(SBorder)
+                    .Padding(FMargin(4.0f, 3.0f))
+                    .BorderBackgroundColor(FLinearColor(0.14f, 0.15f, 0.18f, 1.0f))
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+                        .ColorAndOpacity(FLinearColor(0.88f, 0.90f, 0.94f))
+                        .Text(LOCTEXT("CatTransformsHeader", "▼  Transforms (Local Joint Pose)"))
+                    ]
+                ]
+                // Location (X, Y, Z)
+                + SVerticalBox::Slot().AutoHeight().Padding(2.0f, 2.0f)
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 8.0f, 0.0f)
+                    [
+                        SNew(SBox).WidthOverride(56.0f)
+                        [
+                            SNew(STextBlock).Text(LOCTEXT("BoneLocLbl", "Location")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        ]
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisX", "X"), FLinearColor(1.0f, 0.35f, 0.35f), -5000.0f, 5000.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetLocation().X) : 0.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FVector L = T.GetLocation(); L.X = Val; T.SetLocation(L);
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisY", "Y"), FLinearColor(0.35f, 1.0f, 0.40f), -5000.0f, 5000.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetLocation().Y) : 0.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FVector L = T.GetLocation(); L.Y = Val; T.SetLocation(L);
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisZ", "Z"), FLinearColor(0.40f, 0.65f, 1.0f), -5000.0f, 5000.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetLocation().Z) : 0.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FVector L = T.GetLocation(); L.Z = Val; T.SetLocation(L);
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                ]
+                // Rotation (Roll X, Pitch Y, Yaw Z)
+                + SVerticalBox::Slot().AutoHeight().Padding(2.0f, 2.0f)
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 8.0f, 0.0f)
+                    [
+                        SNew(SBox).WidthOverride(56.0f)
+                        [
+                            SNew(STextBlock).Text(LOCTEXT("BoneRotLbl", "Rotation")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        ]
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisRoll", "X"), FLinearColor(1.0f, 0.35f, 0.35f), -360.0f, 360.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetRotation().Rotator().Roll) : 0.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FRotator R = T.GetRotation().Rotator(); R.Roll = Val; T.SetRotation(FQuat(R));
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisPitch", "Y"), FLinearColor(0.35f, 1.0f, 0.40f), -360.0f, 360.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetRotation().Rotator().Pitch) : 0.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FRotator R = T.GetRotation().Rotator(); R.Pitch = Val; T.SetRotation(FQuat(R));
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisYaw", "Z"), FLinearColor(0.40f, 0.65f, 1.0f), -360.0f, 360.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetRotation().Rotator().Yaw) : 0.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FRotator R = T.GetRotation().Rotator(); R.Yaw = Val; T.SetRotation(FQuat(R));
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                ]
+                // Scale (X, Y, Z)
+                + SVerticalBox::Slot().AutoHeight().Padding(2.0f, 2.0f)
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 8.0f, 0.0f)
+                    [
+                        SNew(SBox).WidthOverride(56.0f)
+                        [
+                            SNew(STextBlock).Text(LOCTEXT("BoneScaleLbl", "Scale")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        ]
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisSX", "X"), FLinearColor(1.0f, 0.35f, 0.35f), 0.05f, 20.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetScale3D().X) : 1.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FVector S = T.GetScale3D(); S.X = FMath::Max(0.05f, Val); T.SetScale3D(S);
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisSY", "Y"), FLinearColor(0.35f, 1.0f, 0.40f), 0.05f, 20.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetScale3D().Y) : 1.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FVector S = T.GetScale3D(); S.Y = FMath::Max(0.05f, Val); T.SetScale3D(S);
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f, 0.0f)
+                    [
+                        MakeBoneAxisSpinBox(LOCTEXT("AxisSZ", "Z"), FLinearColor(0.40f, 0.65f, 1.0f), 0.05f, 20.0f,
+                            [this]() { return SkeletonBones.IsValidIndex(SelectedBoneIndex) ? static_cast<float>(SkeletonBones[SelectedBoneIndex].LocalTransform.GetScale3D().Z) : 1.0f; },
+                            [this, ApplyEditedBoneLocalTransform](float Val)
+                            {
+                                if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+                                {
+                                    FTransform T = SkeletonBones[SelectedBoneIndex].LocalTransform;
+                                    FVector S = T.GetScale3D(); S.Z = FMath::Max(0.05f, Val); T.SetScale3D(S);
+                                    ApplyEditedBoneLocalTransform(T);
+                                }
+                            })
+                    ]
+                ]
+                // Action Row: [Reset Bone (Ctrl+I)] [Reset All (Ctrl+Shift+I)] [Select Verts Near Joint]
+                + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 6.0f, 0.0f, 0.0f)
+                [
+                    SNew(SWrapBox)
+                    .UseAllottedSize(true)
+                    .InnerSlotPadding(FVector2D(4.0f, 3.0f))
+                    + SWrapBox::Slot()
+                    [
+                        SNew(SButton)
+                        .Text(LOCTEXT("BtnResetSelBone", "Reset Bone (Ctrl+I)"))
+                        .ToolTipText(LOCTEXT("BtnResetSelBoneTip", "Reset the selected bone back to Reference Pose"))
+                        .OnClicked_Lambda([this]()
+                        {
+                            if (NGon::ResetSelectedSceneBoneTransform(&Viewport->Preview()))
+                            {
+                                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Viewport.Get()))
+                                {
+                                    if (UIState->OnViewportBoneTransformChanged)
+                                    {
+                                        UIState->OnViewportBoneTransformChanged();
+                                    }
+                                }
+                                Viewport->Invalidate();
+                            }
+                            return FReply::Handled();
+                        })
+                    ]
+                    + SWrapBox::Slot()
+                    [
+                        SNew(SButton)
+                        .Text(LOCTEXT("BtnResetAllBones", "Reset All Bones (Ctrl+Shift+I)"))
+                        .ToolTipText(LOCTEXT("BtnResetAllBonesTip", "Reset all skeleton bones back to Reference Pose"))
+                        .OnClicked_Lambda([this]()
+                        {
+                            if (NGon::ResetAllSceneBonesTransforms(&Viewport->Preview()))
+                            {
+                                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Viewport.Get()))
+                                {
+                                    if (UIState->OnViewportBoneTransformChanged)
+                                    {
+                                        UIState->OnViewportBoneTransformChanged();
+                                    }
+                                }
+                                Viewport->Invalidate();
+                            }
+                            return FReply::Handled();
+                        })
+                    ]
+                    + SWrapBox::Slot()
+                    [
+                        SNew(SButton)
+                        .Text(LOCTEXT("SelectVertsNearBone", "Select Vertices Near Joint"))
+                        .OnClicked(this, &SNGonPreview::SelectVerticesNearSelectedBone)
+                    ]
                 ]
             ]
         ]
@@ -3137,6 +4963,21 @@ TSharedRef<SWidget> SNGonPreview::MakePreviewSettingsTab()
         ];
 }
 
+TSharedRef<SWidget> SNGonPreview::MakePainterTab()
+{
+    return SNew(SVerticalBox)
+        + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 5.0f)
+        [
+            SNew(STextBlock)
+            .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+            .Text(LOCTEXT("PainterHeader", "TiGUI Painter — Active N-Gon UV Mesh"))
+        ]
+        + SVerticalBox::Slot().FillHeight(1.0f)
+        [
+            Painter.ToSharedRef()
+        ];
+}
+
 void SNGonPreview::ApplySoftSelectionSettings()
 {
     FNGonSoftSelectionSettings Settings;
@@ -3209,10 +5050,16 @@ FReply SNGonPreview::LoadDemo()
         SkeletonBones.Reset();
         MorphTargets.Reset();
         SelectedBoneIndex = INDEX_NONE;
-        GetSkeletonTreeUIState(this) = FNGonSkeletonTreeUIState{};
+        {
+            FNGonSkeletonTreeUIState& St = GetSkeletonTreeUIState(this);
+            St.CollapsedBones.Reset();
+            St.Sockets.Reset();
+            St.SelectedSocketIndex = INDEX_NONE;
+        }
         RebuildSkeletonTreeList();
         RebuildMorphTargetList();
         ShowMesh(MoveTemp(Data), LOCTEXT("DemoName", "Demo Mesh"), LOCTEXT("DemoType", "Procedural N-Gon"));
+        NGon::ClearSceneSkeleton(&Viewport->Preview());
     }
     else
     {
@@ -3255,6 +5102,7 @@ void SNGonPreview::LoadStaticMesh(const FAssetData& Asset)
     RebuildMorphTargetList();
 
     ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("StaticMeshType", "Static Mesh"));
+    NGon::ClearSceneSkeleton(&Viewport->Preview());
     if (bTriangleOnly)
     {
         ShowError(LOCTEXT("TrianglesOnly",
@@ -3377,6 +5225,135 @@ void SNGonPreview::LoadSkeletalMesh(const FAssetData& Asset)
         }
     }
 
+    // Extract LOD 0 Skin Weights from ImportedModel SoftVertices mapped to our Logical Vertices
+    const int32 NumLogicalVerts = Data.Topology.RestPositions.Num();
+    TArray<TArray<NGon::FNGonVertexBoneWeight>> ExtractedSkinWeights;
+    ExtractedSkinWeights.SetNum(NumLogicalVerts);
+
+    if (const FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel())
+    {
+        if (ImportedModel->LODModels.IsValidIndex(0))
+        {
+            const FSkeletalMeshLODModel& LODModel = ImportedModel->LODModels[0];
+
+            // Build fast lookup from SourceVertexId (ImportVertexId) -> LogicalVertexId
+            TMap<int32, int32> SourceToLogical;
+            SourceToLogical.Reserve(NumLogicalVerts);
+            for (int32 LogicalIdx = 0; LogicalIdx < Data.Topology.SourceVertexIds.Num(); ++LogicalIdx)
+            {
+                SourceToLogical.FindOrAdd(Data.Topology.SourceVertexIds[LogicalIdx], LogicalIdx);
+            }
+
+            // Also build quantized 3D position lookup for direct position matching
+            TMultiMap<FIntVector, int32> PosHashToLogical;
+            PosHashToLogical.Reserve(NumLogicalVerts);
+            for (int32 LogicalIdx = 0; LogicalIdx < NumLogicalVerts; ++LogicalIdx)
+            {
+                const FVector& P = Data.Topology.RestPositions[LogicalIdx];
+                const FIntVector Key(
+                    FMath::RoundToInt(P.X * 20.0),
+                    FMath::RoundToInt(P.Y * 20.0),
+                    FMath::RoundToInt(P.Z * 20.0));
+                PosHashToLogical.Add(Key, LogicalIdx);
+            }
+
+            int32 GlobalSoftIdx = 0;
+            for (const FSkelMeshSection& Section : LODModel.Sections)
+            {
+                for (const FSoftSkinVertex& SoftVert : Section.SoftVertices)
+                {
+                    TArray<NGon::FNGonVertexBoneWeight, TInlineAllocator<12>> VertWeights;
+                    float WeightSum = 0.0f;
+                    for (int32 InfIdx = 0; InfIdx < MAX_TOTAL_INFLUENCES; ++InfIdx)
+                    {
+                        const uint32 RawW = static_cast<uint32>(SoftVert.InfluenceWeights[InfIdx]);
+                        if (RawW > 0)
+                        {
+                            const int32 SecBoneIdx = static_cast<int32>(SoftVert.InfluenceBones[InfIdx]);
+                            if (Section.BoneMap.IsValidIndex(SecBoneIdx))
+                            {
+                                const int32 RefBoneIdx = static_cast<int32>(Section.BoneMap[SecBoneIdx]);
+                                if (RefBoneIdx >= 0 && RefBoneIdx < NumBones)
+                                {
+                                    const float W = static_cast<float>(RawW);
+                                    VertWeights.Add({ RefBoneIdx, W });
+                                    WeightSum += W;
+                                }
+                            }
+                        }
+                    }
+
+                    if (WeightSum > 0.0f)
+                    {
+                        for (NGon::FNGonVertexBoneWeight& BW : VertWeights)
+                        {
+                            BW.Weight /= WeightSum;
+                        }
+
+                        bool bMappedByImportId = false;
+                        if (LODModel.MeshToImportVertexMap.IsValidIndex(GlobalSoftIdx))
+                        {
+                            const int32 ImportId = LODModel.MeshToImportVertexMap[GlobalSoftIdx];
+                            if (const int32* LogicalPtr = SourceToLogical.Find(ImportId))
+                            {
+                                if (ExtractedSkinWeights[*LogicalPtr].IsEmpty())
+                                {
+                                    ExtractedSkinWeights[*LogicalPtr].Append(VertWeights.GetData(), VertWeights.Num());
+                                    bMappedByImportId = true;
+                                }
+                            }
+                        }
+
+                        if (!bMappedByImportId)
+                        {
+                            const FVector SoftPos(SoftVert.Position);
+                            const FIntVector Key(
+                                FMath::RoundToInt(SoftPos.X * 20.0),
+                                FMath::RoundToInt(SoftPos.Y * 20.0),
+                                FMath::RoundToInt(SoftPos.Z * 20.0));
+                            TArray<int32, TInlineAllocator<8>> Matches;
+                            PosHashToLogical.MultiFind(Key, Matches);
+                            for (const int32 CandLogical : Matches)
+                            {
+                                if (ExtractedSkinWeights[CandLogical].IsEmpty() &&
+                                    FVector::DistSquared(Data.Topology.RestPositions[CandLogical], SoftPos) <= 0.04)
+                                {
+                                    ExtractedSkinWeights[CandLogical].Append(VertWeights.GetData(), VertWeights.Num());
+                                }
+                            }
+                        }
+                    }
+                    ++GlobalSoftIdx;
+                }
+            }
+        }
+    }
+
+    TArray<NGon::FNGonSceneBoneInit> SceneBonesInit;
+    SceneBonesInit.Reserve(SkeletonBones.Num());
+    for (const FNGonBoneEntry& Entry : SkeletonBones)
+    {
+        NGon::FNGonSceneBoneInit InitBone;
+        InitBone.BoneIndex = Entry.BoneIndex;
+        InitBone.ParentIndex = Entry.ParentIndex;
+        InitBone.Name = Entry.Name;
+        InitBone.RefLocalTransform = Entry.LocalTransform;
+        InitBone.RefComponentTransform = Entry.ComponentTransform;
+        SceneBonesInit.Add(InitBone);
+    }
+
+    // Prefer selecting spine_01 or pelvis by default if present so the joint gizmo is immediately ready on the torso
+    const int32 Spine01Idx = RefSkeleton.FindBoneIndex(TEXT("spine_01"));
+    const int32 PelvisIdx = RefSkeleton.FindBoneIndex(TEXT("pelvis"));
+    if (Spine01Idx != INDEX_NONE)
+    {
+        SelectedBoneIndex = Spine01Idx;
+    }
+    else if (PelvisIdx != INDEX_NONE)
+    {
+        SelectedBoneIndex = PelvisIdx;
+    }
+
     StaticMeshAssetPath.Reset();
     SkeletalMeshAssetPath = Asset.GetSoftObjectPath().ToString();
     ActiveUpperTab = ENGonRightUpperTab::SkeletonTree;
@@ -3384,6 +5361,17 @@ void SNGonPreview::LoadSkeletalMesh(const FAssetData& Asset)
     RebuildMorphTargetList();
 
     ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("SkeletalMeshType", "Skeletal Mesh"));
+
+    NGon::SetSceneSkeleton(&Viewport->Preview(), SceneBonesInit, ExtractedSkinWeights);
+    if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+    {
+        NGon::SelectSceneBone(&Viewport->Preview(), SelectedBoneIndex, true);
+        if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
+        {
+            Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
+        }
+    }
+    Viewport->Invalidate();
 }
 
 FReply SNGonPreview::ReloadDefault()
@@ -3423,6 +5411,7 @@ bool SNGonPreview::TryLoadFbx(const FString& Filename, FText& Error)
     RebuildMorphTargetList();
 
     ShowMesh(MoveTemp(Data), Name, LOCTEXT("FbxType", "FBX Polygon Mesh"));
+    NGon::ClearSceneSkeleton(&Viewport->Preview());
     if (bTriangleOnly)
     {
         ShowError(LOCTEXT("FbxIsTriangulated", "This FBX contains triangulated faces only. Export it with Triangulate disabled to preview authored polygons."));
@@ -3457,6 +5446,25 @@ FReply SNGonPreview::OpenFbx()
 
 void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const FText& InSourceType)
 {
+    TArray<FTiPaintUVTriangle> PaintTriangles;
+    if (Data.Mesh.HasAttributes() && Data.Mesh.Attributes()->PrimaryUV())
+    {
+        const UE::Geometry::FDynamicMeshUVOverlay* UVs = Data.Mesh.Attributes()->PrimaryUV();
+        PaintTriangles.Reserve(Data.Mesh.TriangleCount());
+        for (const int32 TriangleId : Data.Mesh.TriangleIndicesItr())
+        {
+            if (!UVs->IsSetTriangle(TriangleId))
+            {
+                continue;
+            }
+            const UE::Geometry::FIndex3i UVIds = UVs->GetTriangle(TriangleId);
+            FTiPaintUVTriangle& Triangle = PaintTriangles.AddDefaulted_GetRef();
+            for (int32 Corner = 0; Corner < 3; ++Corner)
+            {
+                Triangle.UV[Corner] = UVs->IsElement(UVIds[Corner]) ? UVs->GetElement(UVIds[Corner]) : FVector2f::ZeroVector;
+            }
+        }
+    }
     SourceLabel = SourceName;
     SourceTypeLabel = InSourceType;
     ErrorText = FText::GetEmpty();
@@ -3465,6 +5473,10 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const
     Bend = 0.0f;
     NGon::SetActiveViewportUVMesh(Data, SourceName, InSourceType);
     Viewport->SetMesh(MoveTemp(Data));
+    if (Painter.IsValid())
+    {
+        Painter->ResetForMesh(PaintTriangles);
+    }
     Viewport->Preview().SetShowEdges(bShowEdges);
     Viewport->Preview().SetShowVertices(bShowVertices);
     ApplySoftSelectionSettings();

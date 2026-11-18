@@ -24,9 +24,23 @@ void STiPaintCanvas::Construct(const FArguments&, const TSharedRef<FTiPaintDocum
     Document = InDocument;
 }
 
+void STiPaintCanvas::SetDocument(const TSharedRef<FTiPaintDocument>& InDocument)
+{
+    Document = InDocument;
+    bStroke = false;
+    bPan = false;
+    Fit();
+}
+
 void STiPaintCanvas::Fit()
 {
     bNeedsFit = true;
+    Invalidate(EInvalidateWidgetReason::Paint);
+}
+
+void STiPaintCanvas::SetUVTriangles(const TArray<FTiPaintUVTriangle>& InTriangles)
+{
+    UVTriangles = InTriangles;
     Invalidate(EInvalidateWidgetReason::Paint);
 }
 
@@ -91,6 +105,21 @@ int32 STiPaintCanvas::OnPaint(const FPaintArgs&, const FGeometry& Geometry, cons
         }
     }
     FSlateDrawElement::MakeLines(Out, Layer + 3, Geometry.ToPaintGeometry(), { TL, FVector2D(BR.X, TL.Y), BR, FVector2D(TL.X, BR.Y), TL }, ESlateDrawEffect::None, FLinearColor(0.5f, 0.8f, 1.0f), false, 2.0f);
+    for (const FTiPaintUVTriangle& Triangle : UVTriangles)
+    {
+        const FVector2D A = UVToScreen(Geometry, Triangle.UV[0]);
+        const FVector2D B = UVToScreen(Geometry, Triangle.UV[1]);
+        const FVector2D C = UVToScreen(Geometry, Triangle.UV[2]);
+        if ((A.X < -8.0 && B.X < -8.0 && C.X < -8.0) ||
+            (A.X > Size.X + 8.0 && B.X > Size.X + 8.0 && C.X > Size.X + 8.0) ||
+            (A.Y < -8.0 && B.Y < -8.0 && C.Y < -8.0) ||
+            (A.Y > Size.Y + 8.0 && B.Y > Size.Y + 8.0 && C.Y > Size.Y + 8.0))
+        {
+            continue;
+        }
+        FSlateDrawElement::MakeLines(Out, Layer + 4, Geometry.ToPaintGeometry(),
+            { A, B, C, A }, ESlateDrawEffect::None, FLinearColor(0.22f, 0.72f, 1.0f, 0.70f), false, 1.0f);
+    }
     if (bStroke)
     {
         const FVector2D Cursor = UVToScreen(Geometry, LastUV);
@@ -140,7 +169,39 @@ void STiPaintEditor::Construct(const FArguments&)
         + SVerticalBox::Slot().AutoHeight()[MakeStatus()]];
 }
 
-void STiPaintEditor::Refresh() { if (Canvas.IsValid()) Canvas->Invalidate(EInvalidateWidgetReason::Paint); }
+void STiPaintEditor::SetUVTriangles(const TArray<FTiPaintUVTriangle>& InTriangles)
+{
+    if (Canvas.IsValid())
+    {
+        Canvas->SetUVTriangles(InTriangles);
+    }
+}
+
+void STiPaintEditor::SetPaintedCallback(TFunction<void(const TArray<FColor>&, int32, int32)> InCallback)
+{
+    PaintedCallback = MoveTemp(InCallback);
+}
+
+void STiPaintEditor::ResetForMesh(const TArray<FTiPaintUVTriangle>& InTriangles)
+{
+    Document = MakeShared<FTiPaintDocument>();
+    Document->SetChanged([this] { Refresh(); });
+    SetUVTriangles(InTriangles);
+    if (Canvas.IsValid())
+    {
+        Canvas->SetDocument(Document);
+    }
+    Refresh();
+}
+
+void STiPaintEditor::Refresh()
+{
+    if (Canvas.IsValid()) Canvas->Invalidate(EInvalidateWidgetReason::Paint);
+    if (PaintedCallback)
+    {
+        PaintedCallback(Document->Composite(), Document->Width(), Document->Height());
+    }
+}
 void STiPaintEditor::SetMode(ETiPaintMode Mode) { FTiPaintBrush Brush = Document->Brush(); Brush.Mode = Mode; Document->SetBrush(Brush); Refresh(); }
 FReply STiPaintEditor::Export()
 {

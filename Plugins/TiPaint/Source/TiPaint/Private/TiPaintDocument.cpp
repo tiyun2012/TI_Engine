@@ -66,6 +66,10 @@ void FTiPaintDocument::BeginStroke(float U, float V)
     bStroking = true;
     LastUV = FVector2f(FMath::Clamp(U, 0.0f, 1.0f), FMath::Clamp(V, 0.0f, 1.0f));
     Stamp(U, V);
+    // Notify once per input event.  StampAtPixel used to notify for every pixel
+    // in the brush footprint, which caused the NGon preview texture and render
+    // resource to be rebuilt dozens of times for one mouse event.
+    MarkChanged();
 }
 
 void FTiPaintDocument::AddStrokePoint(float U, float V)
@@ -81,13 +85,13 @@ void FTiPaintDocument::AddStrokePoint(float U, float V)
         Stamp(FMath::Lerp(LastUV.X, Current.X, T), FMath::Lerp(LastUV.Y, Current.Y, T));
     }
     LastUV = Current;
+    MarkChanged();
 }
 
 void FTiPaintDocument::EndStroke()
 {
     if (!bStroking) return;
     bStroking = false;
-    MarkChanged();
 }
 
 void FTiPaintDocument::CancelStroke()
@@ -134,7 +138,6 @@ void FTiPaintDocument::StampAtPixel(int32 X, int32 Y)
             }
         }
     }
-    MarkChanged();
 }
 
 void FTiPaintDocument::Undo()
