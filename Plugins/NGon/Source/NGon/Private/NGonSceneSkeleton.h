@@ -9,8 +9,6 @@ class FPrimitiveDrawInterface;
 class FSceneView;
 class FViewport;
 class FCanvas;
-class UCombinedTransformGizmo;
-class UInteractiveGizmoManager;
 
 #ifndef NGON_SCENE_BONE_BRIDGE_DECLARED
 #define NGON_SCENE_BONE_BRIDGE_DECLARED
@@ -88,9 +86,6 @@ void GetSceneSnapSettings(
     float& OutRotStepDeg,
     bool& OutSnapScale,
     float& OutScaleStep);
-void SetSceneFlatShading(FNGonPreviewScene* Scene, bool bFlatShading);
-bool IsSceneFlatShading(const FNGonPreviewScene* Scene);
-bool HasActiveSceneGizmoTarget(const FNGonPreviewScene* Scene);
 bool IsUtilityNonDeformingBoneName(const FName& Name);
 } // namespace NGon
 #endif // NGON_SCENE_BONE_BRIDGE_DECLARED
@@ -155,9 +150,6 @@ struct FNGonSceneAccel
     bool bBoneDragActive = false;
     bool bPendingSkinningUpdate = false;
     bool bPendingFullSkinReset = false;
-    bool bFlatShading = true;
-    bool bPendingShadingUpdate = false;
-    bool bHasActiveGizmoTarget = false;
 
     FTransform DragStartGizmoTransform = FTransform::Identity;
     FTransform DragStartBoneLocalTransform = FTransform::Identity;
@@ -417,8 +409,4 @@ struct FNGonSceneAccel
 
 FNGonSceneAccel& GetSceneAccel(const FNGonPreviewScene* Scene);
 void RemoveSceneAccel(const FNGonPreviewScene* Scene);
-void BindGizmoActorViewContext(
-    UCombinedTransformGizmo* TransformGizmo,
-    UInteractiveGizmoManager* GizmoManager,
-    bool bMarkRenderStateDirty);
 } // namespace NGon

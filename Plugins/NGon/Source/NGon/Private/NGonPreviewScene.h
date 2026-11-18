@@ -15,8 +15,9 @@ class UPreviewGeometry;
 class UInteractiveGizmoManager;
 class UCombinedTransformGizmo;
 class UTransformProxy;
+class UGizmoViewContext;
+class UMaterialInstanceDynamic;
 class UTexture2D;
-class IToolContextTransactionProvider;
 
 /** Coordinate frame used by the component gizmo. WeightedAverage matches Maya's
  * multi-component behavior; ActiveElement uses the most recently picked item. */
@@ -44,19 +45,21 @@ public:
 
     FPreviewScene& GetPreviewScene() { return Scene; }
     const FBox& GetRestBounds() const { return Topology.RestBounds; }
-    FBox GetSelectionOrRestBounds() const;
+    FBox GetMeshBounds() const;
+    FBox GetSelectionOrMeshBounds() const;
 
     void SetMesh(FNGonMeshData&& Data);
     void SetOverlayMaterials(UInteractiveToolManager* ToolManager);
     void SetShowEdges(bool bShow);
     void SetShowVertices(bool bShow);
     void SetHeatmapVisible(bool bShow);
+    void SetFlatShading(bool bEnable);
     /** Apply the TiPaint composite to the preview surface using each corner's UV. */
     void SetPaintTexture(const TArray<FColor>& Pixels, int32 Width, int32 Height);
     void ClearPaintTexture();
     void SetHeatBias(float Value);
     void SetBend(float Value);
-    void SetupGizmo(UInteractiveGizmoManager* GizmoManager, IToolContextTransactionProvider* TransactionProvider);
+    void SetupGizmo(UInteractiveGizmoManager* GizmoManager, UGizmoViewContext* ViewContext);
     void TeardownGizmo();
     void UpdateGizmo();
     void SetSoftSelection(const FNGonSoftSelectionSettings& Settings);
@@ -73,8 +76,9 @@ public:
     FTransform GetSelectionGizmoTransform() const;
     void SetGizmoFramePolicy(ENGonGizmoFramePolicy InPolicy) { GizmoFramePolicy = InPolicy; UpdateGizmo(); }
     ENGonGizmoFramePolicy GetGizmoFramePolicy() const { return GizmoFramePolicy; }
-    void SetGizmoMode(ENGonGizmoMode InMode) { GizmoMode = InMode; UpdateGizmo(); }
+    void SetGizmoMode(ENGonGizmoMode InMode);
     ENGonGizmoMode GetGizmoMode() const { return GizmoMode; }
+    bool HasGizmoTarget() const;
     int32 Pick(ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd);
     void BoxSelect(ENGonElement Element, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
@@ -87,17 +91,23 @@ public:
     const FNGonTopology& GetTopology() const { return Topology; }
 
 private:
+#if WITH_DEV_AUTOMATION_TESTS
+    friend class FNGonViewportGizmoModesTest;
+    friend class FNGonPreviewMaterialTest;
+#endif
+
     struct FColorElement
     {
         int32 OverlayId;
         int32 LogicalVertex;
         int32 Face;
-        FVector2f UV = FVector2f::ZeroVector;
     };
 
     void InitializeColorOverlay(UE::Geometry::FDynamicMesh3& Mesh);
+    FVector4f EncodeOverlayColor(const FColorElement& Element, bool bUseSoftHeat) const;
     void WriteColors(UE::Geometry::FDynamicMesh3& Mesh) const;
     void UpdateColors();
+    void NotifySurfacePositionsChanged(UE::Geometry::FDynamicMesh3& Mesh);
     void RebuildOverlays();
     void UpdateOverlayPositions();
     void UpdateSelection(ENGonElement Element, int32 Id, bool bAdd);
@@ -114,7 +124,9 @@ private:
 
     FPreviewScene Scene;
     TStrongObjectPtr<UPreviewGeometry> Overlay;
+    TStrongObjectPtr<UTexture2D> EmptyPaintTexture;
     TStrongObjectPtr<UTexture2D> PaintTexture;
+    UMaterialInstanceDynamic* SurfaceMaterial = nullptr;
     UDynamicMeshComponent* Surface = nullptr;
     ULineSetComponent* EdgeLines = nullptr;
     UPointSetComponent* VertexPoints = nullptr;
@@ -136,6 +148,8 @@ private:
     TArray<FColorElement> ColorElements;
     int32 ImportedSampleCount = 0;
     bool bHeatmapVisible = false;
+    bool bFlatShading = true;
+    bool bSmoothNormalsDirty = false;
     float HeatBias = 0.0f;
     float Bend = 0.0f;
     int32 TopologyUpdates = 0;
@@ -147,16 +161,10 @@ private:
     FNGonSoftTransformSession SoftSession;
     TArray<FNGonVertexInfluence> SoftInfluences;
     TArray<float> SoftHeatSamples;
-    TArray<FColor> PaintPixels;
-    int32 PaintWidth = 0;
-    int32 PaintHeight = 0;
-    bool bPaintVisible = false;
-    TArray<FVector> SoftOriginalPositions;
     FTransform ActiveGizmoTransform = FTransform::Identity;
     ENGonGizmoFramePolicy GizmoFramePolicy = ENGonGizmoFramePolicy::WeightedAverage;
-    ENGonGizmoMode GizmoMode = ENGonGizmoMode::Combined;
+    ENGonGizmoMode GizmoMode = ENGonGizmoMode::Translate;
     UInteractiveGizmoManager* GizmoManager = nullptr;
     UCombinedTransformGizmo* TransformGizmo = nullptr;
     UTransformProxy* TransformProxy = nullptr;
-    bool bUpdatingGizmo = false;
 };

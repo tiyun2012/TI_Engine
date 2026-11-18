@@ -1,17 +1,9 @@
 #include "NGonSceneSkeleton.h"
 #include "NGonPreviewScene.h"
 
-#include "BaseGizmos/CombinedTransformGizmo.h"
-#include "BaseGizmos/GizmoBaseComponent.h"
-#include "BaseGizmos/GizmoViewContext.h"
-#include "BaseGizmos/ViewAdjustedStaticMeshGizmoComponent.h"
 #include "CanvasItem.h"
 #include "CanvasTypes.h"
-#include "ContextObjectStore.h"
 #include "Engine/Engine.h"
-#include "Engine/StaticMesh.h"
-#include "InteractiveGizmoManager.h"
-#include "PhysicsEngine/BodySetup.h"
 #include "SceneManagement.h"
 #include "SceneView.h"
 #include "UnrealClient.h"
@@ -31,72 +23,6 @@ FNGonSceneAccel& GetSceneAccel(const FNGonPreviewScene* Scene)
 void RemoveSceneAccel(const FNGonPreviewScene* Scene)
 {
     GSceneAccelMap.Remove(Scene);
-}
-
-void BindGizmoActorViewContext(UCombinedTransformGizmo* TransformGizmo, UInteractiveGizmoManager* GizmoManager, bool bMarkRenderStateDirty)
-{
-    if (!TransformGizmo || !GizmoManager)
-    {
-        return;
-    }
-
-    UContextObjectStore* ContextStore = GizmoManager->GetContextObjectStore();
-    if (!ContextStore)
-    {
-        return;
-    }
-
-    UGizmoViewContext* ViewContext = ContextStore->FindContext<UGizmoViewContext>();
-    if (!ViewContext)
-    {
-        ViewContext = NewObject<UGizmoViewContext>(GizmoManager);
-        ContextStore->AddContextObject(ViewContext);
-    }
-
-    if (AActor* GizmoActor = TransformGizmo->GetGizmoActor())
-    {
-        TInlineComponentArray<UGizmoBaseComponent*> GizmoComponents(GizmoActor);
-        for (UGizmoBaseComponent* Comp : GizmoComponents)
-        {
-            if (Comp)
-            {
-                Comp->SetGizmoViewContext(ViewContext);
-                if (bMarkRenderStateDirty)
-                {
-                    Comp->NotifyExternalPropertyUpdates();
-                    Comp->MarkRenderStateDirty();
-                }
-            }
-        }
-
-        // In UE 5.5–5.8, ACombinedTransformGizmoActor uses UViewAdjustedStaticMeshGizmoComponent
-        // (which inherits from UStaticMeshComponent, not UGizmoBaseComponent) for its handles.
-        // Ensure both GizmoViewContext and physics collision state are initialized for line traces.
-        TInlineComponentArray<UViewAdjustedStaticMeshGizmoComponent*> ViewAdjustedComponents(GizmoActor);
-        for (UViewAdjustedStaticMeshGizmoComponent* ViewComp : ViewAdjustedComponents)
-        {
-            if (ViewComp)
-            {
-                ViewComp->SetGizmoViewContext(ViewContext);
-                if (bMarkRenderStateDirty)
-                {
-                    if (UStaticMesh* StaticMesh = ViewComp->GetStaticMesh())
-                    {
-                        if (UBodySetup* BodySetup = StaticMesh->GetBodySetup())
-                        {
-                            BodySetup->CreatePhysicsMeshes();
-                        }
-                    }
-                    if (ViewComp->GetCollisionEnabled() == ECollisionEnabled::NoCollision)
-                    {
-                        ViewComp->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
-                    }
-                    ViewComp->RecreatePhysicsState();
-                    ViewComp->MarkRenderStateDirty();
-                }
-            }
-        }
-    }
 }
 
 } // namespace NGon
@@ -432,6 +358,8 @@ void ClearSceneSkeleton(FNGonPreviewScene* Scene)
     Accel.SelectedBoneIndex = INDEX_NONE;
     Accel.bBoneGizmoActive = false;
     Accel.bBoneDragActive = false;
+    Accel.bPendingSkinningUpdate = false;
+    Accel.bPendingFullSkinReset = false;
     Scene->UpdateGizmo();
 }
 
@@ -887,28 +815,6 @@ void GetSceneSnapSettings(
     OutRotStepDeg = Accel.RotationSnapStep;
     OutSnapScale = Accel.bSnapScale;
     OutScaleStep = Accel.ScaleSnapStep;
-}
-
-void SetSceneFlatShading(FNGonPreviewScene* Scene, bool bFlatShading)
-{
-    if (!Scene)
-    {
-        return;
-    }
-    FNGonSceneAccel& Accel = GetSceneAccel(Scene);
-    Accel.bFlatShading = bFlatShading;
-    Accel.bPendingShadingUpdate = true;
-    Scene->UpdateGizmo();
-}
-
-bool IsSceneFlatShading(const FNGonPreviewScene* Scene)
-{
-    return !Scene || GetSceneAccel(Scene).bFlatShading;
-}
-
-bool HasActiveSceneGizmoTarget(const FNGonPreviewScene* Scene)
-{
-    return Scene && GetSceneAccel(Scene).bHasActiveGizmoTarget;
 }
 
 bool IsUtilityNonDeformingBoneName(const FName& Name)

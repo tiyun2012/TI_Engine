@@ -2,14 +2,17 @@
 
 #include "NGonMeshFiles.h"
 #include "NGonPicking.h"
+#include "NGonPreviewScene.h"
 #include "NGonTopology.h"
 
+#include "Components/DynamicMeshComponent.h"
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "HAL/FileManager.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
+#include "UDynamicMesh.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FNGonDemoTopologyTest, "NGon.TopologyAndPicking",
@@ -72,6 +75,48 @@ bool FNGonDemoTopologyTest::RunTest(const FString& Parameters)
         Picker.PickFace(FVector(-100, 0, 150), Down), 0);
     TestEqual(TEXT("Ray from below the moved mesh misses"),
         Picker.PickFace(FVector(-100, 0, 50), Down), INDEX_NONE);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FNGonPreviewMaterialTest, "NGon.Preview.PaintAndSelection",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FNGonPreviewMaterialTest::RunTest(const FString& Parameters)
+{
+    FNGonMeshData Data;
+    FText Error;
+    if (!TestTrue(TEXT("Build demo mesh"), NGon::MakeDemo(Data, Error)))
+    {
+        AddError(Error.ToString());
+        return false;
+    }
+
+    FNGonPreviewScene Scene;
+    Scene.SetMesh(MoveTemp(Data));
+    Scene.SelectElement(ENGonElement::Face, 0);
+    FNGonSoftSelectionSettings Settings;
+    Settings.bEnabled = true;
+    Scene.SetSoftSelection(Settings);
+    Scene.SetHeatmapVisible(true);
+
+    const UMaterialInterface* Material = Scene.Surface->GetMaterial(0);
+    const auto& Mesh = Scene.Surface->GetDynamicMesh()->GetMeshRef();
+    const auto* Colors = Mesh.Attributes()->PrimaryColors();
+    const int32 Triangle = Scene.GetTopology().Faces.FindChecked(0).Triangles[0];
+    const int32 ColorElement = Colors->GetTriangle(Triangle).A;
+    const FVector4f SelectionAndHeat = Colors->GetElement(ColorElement);
+    TestTrue(TEXT("Selected face and heatmap channels set"), SelectionAndHeat.Y == 1.0f && SelectionAndHeat.Z == 1.0f);
+
+    TArray<FColor> Pixels;
+    Pixels.Init(FColor(0, 0, 255, 255), 4);
+    Scene.SetPaintTexture(Pixels, 2, 2);
+    TestTrue(TEXT("Preview paint texture uploaded"), Scene.PaintTexture.IsValid());
+    TestTrue(TEXT("Paint upload uses the existing surface material"), Scene.Surface->GetMaterial(0) == Material);
+    TestTrue(TEXT("Paint preserves face selection and heatmap channels"), Colors->GetElement(ColorElement) == SelectionAndHeat);
+    Scene.ClearPaintTexture();
+    TestFalse(TEXT("Clearing paint releases the paint texture"), Scene.PaintTexture.IsValid());
+    TestTrue(TEXT("Clearing paint preserves the surface material"), Scene.Surface->GetMaterial(0) == Material);
     return true;
 }
 

@@ -30,7 +30,6 @@
 namespace NGon
 {
 void SetActiveViewportUVMesh(const FNGonMeshData& Data, const FText& InSourceName, const FText& InSourceType);
-void UpdateActiveViewportUVMeshFromTopology(const FNGonTopology& Topology);
 void NotifyHostViewportClosed();
 }
 
@@ -62,10 +61,6 @@ void SNGonPreview::Construct(const FArguments& InArgs)
             GetSkeletonTreeUIState(this).SelectedSocketIndex = INDEX_NONE;
             SelectedBoneIndex = PickedBoneIdx;
             ActiveLowerTab = ENGonRightLowerTab::Details;
-            if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
-            {
-                Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
-            }
             RebuildSkeletonTreeList();
         }
     };
@@ -172,6 +167,15 @@ void SNGonPreview::Construct(const FArguments& InArgs)
     }
 }
 
+SNGonPreview::~SNGonPreview()
+{
+    NGon::RemoveSkeletonTreeUIState(this);
+    if (Painter)
+    {
+        Painter->SetPaintedCallback({});
+    }
+    NGon::NotifyHostViewportClosed();
+}
 
 void SNGonPreview::ApplySoftSelectionSettings()
 {
@@ -213,9 +217,7 @@ FReply SNGonPreview::LoadDemo()
         RebuildMorphTargetList();
         bShowEdges = true;
         bShowVertices = true;
-        NGon::SetSceneFlatShading(&Viewport->Preview(), true);
         ShowMesh(MoveTemp(Data), LOCTEXT("DemoName", "Demo Mesh"), LOCTEXT("DemoType", "Procedural N-Gon"));
-        NGon::ClearSceneSkeleton(&Viewport->Preview());
     }
     else
     {
@@ -257,11 +259,10 @@ void SNGonPreview::LoadStaticMesh(const FAssetData& Asset)
     RebuildSkeletonTreeList();
     RebuildMorphTargetList();
 
-    bShowEdges = true;
-    bShowVertices = true;
-    NGon::SetSceneFlatShading(&Viewport->Preview(), true);
-    ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("StaticMeshType", "Static Mesh"));
-    NGon::ClearSceneSkeleton(&Viewport->Preview());
+    bShowEdges = !bTriangleOnly;
+    bShowVertices = false;
+    ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("StaticMeshType", "Static Mesh"),
+        ENGonViewportShading::Smooth);
     if (bTriangleOnly)
     {
         ShowError(LOCTEXT("TrianglesOnly",
@@ -522,20 +523,15 @@ void SNGonPreview::LoadSkeletalMesh(const FAssetData& Asset)
     // Match native UE5 Skeletal Mesh Editor: smooth lit surface with mesh edges hidden by default (toggleable via Alt+9)
     bShowEdges = false;
     bShowVertices = false;
-    SkelUIState.ShadingMode = 0; // Lit Smooth
     SkelUIState.BoneDrawMode = 2; // Selected Bone Only (matching image_3b0306.jpg)
 
-    ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("SkeletalMeshType", "Skeletal Mesh"));
-    NGon::SetSceneFlatShading(&Viewport->Preview(), false);
+    ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("SkeletalMeshType", "Skeletal Mesh"),
+        ENGonViewportShading::Smooth);
 
     NGon::SetSceneSkeleton(&Viewport->Preview(), SceneBonesInit, ExtractedSkinWeights);
     if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
     {
         NGon::SelectSceneBone(&Viewport->Preview(), SelectedBoneIndex, true);
-        if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
-        {
-            Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
-        }
     }
     Viewport->Invalidate();
 }
@@ -576,11 +572,9 @@ bool SNGonPreview::TryLoadFbx(const FString& Filename, FText& Error)
     RebuildSkeletonTreeList();
     RebuildMorphTargetList();
 
-    bShowEdges = true;
-    bShowVertices = true;
-    NGon::SetSceneFlatShading(&Viewport->Preview(), true);
+    bShowEdges = !bTriangleOnly;
+    bShowVertices = false;
     ShowMesh(MoveTemp(Data), Name, LOCTEXT("FbxType", "FBX Polygon Mesh"));
-    NGon::ClearSceneSkeleton(&Viewport->Preview());
     if (bTriangleOnly)
     {
         ShowError(LOCTEXT("FbxIsTriangulated", "This FBX contains triangulated faces only. Export it with Triangulate disabled to preview authored polygons."));
@@ -613,7 +607,8 @@ FReply SNGonPreview::OpenFbx()
     return FReply::Handled();
 }
 
-void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const FText& InSourceType)
+void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const FText& InSourceType,
+    ENGonViewportShading Shading)
 {
     TArray<FTiPaintUVTriangle> PaintTriangles;
     if (Data.Mesh.HasAttributes() && Data.Mesh.Attributes()->PrimaryUV())
@@ -642,6 +637,7 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const
     Bend = 0.0f;
     NGon::SetActiveViewportUVMesh(Data, SourceName, InSourceType);
     Viewport->SetMesh(MoveTemp(Data));
+    Viewport->SetShadingMode(Shading);
     if (Painter.IsValid())
     {
         Painter->ResetForMesh(PaintTriangles);

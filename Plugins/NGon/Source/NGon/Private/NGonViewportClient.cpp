@@ -8,33 +8,33 @@
 #include "CanvasItem.h"
 #include "CanvasTypes.h"
 #include "ContextObjectStore.h"
-#include "EditorModeManager.h"
 #include "EditorViewportClient.h"
-#include "UnrealWidget.h"
 #include "Framework/Application/SlateApplication.h"
 #include "InputCoreTypes.h"
 #include "InputRouter.h"
 #include "InputState.h"
 #include "InteractiveGizmoManager.h"
+#include "InteractiveToolChange.h"
 #include "InteractiveToolManager.h"
+#include "InteractiveToolsContext.h"
+#include "Materials/Material.h"
+#include "SceneManagement.h"
 #include "SceneView.h"
-#include "Tools/EdModeInteractiveToolsContext.h"
+#include "Slate/SceneViewport.h"
+#include "ToolContextInterfaces.h"
+#include "Widgets/SViewport.h"
 
 namespace NGon
 {
-void SetActiveViewportUVMesh(const FNGonMeshData& Data, const FText& InSourceName, const FText& InSourceType);
 void UpdateActiveViewportUVMeshFromTopology(const FNGonTopology& Topology);
-void NotifyHostViewportClosed();
 }
 
 using NGon::FNGonSkeletonTreeUIState;
-using NGon::GetSkeletonTreeUIState;
 using NGon::FindUIStateByViewport;
-
-#define LOCTEXT_NAMESPACE "NGonViewportClient"
 
 namespace
 {
+// Keep both objects alive until after FEditorViewportClient is destroyed.
 struct FNGonPreviewSceneOwner
 {
     explicit FNGonPreviewSceneOwner(const TSharedRef<FNGonPreviewScene>& InPreview)
@@ -45,17 +45,39 @@ struct FNGonPreviewSceneOwner
     }
 
     TSharedRef<FNGonPreviewScene> PreviewOwner;
-    TSharedPtr<FAssetEditorModeManager> ModeToolsOwner;
+    TSharedRef<FAssetEditorModeManager> ModeToolsOwner;
 };
 
-class FNGonViewportClient final : private FNGonPreviewSceneOwner, public FEditorViewportClient
+class FNGonGizmoRenderContext final : public IToolsContextRenderAPI
+{
+public:
+    FNGonGizmoRenderContext(const FSceneView* InView, FPrimitiveDrawInterface* InPDI,
+        const FViewCameraState& InCamera, EViewInteractionState InInteraction)
+        : View(InView), PDI(InPDI), Camera(InCamera), Interaction(InInteraction)
+    {
+    }
+
+    FPrimitiveDrawInterface* GetPrimitiveDrawInterface() override { return PDI; }
+    const FSceneView* GetSceneView() override { return View; }
+    FViewCameraState GetCameraState() override { return Camera; }
+    EViewInteractionState GetViewInteractionState() override { return Interaction; }
+
+private:
+    const FSceneView* View;
+    FPrimitiveDrawInterface* PDI;
+    const FViewCameraState& Camera;
+    EViewInteractionState Interaction;
+};
+
+class FNGonViewportClient final : private FNGonPreviewSceneOwner, public FEditorViewportClient,
+    private IToolsContextQueriesAPI, private IToolsContextTransactionsAPI
 {
 public:
     FNGonViewportClient(
         const TSharedRef<FNGonPreviewScene>& InPreview,
         const TSharedRef<SNGonViewport>& InWidget)
         : FNGonPreviewSceneOwner(InPreview)
-        , FEditorViewportClient(ModeToolsOwner.Get(), &InPreview->GetPreviewScene(), InWidget)
+        , FEditorViewportClient(&ModeToolsOwner.Get(), &InPreview->GetPreviewScene(), InWidget)
         , ViewportWidget(InWidget)
     {
         SetViewportType(LVT_Perspective);
@@ -67,42 +89,31 @@ public:
         EngineShowFlags.SetEyeAdaptation(false);
         EngineShowFlags.SetPostProcessing(false);
         EngineShowFlags.SetModeWidgets(true);
+        ModeToolsOwner->SetWidgetMode(UE::Widget::WM_None);
 
-        if (FEditorModeTools* ViewportModeTools = GetModeTools())
+        // This context uses the preview world and only receives NGon's mouse events.
+        ToolsContext.Reset(NewObject<UInteractiveToolsContext>());
+        ToolsContext->Initialize(this, this);
+        UInteractiveToolManager* ToolManager = ToolsContext->ToolManager.Get();
+        UContextObjectStore* ContextStore = ToolManager->GetContextObjectStore();
+        UE::TransformGizmoUtil::RegisterTransformGizmoContextObject(ToolsContext.Get());
+        GizmoViewContext = ContextStore->FindContext<UGizmoViewContext>();
+        if (!GizmoViewContext)
         {
-            ViewportModeTools->ActivateDefaultMode();
-            ViewportModeTools->SetWidgetMode(UE::Widget::WM_None);
-
-            if (UModeManagerInteractiveToolsContext* ToolsContext = ViewportModeTools->GetInteractiveToolsContext();
-                ToolsContext && ToolsContext->ToolManager && ToolsContext->GizmoManager && ToolsContext->InputRouter)
-            {
-                InteractiveToolsContext = ToolsContext;
-                ToolManager = ToolsContext->ToolManager.Get();
-                GizmoManager = ToolsContext->GizmoManager.Get();
-                InputRouter = ToolsContext->InputRouter.Get();
-
-                ToolsContext->SetViewportInteractionsEnabled(false);
-
-                // Register UCombinedTransformGizmoContextObject and UGizmoViewContext so
-                // ACombinedTransformGizmoActor's UViewAdjustedStaticMeshGizmoComponents
-                // and view-based transform adjusters receive a valid UGizmoViewContext.
-                UE::TransformGizmoUtil::RegisterTransformGizmoContextObject(ToolsContext);
-
-                if (UContextObjectStore* ContextStore = ToolManager->GetContextObjectStore())
-                {
-                    GizmoViewContext = ContextStore->FindContext<UGizmoViewContext>();
-                    if (!GizmoViewContext)
-                    {
-                        GizmoViewContext = NewObject<UGizmoViewContext>(ToolManager);
-                        ContextStore->AddContextObject(GizmoViewContext);
-                    }
-                }
-
-                ToolManager->ConfigureChangeTrackingMode(EToolChangeTrackingMode::NoChangeTracking);
-                PreviewOwner->SetOverlayMaterials(ToolManager);
-                PreviewOwner->SetupGizmo(GizmoManager, nullptr);
-            }
+            GizmoViewContext = NewObject<UGizmoViewContext>(ToolsContext.Get());
+            ContextStore->AddContextObject(GizmoViewContext);
         }
+
+        PreviewOwner->SetOverlayMaterials(ToolManager);
+        PreviewOwner->SetupGizmo(ToolsContext->GizmoManager.Get(), GizmoViewContext);
+    }
+
+    ~FNGonViewportClient() override
+    {
+        ToolsContext->InputRouter->ForceTerminateAll();
+        PreviewOwner->TeardownGizmo();
+        UE::TransformGizmoUtil::DeregisterTransformGizmoContextObject(ToolsContext.Get());
+        ToolsContext->Shutdown();
     }
 
     void SetGridShowFlag(bool bVisible)
@@ -111,717 +122,209 @@ public:
         Invalidate();
     }
 
+    void FrameBounds(const FBox& Bounds, bool bSetInitialDirection)
+    {
+        if (!Bounds.IsValid)
+        {
+            return;
+        }
+        if (bSetInitialDirection && IsPerspective())
+        {
+            const FVector Size = Bounds.GetSize();
+            FVector FromTarget(-0.32, -0.50, 0.80);
+            if (Size.Y < FMath::Min(Size.X, Size.Z) * 0.25)
+            {
+                FromTarget = FVector(0.25, -1.0, 0.30);
+            }
+            else if (Size.X < FMath::Min(Size.Y, Size.Z) * 0.25)
+            {
+                FromTarget = FVector(-1.0, -0.25, 0.30);
+            }
+            SetViewRotation((-FromTarget).Rotation());
+        }
+        PendingFrameBounds = Bounds.ExpandBy(FMath::Max(Bounds.GetExtent().GetMax() * 0.05, 1.0));
+        ApplyPendingFrame();
+    }
+
     UE::Widget::EWidgetMode GetWidgetMode() const override
     {
-        if (!NGon::HasActiveSceneGizmoTarget(&PreviewOwner.Get()))
-        {
-            return UE::Widget::WM_None;
-        }
-        switch (PreviewOwner->GetGizmoMode())
-        {
-        case ENGonGizmoMode::Translate:
-            return UE::Widget::WM_Translate;
-        case ENGonGizmoMode::Rotate:
-            return UE::Widget::WM_Rotate;
-        case ENGonGizmoMode::Scale:
-            return UE::Widget::WM_Scale;
-        default:
-            return UE::Widget::WM_None;
-        }
-    }
-
-    FVector GetWidgetLocation() const override
-    {
-        return PreviewOwner->GetSelectionGizmoTransform().GetLocation();
-    }
-
-    FMatrix GetWidgetCoordSystem() const override
-    {
-        const bool bWorld = NGon::IsSceneWorldCoordinateSystem(&PreviewOwner.Get())
-            && PreviewOwner->GetGizmoMode() != ENGonGizmoMode::Scale;
-        if (bWorld)
-        {
-            return FMatrix::Identity;
-        }
-        return FQuatRotationMatrix(PreviewOwner->GetSelectionGizmoTransform().GetRotation());
-    }
-
-    ECoordSystem GetWidgetCoordSystemSpace() const override
-    {
-        return (NGon::IsSceneWorldCoordinateSystem(&PreviewOwner.Get())
-            && PreviewOwner->GetGizmoMode() != ENGonGizmoMode::Scale)
-            ? COORD_World
-            : COORD_Local;
-    }
-
-    void TrackingStarted(const struct FInputEventState& InInputState, bool bIsDraggingWidget, bool bNudge) override
-    {
-        FEditorViewportClient::TrackingStarted(InInputState, bIsDraggingWidget, bNudge);
-        if (bIsDraggingWidget && !bDraggingNativeWidget)
-        {
-            bDraggingNativeWidget = true;
-            NativeWidgetStartTransform = PreviewOwner->GetSelectionGizmoTransform();
-            NativeWidgetRawLocation = NativeWidgetStartTransform.GetLocation();
-            NativeWidgetRawRotation = NativeWidgetStartTransform.GetRotation();
-            NativeWidgetRawScale = FVector::OneVector;
-            PreviewOwner->BeginSoftTransform(NativeWidgetStartTransform, PreviewOwner->GetSoftTransformMode());
-        }
-    }
-
-    bool InputWidgetDelta(
-        FViewport* InViewport,
-        EAxisList::Type InCurrentAxis,
-        FVector& Drag,
-        FRotator& Rot,
-        FVector& Scale) override
-    {
-        if (!bDraggingNativeWidget || InCurrentAxis == EAxisList::None)
-        {
-            return false;
-        }
-
-        bool bChanged = false;
-        if (!Drag.IsNearlyZero())
-        {
-            NativeWidgetRawLocation += Drag;
-            bChanged = true;
-        }
-        if (!Rot.IsZero())
-        {
-            NativeWidgetRawRotation = (Rot.Quaternion() * NativeWidgetRawRotation).GetNormalized();
-            bChanged = true;
-        }
-        if (!Scale.IsNearlyZero())
-        {
-            NativeWidgetRawScale = (NativeWidgetRawScale + Scale * 0.025).ComponentMax(FVector(0.05));
-            bChanged = true;
-        }
-
-        if (bChanged)
-        {
-            const FTransform UpdatedTransform(NativeWidgetRawRotation, NativeWidgetRawLocation, NativeWidgetRawScale);
-            PreviewOwner->ApplyGizmoTransform(UpdatedTransform);
-            if (NGon::IsBoneTransformActive(&PreviewOwner.Get()))
-            {
-                if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-                {
-                    if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
-                    {
-                        if (UIState->OnViewportBoneTransformChanged)
-                        {
-                            UIState->OnViewportBoneTransformChanged();
-                        }
-                    }
-                }
-            }
-            Invalidate();
-        }
-        return true;
-    }
-
-    void TrackingStopped() override
-    {
-        if (bDraggingNativeWidget)
-        {
-            bDraggingNativeWidget = false;
-            if (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get()))
-            {
-                PreviewOwner->EndSoftTransform();
-                NGon::UpdateActiveViewportUVMeshFromTopology(PreviewOwner->GetTopology());
-            }
-            if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-            {
-                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
-                {
-                    if (UIState->OnViewportBoneTransformChanged)
-                    {
-                        UIState->OnViewportBoneTransformChanged();
-                    }
-                }
-            }
-            Invalidate();
-        }
-        FEditorViewportClient::TrackingStopped();
-    }
-
-    EMouseCursor::Type GetCursor(FViewport* InViewport, int32 X, int32 Y) override
-    {
-        if (InViewport && !IsAltPressed())
-        {
-            if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())) || NGon::IsBoneTransformActive(&PreviewOwner.Get()))
-            {
-                return EMouseCursor::CardinalCross;
-            }
-            return EMouseCursor::Default;
-        }
-        return FEditorViewportClient::GetCursor(InViewport, X, Y);
+        return UE::Widget::WM_None;
     }
 
     void Tick(float DeltaSeconds) override
     {
-        if (Viewport && bHasPendingGizmoDrag)
-        {
-            FlushPendingGizmoDrag(Viewport);
-        }
         FEditorViewportClient::Tick(DeltaSeconds);
-        if (ToolManager)
+        ApplyPendingFrame();
+        ToolsContext->GizmoManager->Tick(DeltaSeconds);
+        if (bPendingGizmoMove && Viewport)
         {
-            ToolManager->Tick(DeltaSeconds);
-        }
-        if (GizmoManager)
-        {
-            GizmoManager->Tick(DeltaSeconds);
+            UpdateGizmoDrag(Viewport, PendingGizmoMouse);
         }
     }
 
     bool InputKey(const FInputKeyEventArgs& EventArgs) override
     {
-        if (EventArgs.Event == IE_Pressed && EventArgs.Key == EKeys::Escape && (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())))
+        FViewport* InViewport = EventArgs.Viewport;
+        const FKey Key = EventArgs.Key;
+        const bool bPressed = EventArgs.Event == IE_Pressed;
+
+        if (bPressed && Key == EKeys::Escape && PointerAction != EPointerAction::None)
         {
-            if (InputRouter)
-            {
-                InputRouter->ForceTerminateAll();
-            }
-            PreviewOwner->CancelSoftTransform();
-            bLeftMouseButtonDown = false;
-            bHasPendingGizmoDrag = false;
-            bConsumedByGizmo = false;
-            bMarqueeActive = false;
-            bMarqueePending = false;
-            Invalidate();
+            CancelPointerAction();
             return true;
         }
 
-        if (EventArgs.Key == EKeys::LeftMouseButton && EventArgs.Viewport)
+        const bool bNavigating = IsNavigating(InViewport);
+        if (Key == EKeys::LeftMouseButton && InViewport)
         {
-            if (FEditorModeTools* ViewportModeTools = GetModeTools())
+            const FIntPoint Mouse(InViewport->GetMouseX(), InViewport->GetMouseY());
+            if (EventArgs.Event == IE_Released && PointerAction != EPointerAction::None)
             {
-                ViewportModeTools->ReceivedFocus(this, EventArgs.Viewport);
-            }
-
-            const int32 MouseX = EventArgs.Viewport->GetMouseX();
-            const int32 MouseY = EventArgs.Viewport->GetMouseY();
-            const FVector2D CurrentPos(MouseX, MouseY);
-
-            if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
-            {
-                // 1. First check if the user clicked on FEditorViewportClient's native Unreal FWidget (HWidgetAxis)
-                if (GetWidgetMode() != UE::Widget::WM_None)
-                {
-                    HHitProxy* HitResult = EventArgs.Viewport->GetHitProxy(MouseX, MouseY);
-                    if (HitResult && HitResult->IsA(HWidgetAxis::StaticGetType()))
-                    {
-                        HWidgetAxis* AxisProxy = static_cast<HWidgetAxis*>(HitResult);
-                        if (Widget)
-                        {
-                            Widget->SetCurrentAxis(AxisProxy->Axis);
-                        }
-                        bDraggingNativeWidget = true;
-                        NativeWidgetStartTransform = PreviewOwner->GetSelectionGizmoTransform();
-                        NativeWidgetRawLocation = NativeWidgetStartTransform.GetLocation();
-                        NativeWidgetRawRotation = NativeWidgetStartTransform.GetRotation();
-                        NativeWidgetRawScale = FVector::OneVector;
-                        PreviewOwner->BeginSoftTransform(NativeWidgetStartTransform, PreviewOwner->GetSoftTransformMode());
-                        FEditorViewportClient::InputKey(EventArgs);
-                        Invalidate();
-                        return true;
-                    }
-                }
-
-                LastMousePosition = CurrentPos;
-                bLeftMouseButtonDown = true;
-                bHasPendingGizmoDrag = false;
-                bConsumedByGizmo = false;
-
-                FSceneViewFamilyContext ViewFamily(
-                    FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
-                    .SetRealtimeUpdate(IsRealtime()));
-                if (FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily))
-                {
-                    if (GizmoManager)
-                    {
-                        GizmoManager->Tick(0.0f);
-                    }
-                    if (InputRouter)
-                    {
-                        // Use the tools context's canonical button route. It updates
-                        // the cached mouse state, performs gizmo hit testing, and
-                        // starts capture as one atomic operation. Sending a second
-                        // hand-built press here can leave the router and the mesh
-                        // picker disagreeing about who owns the gesture.
-                        const bool bCapturedOnPress = GetModeTools()
-                            ? GetModeTools()->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event, true)
-                            : InteractiveToolsContext
-                                ? InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event)
-                            : [&]()
-                            {
-                                FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, FVector2D::ZeroVector);
-                                State.Mouse.Left.SetStates(true, true, false);
-                                return InputRouter->PostInputEvent(State);
-                            }();
-
-                        if (bCapturedOnPress || InputRouter->HasActiveMouseCapture() || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())))
-                        {
-                            bConsumedByGizmo = true;
-                            bMarqueeActive = false;
-                            bMarqueePending = false;
-                            Invalidate();
-                            return true;
-                        }
-                    }
-                }
-
-                MarqueeStart = CurrentPos;
-                MarqueeCurrent = CurrentPos;
-                bMarqueeActive = false;
-                bMarqueePending = true;
+                FinishPointerAction(InViewport, Mouse);
                 return true;
             }
-            else if (EventArgs.Event == IE_Released && bDraggingNativeWidget)
+            if ((bPressed || EventArgs.Event == IE_DoubleClick) && !bNavigating
+                && PointerAction == EPointerAction::None)
             {
-                bDraggingNativeWidget = false;
-                bLeftMouseButtonDown = false;
-                if (Widget)
-                {
-                    Widget->SetCurrentAxis(EAxisList::None);
-                }
-                FEditorViewportClient::InputKey(EventArgs);
-                if (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get()))
-                {
-                    PreviewOwner->EndSoftTransform();
-                    NGon::UpdateActiveViewportUVMeshFromTopology(PreviewOwner->GetTopology());
-                }
-                if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-                {
-                    if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
-                    {
-                        if (UIState->OnViewportBoneTransformChanged)
-                        {
-                            UIState->OnViewportBoneTransformChanged();
-                        }
-                    }
-                }
-                Invalidate();
+                BeginPointerAction(InViewport, Mouse);
                 return true;
-            }
-            else if (EventArgs.Event == IE_Released && !IsAltPressed() && !IsCtrlPressed())
-            {
-                if (bHasPendingGizmoDrag)
-                {
-                    FlushPendingGizmoDrag(EventArgs.Viewport);
-                }
-                const FVector2D Delta = CurrentPos - LastMousePosition;
-                LastMousePosition = CurrentPos;
-                const bool bWasGizmoInteraction = bConsumedByGizmo
-                    || (InputRouter && InputRouter->HasActiveMouseCapture())
-                    || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get()));
-                bLeftMouseButtonDown = false;
-                bHasPendingGizmoDrag = false;
-
-                FSceneViewFamilyContext ViewFamily(
-                    FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
-                    .SetRealtimeUpdate(IsRealtime()));
-                FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily);
-
-                // Always deliver the release to the tools context, including a
-                // normal mesh click. The press above was routed through
-                // InputKey() to perform gizmo hit testing; skipping the matching
-                // release leaves CurrentMouseState.Mouse.Left.bDown set and
-                // causes later hover/capture tests to reject gizmo interaction.
-                if (InteractiveToolsContext)
-                {
-                    if (FEditorModeTools* ViewportModeTools = GetModeTools())
-                    {
-                        ViewportModeTools->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event, true);
-                    }
-                    else
-                    {
-                        InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
-                    }
-                }
-
-                if (bWasGizmoInteraction)
-                {
-                    if (!InteractiveToolsContext && View && InputRouter)
-                    {
-                        FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, Delta);
-                        State.Mouse.Left.SetStates(false, false, true);
-                        InputRouter->PostInputEvent(State);
-                    }
-                    if (GizmoManager)
-                    {
-                        GizmoManager->Tick(0.0f);
-                    }
-                    if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-                    {
-                        if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
-                        {
-                            if (UIState->OnViewportBoneTransformChanged)
-                            {
-                                UIState->OnViewportBoneTransformChanged();
-                            }
-                        }
-                    }
-                    bConsumedByGizmo = false;
-                    bMarqueeActive = false;
-                    bMarqueePending = false;
-                    Invalidate();
-                    return true;
-                }
-
-                if (bMarqueeActive)
-                {
-                    if (View)
-                    {
-                        const FBox2D Rect(MarqueeStart, MarqueeCurrent);
-                        const bool bFullyContained = MarqueeCurrent.X >= MarqueeStart.X;
-                        if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-                        {
-                            Pinned->BoxSelect(*View, Rect, IsShiftPressed(), bFullyContained);
-                        }
-                    }
-                    bMarqueeActive = false;
-                    bMarqueePending = false;
-                    Invalidate();
-                    return true;
-                }
-
-                if (bMarqueePending)
-                {
-                    bMarqueePending = false;
-                    if (View)
-                    {
-                        if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-                        {
-                            FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get());
-                            const bool bBonesVisible = !UIState || UIState->BoneDrawMode != 3;
-                            int32 HitBone = INDEX_NONE;
-                            if (bBonesVisible && NGon::HasSceneBones(&PreviewOwner.Get()))
-                            {
-                                const float PickRadius = NGon::IsBoneGizmoActive(&PreviewOwner.Get()) ? 20.0f : 12.0f;
-                                HitBone = NGon::PickSceneBone(&PreviewOwner.Get(), *View, CurrentPos, PickRadius, true);
-                            }
-                            if (HitBone != INDEX_NONE)
-                            {
-                                if (UIState && UIState->OnViewportBonePicked)
-                                {
-                                    UIState->OnViewportBonePicked(HitBone);
-                                }
-                            }
-                            else
-                            {
-                                Pinned->Pick(*View, CurrentPos, IsShiftPressed());
-                            }
-                        }
-                    }
-                    Invalidate();
-                    return true;
-                }
-                return true;
-            }
-            else if (EventArgs.Event == IE_Released)
-            {
-                if (bHasPendingGizmoDrag)
-                {
-                    FlushPendingGizmoDrag(EventArgs.Viewport);
-                }
-                const bool bWasGizmoInteraction = bConsumedByGizmo
-                    || (InputRouter && InputRouter->HasActiveMouseCapture())
-                    || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get()));
-                if (InteractiveToolsContext)
-                {
-                    // Keep the tools context's button state balanced for
-                    // modifier-assisted clicks as well.
-                    if (FEditorModeTools* ViewportModeTools = GetModeTools())
-                    {
-                        ViewportModeTools->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event, true);
-                    }
-                    else
-                    {
-                        InteractiveToolsContext->InputKey(this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
-                    }
-                }
-                if (bWasGizmoInteraction && !InteractiveToolsContext)
-                {
-                    FSceneViewFamilyContext ViewFamily(
-                        FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
-                        .SetRealtimeUpdate(IsRealtime()));
-                    if (FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily))
-                    {
-                        if (InputRouter)
-                        {
-                            FInputDeviceState State = MakeMouseInputState(*View, MouseX, MouseY, CurrentPos - LastMousePosition);
-                            State.Mouse.Left.SetStates(false, false, true);
-                            InputRouter->PostInputEvent(State);
-                        }
-                    }
-                }
-                bLeftMouseButtonDown = false;
-                bHasPendingGizmoDrag = false;
-                bConsumedByGizmo = false;
-                bMarqueeActive = false;
-                bMarqueePending = false;
-            }
-            else if (EventArgs.Event == IE_Pressed && IsCtrlPressed() && !IsAltPressed())
-            {
-                if (InteractiveToolsContext)
-                {
-                    InteractiveToolsContext->UpdateStateWithoutRoutingInputKey(
-                        this, EventArgs.Viewport, EventArgs.Key, EventArgs.Event);
-                }
-                FSceneViewFamilyContext ViewFamily(
-                    FSceneViewFamily::ConstructionValues(EventArgs.Viewport, GetScene(), EngineShowFlags)
-                    .SetRealtimeUpdate(IsRealtime()));
-                if (FSceneView* View = BuildSceneView(EventArgs.Viewport, ViewFamily))
-                {
-                    if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-                    {
-                        const int32 Id = Pinned->Pick(*View, CurrentPos, IsShiftPressed());
-                        if (Pinned->GetSelectionMode() == ENGonElement::Edge && Id != INDEX_NONE)
-                        {
-                            Pinned->SelectEdgeLoop(Id, IsShiftPressed());
-                            Invalidate();
-                            return true;
-                        }
-                    }
-                }
             }
         }
 
-        // Ctrl+I (Reset Selected Bone Transform) & Ctrl+Shift+I (Reset All Bones Transforms) matching UE Skeletal Mesh Editor
-        if (EventArgs.Event == IE_Pressed && IsCtrlPressed() && !IsAltPressed() && EventArgs.Key == EKeys::I)
+        if (PointerAction != EPointerAction::None)
+        {
+            return true;
+        }
+
+        if (bPressed && !bNavigating && IsCtrlPressed() && Key == EKeys::I)
         {
             const bool bReset = IsShiftPressed()
                 ? NGon::ResetAllSceneBonesTransforms(&PreviewOwner.Get())
                 : NGon::ResetSelectedSceneBoneTransform(&PreviewOwner.Get());
             if (bReset)
             {
-                if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-                {
-                    if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
-                    {
-                        if (UIState->OnViewportBoneTransformChanged)
-                        {
-                            UIState->OnViewportBoneTransformChanged();
-                        }
-                    }
-                }
+                NotifyBoneTransformChanged();
                 Invalidate();
             }
             return true;
         }
 
-        // Alt+9: Toggle Mesh Edges Rendering (matching UE Skeletal Mesh Editor hotkey)
-        if (EventArgs.Event == IE_Pressed && IsAltPressed() && !IsCtrlPressed() && EventArgs.Key == EKeys::Nine)
+        const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
+        if (bPressed && Pinned)
         {
-            if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
+            if (IsAltPressed() && !IsCtrlPressed() && Key == EKeys::Nine)
             {
-                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
+                if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get());
+                    UIState && UIState->OnToggleEdgesShortcut)
                 {
-                    if (UIState->OnToggleEdgesShortcut)
-                    {
-                        UIState->OnToggleEdgesShortcut();
-                    }
+                    UIState->OnToggleEdgesShortcut();
                 }
+                return true;
             }
-            Invalidate();
-            return true;
-        }
-
-        if (EventArgs.Event == IE_Pressed && !IsAltPressed() && !IsCtrlPressed())
-        {
-            if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
+            if (!bNavigating && !IsCtrlPressed() && HandleViewportShortcut(*Pinned, Key))
             {
-                if (EventArgs.Key == EKeys::Q)
-                {
-                    Pinned->SetGizmoMode(ENGonGizmoMode::None);
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::Four)
-                {
-                    NGon::SetBoneGizmoActive(&PreviewOwner.Get(), true);
-                    Invalidate();
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::One)
-                {
-                    NGon::SetBoneGizmoActive(&PreviewOwner.Get(), false);
-                    Pinned->SetSelectionMode(ENGonElement::Vertex);
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::Two)
-                {
-                    NGon::SetBoneGizmoActive(&PreviewOwner.Get(), false);
-                    Pinned->SetSelectionMode(ENGonElement::Edge);
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::Three)
-                {
-                    NGon::SetBoneGizmoActive(&PreviewOwner.Get(), false);
-                    Pinned->SetSelectionMode(ENGonElement::Face);
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::W)
-                {
-                    Pinned->SetGizmoMode(ENGonGizmoMode::Translate);
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::E)
-                {
-                    Pinned->SetGizmoMode(ENGonGizmoMode::Rotate);
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::R)
-                {
-                    Pinned->SetGizmoMode(ENGonGizmoMode::Scale);
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::H)
-                {
-                    Pinned->ToggleHeatmap();
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::F)
-                {
-                    Pinned->FrameMesh();
-                    return true;
-                }
-                if (EventArgs.Key == EKeys::Delete || EventArgs.Key == EKeys::BackSpace)
-                {
-                    if (Pinned->DeleteSelectedFaces())
-                    {
-                        Invalidate();
-                        return true;
-                    }
-                    return false;
-                }
+                return true;
             }
         }
         return FEditorViewportClient::InputKey(EventArgs);
     }
 
-    void MouseMove(FViewport* InViewport, int32 X, int32 Y) override
+    EMouseCursor::Type GetCursor(FViewport* InViewport, int32 X, int32 Y) override
     {
-        if (bDraggingNativeWidget)
+        if (PointerAction == EPointerAction::Gizmo)
         {
-            FEditorViewportClient::MouseMove(InViewport, X, Y);
-            return;
+            return EMouseCursor::CardinalCross;
         }
-        if (HandleLeftMouseDrag(InViewport, X, Y))
-        {
-            return;
-        }
-        // Always let FEditorViewportClient update HWidgetAxis hover state on the native Unreal FWidget
-        if (GetWidgetMode() != UE::Widget::WM_None)
-        {
-            FEditorViewportClient::MouseMove(InViewport, X, Y);
-        }
-
-        if (InputRouter && InViewport && !IsAltPressed())
-        {
-            FSceneViewFamilyContext ViewFamily(
-                FSceneViewFamily::ConstructionValues(InViewport, GetScene(), EngineShowFlags)
-                .SetRealtimeUpdate(IsRealtime()));
-            if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
-            {
-                if (GizmoManager)
-                {
-                    GizmoManager->Tick(0.0f);
-                }
-                if (InteractiveToolsContext)
-                {
-                    InteractiveToolsContext->MouseMove(this, InViewport, X, Y);
-                }
-                const FVector2D CurrentPos(X, Y);
-                const FVector2D HoverDelta = CurrentPos - LastMousePosition;
-                LastMousePosition = CurrentPos;
-                if (!InteractiveToolsContext)
-                {
-                    FInputDeviceState State = MakeMouseInputState(*View, X, Y, HoverDelta);
-                    InputRouter->PostHoverInputEvent(State);
-                }
-                Invalidate();
-            }
-            return;
-        }
-
-        FEditorViewportClient::MouseMove(InViewport, X, Y);
+        return FEditorViewportClient::GetCursor(InViewport, X, Y);
     }
 
-    void CapturedMouseMove(FViewport* InViewport, int32 InMouseX, int32 InMouseY) override
+    void MouseMove(FViewport* InViewport, int32 X, int32 Y) override
     {
-        if (bDraggingNativeWidget)
-        {
-            FEditorViewportClient::CapturedMouseMove(InViewport, InMouseX, InMouseY);
-            return;
-        }
-        if (HandleLeftMouseDrag(InViewport, InMouseX, InMouseY))
+        if (MovePointer(FIntPoint(X, Y)))
         {
             return;
         }
+        FEditorViewportClient::MouseMove(InViewport, X, Y);
+        if (InViewport && !IsNavigating(InViewport) && PreviewOwner->HasGizmoTarget())
+        {
+            FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
+            if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+            {
+                FInputDeviceState State = MakeMouseInput(*View, FIntPoint(X, Y), FVector2D::ZeroVector);
+                ToolsContext->InputRouter->PostHoverInputEvent(State);
+            }
+        }
+    }
 
-        FEditorViewportClient::CapturedMouseMove(InViewport, InMouseX, InMouseY);
+    void CapturedMouseMove(FViewport* InViewport, int32 X, int32 Y) override
+    {
+        if (!MovePointer(FIntPoint(X, Y)))
+        {
+            FEditorViewportClient::CapturedMouseMove(InViewport, X, Y);
+        }
+    }
+
+    void MouseEnter(FViewport* InViewport, int32 X, int32 Y) override
+    {
+        bMouseOverViewport = true;
+        FEditorViewportClient::MouseEnter(InViewport, X, Y);
+    }
+
+    void MouseLeave(FViewport* InViewport) override
+    {
+        bMouseOverViewport = false;
+        if (PointerAction == EPointerAction::None)
+        {
+            ToolsContext->InputRouter->ForceTerminateAll();
+        }
+        FEditorViewportClient::MouseLeave(InViewport);
+    }
+
+    void LostFocus(FViewport* InViewport) override
+    {
+        CancelPointerAction();
+        FEditorViewportClient::LostFocus(InViewport);
     }
 
     bool InputAxis(const FInputKeyEventArgs& Args) override
     {
-        if (bDraggingNativeWidget)
-        {
-            return FEditorViewportClient::InputAxis(Args);
-        }
-        // A left-button press by itself is also how mesh picking and marquee
-        // selection begin. Do not swallow viewport axis events until a gizmo,
-        // soft-transform, or marquee capture actually owns the gesture.
-        if (!IsAltPressed() && (bConsumedByGizmo || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())) || bMarqueeActive))
-        {
-            return true;
-        }
-        return FEditorViewportClient::InputAxis(Args);
+        return PointerAction != EPointerAction::None || FEditorViewportClient::InputAxis(Args);
     }
 
     void Draw(const FSceneView* View, FPrimitiveDrawInterface* PDI) override
     {
-        if (View && GizmoViewContext)
+        if (View)
         {
-            GizmoViewContext->ResetFromSceneView(*View);
+            UpdateViewContext(*View);
         }
         FEditorViewportClient::Draw(View, PDI);
-
-        if (View && PDI && NGon::HasSceneBones(&PreviewOwner.Get()))
+        if (View && PDI)
         {
-            int32 DrawMode = 0;
-            if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
+            if (!PDI->IsHitTesting() && PreviewOwner->HasGizmoTarget())
             {
-                if (const FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
-                {
-                    DrawMode = UIState->BoneDrawMode;
-                }
+                const EViewInteractionState Interaction = GetFocusedViewport()
+                    ? (bMouseOverViewport ? EViewInteractionState::All : EViewInteractionState::Focused)
+                    : (bMouseOverViewport ? EViewInteractionState::Hovered : EViewInteractionState::None);
+                FNGonGizmoRenderContext Context(View, PDI, CameraState, Interaction);
+                ToolsContext->GizmoManager->Render(&Context);
             }
-            NGon::DrawSceneSkeleton(&PreviewOwner.Get(), View, PDI, DrawMode);
+            if (NGon::HasSceneBones(&PreviewOwner.Get()))
+            {
+                const FNGonSkeletonTreeUIState* UIState = GetUIState();
+                NGon::DrawSceneSkeleton(&PreviewOwner.Get(), View, PDI, UIState ? UIState->BoneDrawMode : 0);
+            }
         }
     }
 
     void Draw(FViewport* InViewport, FCanvas* Canvas) override
     {
         FEditorViewportClient::Draw(InViewport, Canvas);
-
         if (InViewport && Canvas && NGon::HasSceneBones(&PreviewOwner.Get()))
         {
-            bool bShowBoneNames = true;
-            int32 DrawMode = 0;
-            if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
+            const FNGonSkeletonTreeUIState* UIState = GetUIState();
+            if (!UIState || (UIState->bShowBoneNames && UIState->BoneDrawMode != 3))
             {
-                if (const FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
-                {
-                    bShowBoneNames = UIState->bShowBoneNames;
-                    DrawMode = UIState->BoneDrawMode;
-                }
-            }
-            if (bShowBoneNames && DrawMode != 3)
-            {
-                FSceneViewFamilyContext ViewFamily(
-                    FSceneViewFamily::ConstructionValues(InViewport, GetScene(), EngineShowFlags)
-                    .SetRealtimeUpdate(IsRealtime()));
+                FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
                 if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
                 {
                     NGon::DrawSceneSkeletonLabels(&PreviewOwner.Get(), View, InViewport, Canvas, true);
@@ -831,182 +334,361 @@ public:
 
         if (bMarqueeActive && Canvas)
         {
-            const FVector2D Min(FMath::Min(MarqueeStart.X, MarqueeCurrent.X), FMath::Min(MarqueeStart.Y, MarqueeCurrent.Y));
-            const FVector2D Size(FMath::Abs(MarqueeCurrent.X - MarqueeStart.X), FMath::Abs(MarqueeCurrent.Y - MarqueeStart.Y));
-            FCanvasBoxItem Box(Min, Size);
+            const FBox2D Rect = MakeMarquee();
+            FCanvasBoxItem Box(Rect.Min, Rect.GetSize());
             Box.SetColor(FLinearColor(0.15f, 0.65f, 1.0f, 0.85f));
             Box.LineThickness = 2.0f;
             Canvas->DrawItem(Box);
         }
     }
 
-    ~FNGonViewportClient() override
+private:
+    enum class EPointerAction : uint8 { None, Select, EdgeLoop, Gizmo };
+
+    // The preview is transient. Gizmo changes are applied by the preview scene
+    // and must not enter the level editor's undo stack as proxy-only changes.
+    UWorld* GetCurrentEditingWorld() override { return PreviewOwner->GetPreviewScene().GetWorld(); }
+    FViewport* GetFocusedViewport() override { return Viewport && Viewport->HasFocus() ? Viewport : nullptr; }
+    FViewport* GetHoveredViewport() override { return bMouseOverViewport ? Viewport : nullptr; }
+    void GetCurrentSelectionState(FToolBuilderState& State) const override
     {
-        PreviewOwner->TeardownGizmo();
-        NGon::NotifyHostViewportClosed();
-        if (InteractiveToolsContext)
+        State = FToolBuilderState{};
+        State.World = PreviewOwner->GetPreviewScene().GetWorld();
+        State.ToolManager = ToolsContext->ToolManager.Get();
+        State.GizmoManager = ToolsContext->GizmoManager.Get();
+    }
+    void GetCurrentViewState(FViewCameraState& State) const override { State = CameraState; }
+    UMaterialInterface* GetStandardMaterial(EStandardToolContextMaterials MaterialType) const override
+    {
+        return UMaterial::GetDefaultMaterial(MD_Surface);
+    }
+    void DisplayMessage(const FText& Message, EToolMessageLevel Level) override {}
+    void PostInvalidation() override { Invalidate(false, false); }
+    void BeginUndoTransaction(const FText& Description) override {}
+    void EndUndoTransaction() override {}
+    void CancelUndoTransaction() override {}
+    void AppendChange(UObject* Target, TUniquePtr<FToolCommandChange> Change, const FText& Description) override {}
+    bool RequestSelectionChange(const FSelectedObjectsChangeList& Change) override { return false; }
+
+    FNGonSkeletonTreeUIState* GetUIState() const
+    {
+        const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
+        return FindUIStateByViewport(Pinned.Get());
+    }
+
+    void NotifyBoneTransformChanged() const
+    {
+        if (const FNGonSkeletonTreeUIState* UI = GetUIState(); UI && UI->OnViewportBoneTransformChanged)
         {
-            UE::TransformGizmoUtil::DeregisterTransformGizmoContextObject(InteractiveToolsContext);
+            UI->OnViewportBoneTransformChanged();
         }
     }
 
-private:
+    void ApplyPendingFrame()
+    {
+        if (PendingFrameBounds.IsValid && Viewport && Viewport->GetSizeXY().GetMin() > 0)
+        {
+            FocusViewportOnBox(PendingFrameBounds, true);
+            PendingFrameBounds.Init();
+            Invalidate();
+        }
+    }
+
+    bool IsNavigating(FViewport* InViewport) const
+    {
+        return IsAltPressed()
+            || (InViewport && (InViewport->KeyState(EKeys::RightMouseButton) || InViewport->KeyState(EKeys::MiddleMouseButton)));
+    }
+
+    bool HandleViewportShortcut(SNGonViewport& Widget, const FKey& Key)
+    {
+        if (Key == EKeys::Q || Key == EKeys::W || Key == EKeys::E || Key == EKeys::R)
+        {
+            ENGonGizmoMode Mode = ENGonGizmoMode::None;
+            if (Key == EKeys::W) Mode = ENGonGizmoMode::Translate;
+            if (Key == EKeys::E) Mode = ENGonGizmoMode::Rotate;
+            if (Key == EKeys::R) Mode = ENGonGizmoMode::Scale;
+            Widget.SetGizmoMode(Mode);
+        }
+        else if (Key == EKeys::One || Key == EKeys::Two || Key == EKeys::Three)
+        {
+            Widget.SetSelectionMode(Key == EKeys::One ? ENGonElement::Vertex
+                : Key == EKeys::Two ? ENGonElement::Edge : ENGonElement::Face);
+        }
+        else if (Key == EKeys::Four)
+        {
+            NGon::SetBoneGizmoActive(&PreviewOwner.Get(), true);
+            Invalidate();
+        }
+        else if (Key == EKeys::H)
+        {
+            Widget.ToggleHeatmap();
+        }
+        else if (Key == EKeys::F)
+        {
+            Widget.FrameMesh();
+        }
+        else if (Key == EKeys::Delete || Key == EKeys::BackSpace)
+        {
+            Widget.DeleteSelectedFaces();
+        }
+        else
+        {
+            return false;
+        }
+        return true;
+    }
+
+    FSceneViewFamily::ConstructionValues MakeViewFamily(FViewport* InViewport)
+    {
+        FSceneViewFamily::ConstructionValues Values(InViewport, GetScene(), EngineShowFlags);
+        Values.SetRealtimeUpdate(IsRealtime());
+        return Values;
+    }
+
     FSceneView* BuildSceneView(FViewport* InViewport, FSceneViewFamilyContext& ViewFamily)
     {
-        if (!InViewport || InViewport->GetSizeXY().GetMin() <= 0)
+        if (InViewport->GetSizeXY().GetMin() <= 0)
         {
             return nullptr;
         }
         FSceneView* View = CalcSceneView(&ViewFamily);
-        if (View && GizmoViewContext)
+        if (View)
         {
-            GizmoViewContext->ResetFromSceneView(*View);
+            UpdateViewContext(*View);
         }
         return View;
     }
 
-    FInputDeviceState MakeMouseInputState(const FSceneView& View, int32 MouseX, int32 MouseY, const FVector2D& Delta2D) const
+    void UpdateViewContext(const FSceneView& View)
     {
-        FVector RayOrigin = FVector::ZeroVector;
-        FVector RayDirection = FVector::ForwardVector;
-        View.DeprojectFVector2D(FVector2D(MouseX, MouseY), RayOrigin, RayDirection);
+        GizmoViewContext->ResetFromSceneView(View);
+        CameraState.DPIScale = GetDPIScale();
+        GizmoViewContext->SetDPIScale(CameraState.DPIScale);
+        CameraState.Position = View.ViewLocation;
+        CameraState.Orientation = View.ViewRotation.Quaternion();
+        CameraState.HorizontalFOVDegrees = ViewFOV;
+        CameraState.AspectRatio = static_cast<float>(View.UnscaledViewRect.Width()) / FMath::Max(1, View.UnscaledViewRect.Height());
+        CameraState.bIsOrthographic = !View.IsPerspectiveProjection();
+        CameraState.OrthoWorldCoordinateWidth = CameraState.bIsOrthographic && Viewport
+            ? GetOrthoUnitsPerPixel(Viewport) * View.UnscaledViewRect.Width() : 0.0f;
+    }
 
-        FInputDeviceState State;
+    FInputDeviceState MakeMouseInput(const FSceneView& View, const FIntPoint& Mouse, const FVector2D& Delta) const
+    {
+        const FVector2D Pixel(Mouse.X, Mouse.Y);
+        FVector Origin;
+        FVector Direction;
+        View.DeprojectFVector2D(Pixel, Origin, Direction);
+
+        FInputDeviceState State{};
         State.InputDevice = EInputDevices::Mouse;
         State.SetModifierKeyStates(IsShiftPressed(), IsAltPressed(), IsCtrlPressed(), false);
-        State.Mouse.Position2D = FVector2D(MouseX, MouseY);
-        State.Mouse.Delta2D = Delta2D;
-        State.Mouse.WorldRay = FRay(RayOrigin, RayDirection);
+        State.Mouse.Position2D = Pixel;
+        State.Mouse.Delta2D = Delta;
+        State.Mouse.WorldRay = FRay(Origin, Direction);
         return State;
     }
 
-    void FlushPendingGizmoDrag(FViewport* InViewport)
+    void BeginPointerAction(FViewport* InViewport, const FIntPoint& Mouse)
     {
-        if (!bHasPendingGizmoDrag || !InViewport)
+        const bool bBoneMode = NGon::IsBoneGizmoActive(&PreviewOwner.Get());
+        if (IsCtrlPressed() && !bBoneMode)
         {
+            PointerAction = EPointerAction::EdgeLoop;
             return;
         }
-        bHasPendingGizmoDrag = false;
-        const int32 InMouseX = FMath::RoundToInt(PendingDragPosition.X);
-        const int32 InMouseY = FMath::RoundToInt(PendingDragPosition.Y);
-        const FVector2D Delta = PendingDragPosition - LastMousePosition;
-        if (Delta.IsNearlyZero())
+        if (PreviewOwner->HasGizmoTarget())
         {
-            return;
-        }
-        LastMousePosition = PendingDragPosition;
-
-        FSceneViewFamilyContext ViewFamily(
-            FSceneViewFamily::ConstructionValues(InViewport, GetScene(), EngineShowFlags)
-            .SetRealtimeUpdate(IsRealtime()));
-        if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
-        {
-            if (FEditorModeTools* ViewportModeTools = GetModeTools())
+            FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
+            if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
             {
-                ViewportModeTools->CapturedMouseMove(this, InViewport, InMouseX, InMouseY);
-            }
-            else if (InteractiveToolsContext)
-            {
-                // CapturedMouseMove maintains the tools context's unbounded
-                // cursor/ray state and posts exactly one captured event.
-                InteractiveToolsContext->CapturedMouseMove(this, InViewport, InMouseX, InMouseY);
-            }
-            else if (InputRouter)
-            {
-                FInputDeviceState State = MakeMouseInputState(*View, InMouseX, InMouseY, Delta);
-                State.Mouse.Left.SetStates(false, true, false);
-                InputRouter->PostInputEvent(State);
-                if (NGon::IsBoneTransformActive(&PreviewOwner.Get()))
+                FInputDeviceState State = MakeMouseInput(*View, Mouse, FVector2D::ZeroVector);
+                State.Mouse.Left.SetStates(true, true, false);
+                ToolsContext->InputRouter->PostInputEvent(State);
+                if (ToolsContext->InputRouter->HasActiveMouseCapture())
                 {
-                    if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-                    {
-                        if (FNGonSkeletonTreeUIState* UIState = FindUIStateByViewport(Pinned.Get()))
-                        {
-                            if (UIState->OnViewportBoneTransformChanged)
-                            {
-                                UIState->OnViewportBoneTransformChanged();
-                            }
-                        }
-                    }
+                    PointerAction = EPointerAction::Gizmo;
+                    LastGizmoMouse = Mouse;
+                    PostInvalidation();
+                    return;
                 }
             }
-            if (GizmoManager)
-            {
-                GizmoManager->Tick(0.0f);
-            }
         }
-        Invalidate();
+
+        PointerAction = EPointerAction::Select;
+        MarqueeStart = FVector2D(Mouse.X, Mouse.Y);
+        MarqueeEnd = MarqueeStart;
     }
 
-    bool HandleLeftMouseDrag(FViewport* InViewport, int32 InMouseX, int32 InMouseY)
+    bool MovePointer(const FIntPoint& Mouse)
     {
-        if (!bLeftMouseButtonDown || !InViewport)
+        if (PointerAction == EPointerAction::Gizmo)
         {
-            return false;
+            PendingGizmoMouse = Mouse;
+            bPendingGizmoMove = true;
+            return true;
+        }
+        if (PointerAction == EPointerAction::Select)
+        {
+            if (!NGon::IsBoneGizmoActive(&PreviewOwner.Get()))
+            {
+                MarqueeEnd = FVector2D(Mouse.X, Mouse.Y);
+                bMarqueeActive = bMarqueeActive || FVector2D::DistSquared(MarqueeStart, MarqueeEnd) > 25.0;
+                if (bMarqueeActive)
+                {
+                    PostInvalidation();
+                }
+            }
+            return true;
+        }
+        return PointerAction == EPointerAction::EdgeLoop;
+    }
+
+    void UpdateGizmoDrag(FViewport* InViewport, const FIntPoint& Mouse)
+    {
+        bPendingGizmoMove = false;
+        if (Mouse == LastGizmoMouse)
+        {
+            return;
         }
 
-        const FVector2D CurrentPos(InMouseX, InMouseY);
-        if (bConsumedByGizmo || (InputRouter && InputRouter->HasActiveMouseCapture()) || (PreviewOwner->IsSoftTransformActive() || NGon::IsBoneTransformActive(&PreviewOwner.Get())))
+        FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
+        if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
         {
-            PendingDragPosition = CurrentPos;
-            bHasPendingGizmoDrag = true;
-            if (LastDragFrameCounter != GFrameCounter)
+            const FIntPoint Delta = Mouse - LastGizmoMouse;
+            FInputDeviceState State = MakeMouseInput(*View, Mouse, FVector2D(Delta.X, Delta.Y));
+            State.Mouse.Left.SetStates(false, true, false);
+            ToolsContext->InputRouter->PostInputEvent(State);
+            LastGizmoMouse = Mouse;
+            if (NGon::IsBoneTransformActive(&PreviewOwner.Get()))
             {
-                LastDragFrameCounter = GFrameCounter;
-                FlushPendingGizmoDrag(InViewport);
+                NotifyBoneTransformChanged();
+            }
+            PostInvalidation();
+        }
+    }
+
+    void FinishPointerAction(FViewport* InViewport, const FIntPoint& Mouse)
+    {
+        if (PointerAction == EPointerAction::Gizmo)
+        {
+            UpdateGizmoDrag(InViewport, Mouse);
+            FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
+            if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+            {
+                FInputDeviceState State = MakeMouseInput(*View, Mouse, FVector2D::ZeroVector);
+                State.Mouse.Left.SetStates(false, false, true);
+                ToolsContext->InputRouter->PostInputEvent(State);
+                const bool bBoneDrag = NGon::IsBoneTransformActive(&PreviewOwner.Get());
+                if (bBoneDrag || PreviewOwner->IsSoftTransformActive())
+                {
+                    PreviewOwner->EndSoftTransform();
+                }
+                if (bBoneDrag)
+                {
+                    NotifyBoneTransformChanged();
+                }
             }
             else
             {
-                Invalidate();
+                CancelPointerAction();
+                return;
             }
-            return true;
         }
-
-        LastMousePosition = CurrentPos;
-        if (bMarqueePending && !IsAltPressed())
+        else
         {
-            if (bMarqueeActive || (MarqueeStart != CurrentPos &&
-                (FMath::Abs(CurrentPos.X - MarqueeStart.X) + FMath::Abs(CurrentPos.Y - MarqueeStart.Y) > 5.0)))
+            MovePointer(Mouse);
+            FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
+            if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
             {
-                MarqueeCurrent = CurrentPos;
-                bMarqueeActive = true;
-                Invalidate();
+                SelectAtPointer(*View, FVector2D(Mouse.X, Mouse.Y));
             }
-            return true;
         }
 
-        return false;
+        PointerAction = EPointerAction::None;
+        bMarqueeActive = false;
+        PostInvalidation();
+    }
+
+    void SelectAtPointer(const FSceneView& View, const FVector2D& Mouse)
+    {
+        const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
+        if (!Pinned)
+        {
+            return;
+        }
+
+        if (NGon::IsBoneGizmoActive(&PreviewOwner.Get()))
+        {
+            FNGonSkeletonTreeUIState* UI = GetUIState();
+            if (!UI || UI->BoneDrawMode != 3)
+            {
+                const int32 HitBone = NGon::PickSceneBone(&PreviewOwner.Get(), View, Mouse, 20.0f, true);
+                if (HitBone != INDEX_NONE && UI && UI->OnViewportBonePicked)
+                {
+                    UI->OnViewportBonePicked(HitBone);
+                }
+            }
+        }
+        else if (bMarqueeActive)
+        {
+            Pinned->BoxSelect(View, MakeMarquee(), IsShiftPressed(), MarqueeEnd.X >= MarqueeStart.X);
+        }
+        else
+        {
+            const bool bAdd = IsShiftPressed();
+            const int32 Hit = Pinned->Pick(View, Mouse, bAdd);
+            if (PointerAction == EPointerAction::EdgeLoop && Pinned->GetSelectionMode() == ENGonElement::Edge && Hit != INDEX_NONE)
+            {
+                Pinned->SelectEdgeLoop(Hit, bAdd);
+            }
+        }
+    }
+
+    void CancelPointerAction()
+    {
+        ToolsContext->InputRouter->ForceTerminateAll();
+        const bool bBoneDrag = NGon::IsBoneTransformActive(&PreviewOwner.Get());
+        PreviewOwner->CancelSoftTransform();
+        if (bBoneDrag)
+        {
+            NotifyBoneTransformChanged();
+        }
+        PointerAction = EPointerAction::None;
+        bPendingGizmoMove = false;
+        bMarqueeActive = false;
+        PostInvalidation();
+    }
+
+    FBox2D MakeMarquee() const
+    {
+        FBox2D Rect(ForceInit);
+        Rect += MarqueeStart;
+        Rect += MarqueeEnd;
+        return Rect;
     }
 
     TWeakPtr<SNGonViewport> ViewportWidget;
-    UModeManagerInteractiveToolsContext* InteractiveToolsContext = nullptr;
-    UInteractiveToolManager* ToolManager = nullptr;
-    UInteractiveGizmoManager* GizmoManager = nullptr;
-    UInputRouter* InputRouter = nullptr;
+    TStrongObjectPtr<UInteractiveToolsContext> ToolsContext;
     UGizmoViewContext* GizmoViewContext = nullptr;
+    FViewCameraState CameraState{};
+    FBox PendingFrameBounds{ForceInit};
 
-    FVector2D LastMousePosition = FVector2D::ZeroVector;
-    FVector2D PendingDragPosition = FVector2D::ZeroVector;
-    uint64 LastDragFrameCounter = 0;
+    EPointerAction PointerAction = EPointerAction::None;
+    FIntPoint LastGizmoMouse = FIntPoint::ZeroValue;
+    FIntPoint PendingGizmoMouse = FIntPoint::ZeroValue;
     FVector2D MarqueeStart = FVector2D::ZeroVector;
-    FVector2D MarqueeCurrent = FVector2D::ZeroVector;
-    bool bLeftMouseButtonDown = false;
-    bool bHasPendingGizmoDrag = false;
+    FVector2D MarqueeEnd = FVector2D::ZeroVector;
+    bool bPendingGizmoMove = false;
     bool bMarqueeActive = false;
-    bool bMarqueePending = false;
-    bool bConsumedByGizmo = false;
-    bool bDraggingNativeWidget = false;
-    FTransform NativeWidgetStartTransform = FTransform::Identity;
-    FVector NativeWidgetRawLocation = FVector::ZeroVector;
-    FQuat NativeWidgetRawRotation = FQuat::Identity;
-    FVector NativeWidgetRawScale = FVector::OneVector;
+    bool bMouseOverViewport = false;
 };
 }
 
 void SNGonViewport::Construct(const FArguments& InArgs)
 {
     PreviewScene = MakeShared<FNGonPreviewScene>();
-    PreviewScene->SetGizmoMode(ENGonGizmoMode::Translate);
     bGridVisible = true;
     SEditorViewport::Construct(SEditorViewport::FArguments());
 }
@@ -1019,34 +701,41 @@ TSharedRef<FEditorViewportClient> SNGonViewport::MakeEditorViewportClient()
 void SNGonViewport::SetMesh(FNGonMeshData&& Data)
 {
     bHeatmapVisible = false;
+    NGon::ClearSceneSkeleton(PreviewScene.Get());
     PreviewScene->SetMesh(MoveTemp(Data));
-    FrameMesh();
+    if (const TSharedPtr<FEditorViewportClient> Client = GetViewportClient())
+    {
+        static_cast<FNGonViewportClient*>(Client.Get())->FrameBounds(PreviewScene->GetMeshBounds(), true);
+    }
 }
 
 void SNGonViewport::FrameMesh()
 {
-    const FBox Bounds = PreviewScene->GetSelectionOrRestBounds();
-    if (Bounds.IsValid)
+    if (const TSharedPtr<FEditorViewportClient> Client = GetViewportClient())
     {
-        const FVector Center = Bounds.GetCenter();
-        const FVector Size = Bounds.GetSize();
-        FVector FromTarget(-0.18, -0.4, 1.0);
-        if (Size.Y < FMath::Min(Size.X, Size.Z) * 0.25)
-        {
-            FromTarget = FVector(0.25, -1.0, 0.30);
-        }
-        else if (Size.X < FMath::Min(Size.Y, Size.Z) * 0.25)
-        {
-            FromTarget = FVector(-1.0, -0.25, 0.30);
-        }
+        static_cast<FNGonViewportClient*>(Client.Get())->FrameBounds(PreviewScene->GetSelectionOrMeshBounds(), false);
+    }
+}
 
-        const double Distance = FMath::Max(Size.Size() * 1.35, 35.0);
-        const FVector Location = Center + FromTarget.GetSafeNormal() * Distance;
-        const TSharedPtr<FEditorViewportClient> ViewportClient = GetViewportClient();
-        ViewportClient->SetViewLocation(Location);
-        ViewportClient->SetViewRotation((Center - Location).Rotation());
-        ViewportClient->SetLookAtLocation(Center, false);
-        ViewportClient->Invalidate();
+void SNGonViewport::FocusViewport()
+{
+    if (const TSharedPtr<FSceneViewport> SceneViewport = GetSceneViewport())
+    {
+        if (const TSharedPtr<SViewport> Widget = SceneViewport->GetViewportWidget().Pin())
+        {
+            FSlateApplication::Get().SetKeyboardFocus(Widget, EFocusCause::SetDirectly);
+        }
+    }
+}
+
+void SNGonViewport::SetShadingMode(ENGonViewportShading Mode)
+{
+    ShadingMode = Mode;
+    PreviewScene->SetFlatShading(Mode == ENGonViewportShading::Faceted);
+    if (const TSharedPtr<FEditorViewportClient> Client = GetViewportClient())
+    {
+        Client->SetViewMode(Mode == ENGonViewportShading::Wireframe ? VMI_Wireframe : VMI_Unlit);
+        Invalidate();
     }
 }
 
@@ -1057,13 +746,14 @@ void SNGonViewport::OnFocusViewportToSelection()
 
 void SNGonViewport::SetSelectionMode(ENGonElement Element)
 {
+    NGon::SetBoneGizmoActive(PreviewScene.Get(), false);
     if (SelectionMode != Element)
     {
         SelectionMode = Element;
         PreviewScene->ClearSelection();
         SetHeatmapVisible(false);
-        Invalidate();
     }
+    Invalidate();
 }
 
 void SNGonViewport::SetGizmoMode(ENGonGizmoMode Mode)
@@ -1074,7 +764,7 @@ void SNGonViewport::SetGizmoMode(ENGonGizmoMode Mode)
 
 ENGonGizmoMode SNGonViewport::GetGizmoMode() const
 {
-    return PreviewScene.IsValid() ? PreviewScene->GetGizmoMode() : ENGonGizmoMode::Combined;
+    return PreviewScene->GetGizmoMode();
 }
 
 void SNGonViewport::SetGridVisible(bool bVisible)
@@ -1146,7 +836,7 @@ bool SNGonViewport::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
 
 bool SNGonViewport::DeleteSelectedFaces()
 {
-    const bool bDeleted = PreviewScene->DeleteSelectedFaces();
+    const bool bDeleted = !NGon::IsBoneGizmoActive(PreviewScene.Get()) && PreviewScene->DeleteSelectedFaces();
     if (bDeleted)
     {
         if (!PreviewScene->HasSoftSelectionInfluence())
@@ -1158,7 +848,3 @@ bool SNGonViewport::DeleteSelectedFaces()
     }
     return bDeleted;
 }
-
-
-
-#undef LOCTEXT_NAMESPACE

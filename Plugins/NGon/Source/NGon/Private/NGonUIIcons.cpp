@@ -18,6 +18,11 @@ FNGonSkeletonTreeUIState& GetSkeletonTreeUIState(const SNGonPreview* Preview)
     return GSkeletonTreeUIStateMap.FindOrAdd(Preview);
 }
 
+void RemoveSkeletonTreeUIState(const SNGonPreview* Preview)
+{
+    GSkeletonTreeUIStateMap.Remove(Preview);
+}
+
 FNGonSkeletonTreeUIState* FindUIStateByViewport(const SNGonViewport* InViewport)
 {
     if (!InViewport)

@@ -97,8 +97,8 @@ int32 STiPaintCanvas::OnPaint(const FPaintArgs&, const FGeometry& Geometry, cons
             if (Samples > 0) Color /= static_cast<float>(Samples);
             const float U0 = static_cast<float>(GridX) / PreviewSize;
             const float U1 = static_cast<float>(GridX + 1) / PreviewSize;
-            const float V0 = static_cast<float>(GridY) / PreviewSize;
-            const float V1 = static_cast<float>(GridY + 1) / PreviewSize;
+            const float V0 = 1.0f - static_cast<float>(GridY + 1) / PreviewSize;
+            const float V1 = 1.0f - static_cast<float>(GridY) / PreviewSize;
             const FVector2D A = UVToScreen(Geometry, FVector2f(U0, V1));
             const FVector2D B = UVToScreen(Geometry, FVector2f(U1, V0));
             FSlateDrawElement::MakeBox(Out, Layer + 2, Geometry.ToPaintGeometry(FVector2D(B.X - A.X + 1.0, B.Y - A.Y + 1.0), FSlateLayoutTransform(A)), &Background, ESlateDrawEffect::None, Color);

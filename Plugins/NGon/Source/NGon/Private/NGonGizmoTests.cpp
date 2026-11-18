@@ -2,6 +2,10 @@
 
 #include "NGonMeshFiles.h"
 #include "NGonPreviewScene.h"
+#include "NGonSceneSkeleton.h"
+#include "SNGonPreview.h"
+
+#include "BaseGizmos/CombinedTransformGizmo.h"
 #include "Misc/AutomationTest.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -99,6 +103,77 @@ bool FNGonGizmoComponentFrameTest::RunTest(const FString& Parameters)
         VertexFrame.GetTranslation().Equals(FVector(0, 0, 100), 0.01));
     TestTrue(TEXT("Vertex frame has a usable normal"),
         VertexFrame.GetUnitAxis(EAxis::Z).IsNormalized());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FNGonViewportGizmoModesTest, "NGon.Gizmo.ViewportModes",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FNGonViewportGizmoModesTest::RunTest(const FString& Parameters)
+{
+    FNGonMeshData Data;
+    FText Error;
+    if (!TestTrue(TEXT("Build demo mesh"), NGon::MakeDemo(Data, Error)))
+    {
+        AddError(Error.ToString());
+        return false;
+    }
+
+    const TSharedRef<SNGonViewport> Viewport = SNew(SNGonViewport);
+    Viewport->SetMesh(MoveTemp(Data));
+    FNGonPreviewScene& Scene = Viewport->Preview();
+    UCombinedTransformGizmo* Gizmo = Scene.TransformGizmo;
+    if (!TestNotNull(TEXT("Native gizmo created by the viewport"), Gizmo)
+        || !TestNotNull(TEXT("Native gizmo actor"), Gizmo->GetGizmoActor()))
+    {
+        return false;
+    }
+    const ACombinedTransformGizmoActor* Actor = Gizmo->GetGizmoActor();
+    TestTrue(TEXT("Gizmo actor spawned in the same preview world"),
+        Actor->GetWorld() == Scene.GetPreviewScene().GetWorld());
+    TestNotNull(TEXT("Translate handle"), Actor->TranslateX.Get());
+    TestNotNull(TEXT("Rotate handle"), Actor->RotateZ.Get());
+    TestNotNull(TEXT("Scale handle"), Actor->UniformScale.Get());
+    TestFalse(TEXT("Gizmo hidden without a target"), Gizmo->IsVisible());
+
+    Scene.SelectElement(ENGonElement::Face, 0);
+    const FTransform FaceFrame = Scene.GetSelectionGizmoTransform();
+    Viewport->SetGizmoMode(ENGonGizmoMode::None);
+    TestFalse(TEXT("Select hides gizmo on a selected face"), Gizmo->IsVisible());
+
+    const TPair<ENGonGizmoMode, EToolContextTransformGizmoMode> Modes[] = {
+        { ENGonGizmoMode::Translate, EToolContextTransformGizmoMode::Translation },
+        { ENGonGizmoMode::Rotate, EToolContextTransformGizmoMode::Rotation },
+        { ENGonGizmoMode::Scale, EToolContextTransformGizmoMode::Scale },
+        { ENGonGizmoMode::Combined, EToolContextTransformGizmoMode::Combined }
+    };
+    for (const auto& Mode : Modes)
+    {
+        Viewport->SetGizmoMode(Mode.Key);
+        const FString NativeMode = FString::FromInt(static_cast<int32>(Mode.Value));
+        TestTrue(TEXT("Visible native gizmo in mode ") + NativeMode, Gizmo->IsVisible());
+        TestTrue(TEXT("Native handle mode ") + NativeMode, Gizmo->ActiveGizmoMode == Mode.Value);
+        TestTrue(TEXT("Mode changes retain the selected component's pivot"),
+            Gizmo->GetGizmoTransform().GetLocation().Equals(FaceFrame.GetLocation(), 0.01));
+    }
+    Scene.ClearSelection();
+    TestFalse(TEXT("Clearing component selection hides the gizmo"), Gizmo->IsVisible());
+
+    TArray<NGon::FNGonSceneBoneInit> Bones;
+    NGon::FNGonSceneBoneInit& Bone = Bones.AddDefaulted_GetRef();
+    Bone.BoneIndex = 0;
+    Bone.Name = TEXT("TestJoint");
+    Bone.RefLocalTransform = FTransform(FVector(10.0, 20.0, 30.0));
+    Bone.RefComponentTransform = Bone.RefLocalTransform;
+    NGon::SetSceneSkeleton(&Scene, Bones, {});
+    NGon::SelectSceneBone(&Scene, 0, true);
+    Viewport->SetGizmoMode(ENGonGizmoMode::Rotate);
+    TestTrue(TEXT("Rotate is visible on a selected bone"), Gizmo->IsVisible());
+    TestTrue(TEXT("The same gizmo follows the bone pivot"),
+        Gizmo->GetGizmoTransform().GetLocation().Equals(Bone.RefComponentTransform.GetLocation(), 0.01));
+    Viewport->SetSelectionMode(ENGonElement::Face);
+    TestFalse(TEXT("Switching to an empty component selection releases the bone gizmo"), Gizmo->IsVisible());
     return true;
 }
 

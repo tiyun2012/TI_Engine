@@ -556,11 +556,8 @@ void SNGonPreview::RebuildSkeletonTreeList()
                         if (Viewport.IsValid())
                         {
                             NGon::SelectSceneBone(&Viewport->Preview(), BoneIdx, true);
-                            if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
-                            {
-                                Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
-                            }
                             Viewport->Invalidate();
+                            Viewport->FocusViewport();
                         }
                         RebuildSkeletonTreeList();
                     })

@@ -71,10 +71,10 @@ struct FNGonSkeletonTreeUIState
     bool bSurfaceSnapEnabled = false;
     float CameraSpeedScalar = 1.0f;
     ELevelViewportType ViewportType = LVT_Perspective;
-    int32 ShadingMode = 0; // 0 = Lit Smooth, 1 = Lit Flat, 2 = Unlit, 3 = Wireframe
 };
 
 FNGonSkeletonTreeUIState& GetSkeletonTreeUIState(const SNGonPreview* Preview);
+void RemoveSkeletonTreeUIState(const SNGonPreview* Preview);
 FNGonSkeletonTreeUIState* FindUIStateByViewport(const SNGonViewport* InViewport);
 
 void DrawBoneIconVector(

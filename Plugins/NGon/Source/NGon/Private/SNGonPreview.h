@@ -12,6 +12,13 @@ struct FNGonMeshData;
 class SVerticalBox;
 class STiPaintEditor;
 
+enum class ENGonViewportShading : uint8
+{
+    Smooth,
+    Faceted,
+    Wireframe
+};
+
 class SNGonViewport final : public SEditorViewport
 {
 public:
@@ -21,7 +28,9 @@ public:
     void Construct(const FArguments& InArgs);
     void SetSelectionMode(ENGonElement Element);
     void SetGizmoMode(ENGonGizmoMode Mode);
+    void SetShadingMode(ENGonViewportShading Mode);
     ENGonGizmoMode GetGizmoMode() const;
+    ENGonViewportShading GetShadingMode() const { return ShadingMode; }
     ENGonElement GetSelectionMode() const { return SelectionMode; }
     void ToggleHeatmap();
     void SetHeatmapVisible(bool bVisible);
@@ -30,6 +39,7 @@ public:
     bool IsGridVisible() const { return bGridVisible; }
     void SetMesh(FNGonMeshData&& Data);
     void FrameMesh();
+    void FocusViewport();
     bool DeleteSelectedFaces();
     void SetPaintTexture(const TArray<FColor>& Pixels, int32 Width, int32 Height) { PreviewScene->SetPaintTexture(Pixels, Width, Height); }
     int32 Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd);
@@ -45,6 +55,7 @@ protected:
 private:
     TSharedPtr<FNGonPreviewScene> PreviewScene;
     ENGonElement SelectionMode = ENGonElement::Face;
+    ENGonViewportShading ShadingMode = ENGonViewportShading::Faceted;
     bool bHeatmapVisible = false;
     bool bGridVisible = false;
 };
@@ -98,6 +109,7 @@ public:
     SLATE_END_ARGS()
 
     void Construct(const FArguments& InArgs);
+    ~SNGonPreview() override;
 
 private:
     FReply LoadDemo();
@@ -107,7 +119,8 @@ private:
     bool TryLoadFbx(const FString& Filename, FText& Error);
     void LoadStaticMesh(const FAssetData& Asset);
     void LoadSkeletalMesh(const FAssetData& Asset);
-    void ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const FText& InSourceType);
+    void ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const FText& InSourceType,
+        ENGonViewportShading Shading = ENGonViewportShading::Faceted);
     void ShowError(const FText& Error);
     void SetSelectionMode(ENGonElement Element);
     void SetActiveToolTab(ENGonToolShelfTab Tab);

@@ -276,7 +276,7 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
             ];
     };
 
-    auto MakeIconToolButton = [](
+    auto MakeIconToolButton = [this](
         ENGonTreeIconKind IconKind,
         const FText& Tooltip,
         TFunction<bool()> IsActiveFn,
@@ -299,9 +299,10 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                 {
                     return IsActiveFn() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
                 })
-                .OnCheckStateChanged_Lambda([OnClickFn](ECheckBoxState)
+                .OnCheckStateChanged_Lambda([this, OnClickFn](ECheckBoxState)
                 {
                     OnClickFn();
+                    Viewport->FocusViewport();
                 })
                 [
                     SNew(SNGonVectorIcon)
@@ -338,10 +339,6 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                             FExecuteAction::CreateLambda([this]()
                             {
                                 NGon::SetBoneGizmoActive(&Viewport->Preview(), true);
-                                if (Viewport->GetGizmoMode() == ENGonGizmoMode::None)
-                                {
-                                    Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
-                                }
                                 Viewport->Invalidate();
                             }),
                             FCanExecuteAction::CreateLambda([this]() { return !SkeletonBones.IsEmpty(); }),
@@ -562,10 +559,6 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                     {
                         const bool bNewBoneMode = !NGon::IsBoneGizmoActive(&Viewport->Preview());
                         NGon::SetBoneGizmoActive(&Viewport->Preview(), bNewBoneMode);
-                        if (bNewBoneMode && Viewport->GetGizmoMode() == ENGonGizmoMode::None)
-                        {
-                            Viewport->SetGizmoMode(ENGonGizmoMode::Translate);
-                        }
                         Viewport->Invalidate();
                     })
             ]
@@ -596,7 +589,6 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                     [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Vertex; },
                     [this]()
                     {
-                        NGon::SetBoneGizmoActive(&Viewport->Preview(), false);
                         SetSelectionMode(ENGonElement::Vertex);
                     })
             ]
@@ -608,7 +600,6 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                     [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Edge; },
                     [this]()
                     {
-                        NGon::SetBoneGizmoActive(&Viewport->Preview(), false);
                         SetSelectionMode(ENGonElement::Edge);
                     })
             ]
@@ -620,7 +611,6 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                     [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Face; },
                     [this]()
                     {
-                        NGon::SetBoneGizmoActive(&Viewport->Preview(), false);
                         SetSelectionMode(ENGonElement::Face);
                     })
             ]
@@ -1060,51 +1050,22 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
             [
                 SNew(SComboButton)
                 .ContentPadding(FMargin(5.0f, 2.0f))
-                .ToolTipText(LOCTEXT("ShadingModeTip", "Viewport Shading Mode (Lit Smooth, Lit Faceted, Wireframe)"))
+                .ToolTipText(LOCTEXT("ShadingModeTip", "Preview shading"))
                 .OnGetMenuContent_Lambda([this]()
                 {
                     FMenuBuilder Menu(true, nullptr);
-                    Menu.AddMenuEntry(
-                        LOCTEXT("ShadeLitSmooth", "Lit (Smooth Normals)"),
-                        FText(),
-                        FSlateIcon(),
-                        FUIAction(FExecuteAction::CreateLambda([this]()
-                        {
-                            GetSkeletonTreeUIState(this).ShadingMode = 0;
-                            NGon::SetSceneFlatShading(&Viewport->Preview(), false);
-                            if (TSharedPtr<FEditorViewportClient> Client = Viewport->GetViewportClient())
-                            {
-                                Client->SetViewMode(VMI_Unlit);
-                                Client->Invalidate();
-                            }
-                        })));
-                    Menu.AddMenuEntry(
-                        LOCTEXT("ShadeLitFlat", "Lit (Flat Faceted Polygons)"),
-                        FText(),
-                        FSlateIcon(),
-                        FUIAction(FExecuteAction::CreateLambda([this]()
-                        {
-                            GetSkeletonTreeUIState(this).ShadingMode = 1;
-                            NGon::SetSceneFlatShading(&Viewport->Preview(), true);
-                            if (TSharedPtr<FEditorViewportClient> Client = Viewport->GetViewportClient())
-                            {
-                                Client->SetViewMode(VMI_Unlit);
-                                Client->Invalidate();
-                            }
-                        })));
-                    Menu.AddMenuEntry(
-                        LOCTEXT("ShadeWireframe", "Wireframe"),
-                        FText(),
-                        FSlateIcon(),
-                        FUIAction(FExecuteAction::CreateLambda([this]()
-                        {
-                            GetSkeletonTreeUIState(this).ShadingMode = 3;
-                            if (TSharedPtr<FEditorViewportClient> Client = Viewport->GetViewportClient())
-                            {
-                                Client->SetViewMode(VMI_Wireframe);
-                                Client->Invalidate();
-                            }
-                        })));
+                    auto AddShadingMode = [this, &Menu](ENGonViewportShading Mode, const FText& Label)
+                    {
+                        Menu.AddMenuEntry(Label, FText(), FSlateIcon(),
+                            FUIAction(
+                                FExecuteAction::CreateLambda([this, Mode]() { Viewport->SetShadingMode(Mode); }),
+                                FCanExecuteAction(),
+                                FIsActionChecked::CreateLambda([this, Mode]() { return Viewport->GetShadingMode() == Mode; })),
+                            NAME_None, EUserInterfaceActionType::RadioButton);
+                    };
+                    AddShadingMode(ENGonViewportShading::Smooth, LOCTEXT("ShadeSmooth", "Smooth"));
+                    AddShadingMode(ENGonViewportShading::Faceted, LOCTEXT("ShadeFaceted", "Faceted"));
+                    AddShadingMode(ENGonViewportShading::Wireframe, LOCTEXT("ShadeWireframe", "Wireframe"));
                     return Menu.MakeWidget();
                 })
                 .ButtonContent()
@@ -1122,10 +1083,11 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                         .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
                         .Text_Lambda([this]()
                         {
-                            switch (GetSkeletonTreeUIState(this).ShadingMode)
+                            switch (Viewport->GetShadingMode())
                             {
-                            case 3: return LOCTEXT("LblWire", "Wireframe");
-                            default: return LOCTEXT("LblLit", "Lit");
+                            case ENGonViewportShading::Smooth: return LOCTEXT("ShadeSmooth", "Smooth");
+                            case ENGonViewportShading::Wireframe: return LOCTEXT("ShadeWireframe", "Wireframe");
+                            default: return LOCTEXT("ShadeFaceted", "Faceted");
                             }
                         })
                     ]

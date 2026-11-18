@@ -1,4 +1,4 @@
-# N-Gon for Unreal Engine 5.8
+# N-Gon 0.2.1 for Unreal Engine 5.8
 
 N-Gon is a project-local C++ editor plugin for picking authored polygons, edges and logical vertices. It reads raw FBX polygon loops and previews them over a triangulated surface.
 
@@ -14,6 +14,8 @@ N-Gon is a project-local C++ editor plugin for picking authored polygons, edges 
 
 4. Open the project and choose **Window → N-Gon**. The default FBX loads when the tab opens. If it is missing, ambiguous, or unreadable, the tab opens the built-in demo and shows the reason.
 
+When updating an existing installation, keep your `Plugins/NGon/Meshes` folder and rebuild the Editor target with Unreal closed.
+
 ## Try it
 
 | Control | What to check |
@@ -23,7 +25,9 @@ N-Gon is a project-local C++ editor plugin for picking authored polygons, edges 
 | **Static Mesh** | Choose an Unreal asset to inspect its editable LOD 0. Use the raw FBX for polygons that the Unreal import already triangulated. |
 | **Face / Edge / Vertex** | Click to select. Shift-click adds to the active selection. A face highlights all its underlying triangles. |
 | **Gizmo frame** | The gizmo follows the selected component like Maya/TiGUI: faces use centroid + normal + perimeter tangent, edges use midpoint + edge direction + adjacent normal, and vertices use incident-face normals. Multiple components use weighted averages. Enable **Active Frame** to pivot/orient from the active component. |
-| **Transform tool** | Press **W** for Translate, **E** for Rotate, or **R** for Scale. The toolbar also provides Combined mode. Unreal's native gizmo supplies mouse hit testing and drag capture; the selected component frame supplies the local axes. |
+| **Transform tool** | Click the viewport and select a face, edge, vertex, or joint. Press **W** for Translate, **E** for Rotate, **R** for Scale, or **Q** to hide the gizmo while selecting. The toolbar also provides Combined mode. Drag a handle to transform the active selection and press **Esc** during a drag to restore the starting pose. |
+| **Joints and components** | Press **4** or choose a joint in the Skeleton Tree to target bones. Press **1**, **2**, or **3** to pick mesh vertices, edges, or faces. |
+| **Shading** | Choose **Smooth**, **Faceted**, or **Wireframe** from the viewport toolbar. Loading another mesh restores its shaded view and frames the full mesh. Enable **Vertices** in the toolbar to see every logical vertex on an imported mesh. |
 | **Delete Faces** | In Face mode, select one or more faces and click **Delete Faces** or press **Delete/Backspace**. The preview rebuilds the remaining authored polygons, refreshes picking/overlays/gizmo state, and refuses to delete the final face. |
 | **Soft Heatmap** | Enable Soft Selection, select a face, edge, or vertex, then toggle Soft Heatmap. The surface uses the same blue-to-green-to-orange influence ramp as the soft-selection markers; changing radius, metric, connectivity, or gizmo deformation updates it. |
 | **Bend** | Scrub the position test and check that surface picking and visible overlays follow it. The **Positions** counter advances. |
@@ -31,7 +35,9 @@ N-Gon is a project-local C++ editor plugin for picking authored polygons, edges 
 
 Choose **Window → N-Gon UV Editor** to open the native Slate UV editor. It reads the primary UV overlay from the same raw FBX/default mesh and keeps overlay element IDs intact, so authored seams remain separate UV corners. Corner, edge, face and island modes support Shift-add and Ctrl marquee selection; left-drag moves the selected UVs, middle/right drag pans, and the wheel zooms around the cursor. The toolbar provides Fit, 90-degree rotation, Flip U/V, Normalize and Reload. The grid, UV triangle outlines, corner markers, selected highlighting and status line provide the same inspection feedback as the TiGUI UV canvas.
 
-Use Alt + left drag to orbit, scroll to zoom, and **Frame Mesh** to reset the camera. Translate, rotate, and scale with the gizmo; the frame is frozen at gesture start so soft selection remains stable through the drag.
+Use Alt + left drag to orbit, scroll to zoom, and **F** to frame the current selection or the full mesh. The gizmo keeps its starting frame through each drag so soft selection stays stable.
+
+For a quick viewport check, load the demo, click a face, and drag a **W** arrow and an **E** ring. The face should stay selected during the drag. Repeat with your default FBX. If you work with skeletal meshes, select a joint in the Skeleton Tree and repeat, then press **3** and confirm that clicking the visible surface selects a face.
 
 ## FBX export and preview
 
@@ -50,7 +56,7 @@ Use Alt + left drag to orbit, scroll to zoom, and **Frame Mesh** to reset the ca
 
 ## Run the tests
 
-Run `Automation RunTests NGon` in the Unreal Editor console. The tests cover demo topology and picking, safe edge loops, face deletion (including the final-face guard), default-file precedence and a generated FBX with concavity, transform offsets and both imported color mappings.
+Run `Automation RunTests NGon` in the Unreal Editor console. The suite covers demo topology and picking, edge loops, face deletion, default FBX precedence, FBX import, viewport gizmo visibility across transform modes, and paint updates with face selection and heatmap enabled.
 
 ```bat
 "D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" "D:\Projects\MyProject\MyProject.uproject" -ExecCmds="Automation RunTests NGon" -unattended -nopause -nullrhi -log -TestExit="Automation Test Queue Empty"

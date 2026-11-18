@@ -1,7 +1,7 @@
 {
     "FileVersion": 3,
-    "Version": 2,
-    "VersionName": "0.2.0",
+    "Version": 3,
+    "VersionName": "0.2.1",
     "FriendlyName": "N-Gon",
     "Description": "Preview authored polygons, edges, vertices and scalar heatmaps from raw FBX or static meshes.",
     "Category": "Modeling",
@@ -15,10 +15,7 @@
         }
     ],
     "Plugins": [
-        {
-            "Name": "TiPaint",
-            "Enabled": true
-        },
+        
         {
             "Name": "MeshModelingToolset",
             "Enabled": true
