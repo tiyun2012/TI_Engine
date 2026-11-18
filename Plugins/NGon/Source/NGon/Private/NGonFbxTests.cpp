@@ -18,7 +18,13 @@ namespace
 {
 struct FFbxTestManagerDeleter
 {
-    void operator()(FbxManager* Manager) const { Manager->Destroy(); }
+    void operator()(FbxManager* Manager) const
+    {
+        if (Manager)
+        {
+            Manager->Destroy();
+        }
+    }
 };
 
 bool WriteFbxFixture(const FString& Path, bool bUseCornerColors)
@@ -30,16 +36,32 @@ bool WriteFbxFixture(const FString& Path, bool bUseCornerColors)
     }
 
     FbxIOSettings* Settings = FbxIOSettings::Create(Manager.Get(), IOSROOT);
+    if (!Settings)
+    {
+        return false;
+    }
     Manager->SetIOSettings(Settings);
     FbxScene* Scene = FbxScene::Create(Manager.Get(), "NGonTest");
+    if (!Scene)
+    {
+        return false;
+    }
     Scene->GetGlobalSettings().SetAxisSystem(FbxAxisSystem::Max);
     Scene->GetGlobalSettings().SetSystemUnit(FbxSystemUnit::m);
     FbxNode* Node = FbxNode::Create(Scene, "Mesh");
+    if (!Node)
+    {
+        return false;
+    }
     Node->LclTranslation.Set(FbxDouble3(2.0, 3.0, 0.5));
     Node->SetGeometricTranslation(FbxNode::eSourcePivot, FbxVector4(0.25, -0.5, 0.5));
     Scene->GetRootNode()->AddChild(Node);
 
     FbxMesh* Mesh = FbxMesh::Create(Scene, "QuadAndConcaveFace");
+    if (!Mesh)
+    {
+        return false;
+    }
     Node->SetNodeAttribute(Mesh);
     const FbxVector4 Points[] = {
         {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}, {2, 0, 0}, {2, 1, 0}, {1.5, 1, 0}, {1.5, 0.4, 0}
@@ -88,8 +110,14 @@ bool WriteFbxFixture(const FString& Path, bool bUseCornerColors)
     }
 
     FbxExporter* Exporter = FbxExporter::Create(Manager.Get(), "");
+    if (!Exporter)
+    {
+        return false;
+    }
     const int32 Writer = Manager->GetIOPluginRegistry()->GetNativeWriterFormat();
-    return Exporter->Initialize(TCHAR_TO_UTF8(*Path), Writer, Settings) && Exporter->Export(Scene);
+    const bool bExported = Exporter->Initialize(TCHAR_TO_UTF8(*Path), Writer, Settings) && Exporter->Export(Scene);
+    Exporter->Destroy();
+    return bExported;
 }
 }
 

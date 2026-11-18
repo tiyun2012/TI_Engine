@@ -4,6 +4,7 @@
 #include "Modules/ModuleManager.h"
 #include "SNGonPreview.h"
 #include "NGonUVEditor.h"
+#include "STiPaintEditor.h"
 #include "ToolMenus.h"
 #include "Widgets/Docking/SDockTab.h"
 
@@ -13,6 +14,7 @@ namespace
 {
 const FName PreviewTabName(TEXT("NGonViewport"));
 const FName UVEditorTabName(TEXT("NGonUVEditor"));
+const FName PaintTabName(TEXT("TiPaintEditor"));
 }
 
 class FNGonModule final : public IModuleInterface
@@ -33,6 +35,10 @@ public:
             UVEditorTabName, FOnSpawnTab::CreateRaw(this, &FNGonModule::SpawnUVTab))
             .SetDisplayName(LOCTEXT("UVTabTitle", "N-Gon UV Editor"))
             .SetMenuType(ETabSpawnerMenuType::Hidden);
+        FGlobalTabmanager::Get()->RegisterNomadTabSpawner(
+            PaintTabName, FOnSpawnTab::CreateRaw(this, &FNGonModule::SpawnPaintTab))
+            .SetDisplayName(LOCTEXT("PaintTabTitle", "Ti Paint"))
+            .SetMenuType(ETabSpawnerMenuType::Hidden);
 
         UToolMenus::RegisterStartupCallback(
             FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FNGonModule::RegisterMenus));
@@ -50,6 +56,7 @@ public:
             }
             FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(PreviewTabName);
             FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(UVEditorTabName);
+            FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(PaintTabName);
         }
     }
 
@@ -105,6 +112,14 @@ private:
         return SNew(SDockTab).TabRole(ETabRole::NomadTab)
             [
                 SNew(SNGonUVEditor)
+            ];
+    }
+
+    TSharedRef<SDockTab> SpawnPaintTab(const FSpawnTabArgs&)
+    {
+        return SNew(SDockTab).TabRole(ETabRole::NomadTab)
+            [
+                SNew(STiPaintEditor)
             ];
     }
 

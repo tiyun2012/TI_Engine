@@ -28,7 +28,8 @@ public class NGon : ModuleRules
             "MeshConversion",
             "InteractiveToolsFramework",
             "ModelingComponents"
-            ,"TiPaint"
+            ,
+            "ImageWrapper"
         });
 
         AddEngineThirdPartyPrivateStaticDependencies(Target, "FBX");

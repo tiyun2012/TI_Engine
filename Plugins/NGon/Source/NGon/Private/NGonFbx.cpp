@@ -17,7 +17,13 @@ namespace
 {
 struct FDestroyFbxManager
 {
-    void operator()(FbxManager* Manager) const { Manager->Destroy(); }
+    void operator()(FbxManager* Manager) const
+    {
+        if (Manager)
+        {
+            Manager->Destroy();
+        }
+    }
 };
 
 struct FHeatAccumulator
@@ -482,6 +488,8 @@ bool NGon::LoadFbx(const FString& Filename, FNGonMeshData& Out, FText& Error)
         Error = MakeFbxError(LOCTEXT("FbxReadError", "The SDK could not read the FBX scene."), *Importer);
         return false;
     }
+    Importer->Destroy();
+    Importer = nullptr;
 
     FbxAxisSystem::Max.DeepConvertScene(Scene);
     const double ToCentimeters = Scene->GetGlobalSettings().GetSystemUnit().GetScaleFactor();
@@ -516,6 +524,11 @@ bool NGon::LoadFbx(const FString& Filename, FNGonMeshData& Out, FText& Error)
             Pending.Add(Node->GetChild(Child));
         }
     }
+
+    // Release FBX SDK scene and manager as soon as mesh data is extracted;
+    // FDestroyFbxManager safely guards against nullptr when ~TUniquePtr runs.
+    Manager.Reset();
+
     if (Faces.IsEmpty())
     {
         Error = LOCTEXT("FbxNoMesh", "The FBX contains no polygon mesh faces.");
