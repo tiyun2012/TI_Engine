@@ -1,4 +1,4 @@
-# N-Gon 0.2.1 for Unreal Engine 5.8
+# N-Gon 0.2.3 for Unreal Engine 5.8
 
 N-Gon is a project-local C++ editor plugin for picking authored polygons, edges and logical vertices. It reads raw FBX polygon loops and previews them over a triangulated surface.
 
@@ -25,9 +25,9 @@ When updating an existing installation, keep your `Plugins/NGon/Meshes` folder a
 | **Static Mesh** | Choose an Unreal asset to inspect its editable LOD 0. Use the raw FBX for polygons that the Unreal import already triangulated. |
 | **Face / Edge / Vertex** | Click to select. Shift-click adds to the active selection. A face highlights all its underlying triangles. |
 | **Gizmo frame** | The gizmo follows the selected component like Maya/TiGUI: faces use centroid + normal + perimeter tangent, edges use midpoint + edge direction + adjacent normal, and vertices use incident-face normals. Multiple components use weighted averages. Enable **Active Frame** to pivot/orient from the active component. |
-| **Transform tool** | Click the viewport and select a face, edge, vertex, or joint. Press **W** for Translate, **E** for Rotate, **R** for Scale, or **Q** to hide the gizmo while selecting. The toolbar also provides Combined mode. Drag a handle to transform the active selection and press **Esc** during a drag to restore the starting pose. |
+| **Transform tool** | Click the viewport and select a face, edge, vertex, or joint. Press **W** for Translate, **E** for Rotate, **R** for Scale, or **Q** to hide the gizmo while selecting. The handles draw above the surface, including on joints inside the mesh. Drag a handle to transform the selection and press **Esc** during a drag to restore the starting pose. The toolbar also provides Combined mode. |
 | **Joints and components** | Press **4** or choose a joint in the Skeleton Tree to target bones. Press **1**, **2**, or **3** to pick mesh vertices, edges, or faces. |
-| **Shading** | Choose **Smooth**, **Faceted**, or **Wireframe** from the viewport toolbar. Loading another mesh restores its shaded view and frames the full mesh. Enable **Vertices** in the toolbar to see every logical vertex on an imported mesh. |
+| **Shading** | Choose **Smooth**, **Faceted**, or **Wireframe** from the viewport toolbar. Unreal mesh assets display their assigned material slots under preview lighting. The demo and raw FBX use a neutral material. Enable **Vertices** in the toolbar to see every logical vertex on an imported mesh. |
 | **Delete Faces** | In Face mode, select one or more faces and click **Delete Faces** or press **Delete/Backspace**. The preview rebuilds the remaining authored polygons, refreshes picking/overlays/gizmo state, and refuses to delete the final face. |
 | **Soft Heatmap** | Enable Soft Selection, select a face, edge, or vertex, then toggle Soft Heatmap. The surface uses the same blue-to-green-to-orange influence ramp as the soft-selection markers; changing radius, metric, connectivity, or gizmo deformation updates it. |
 | **Bend** | Scrub the position test and check that surface picking and visible overlays follow it. The **Positions** counter advances. |
@@ -37,7 +37,7 @@ Choose **Window → N-Gon UV Editor** to open the native Slate UV editor. It rea
 
 Use Alt + left drag to orbit, scroll to zoom, and **F** to frame the current selection or the full mesh. The gizmo keeps its starting frame through each drag so soft selection stays stable.
 
-For a quick viewport check, load the demo, click a face, and drag a **W** arrow and an **E** ring. The face should stay selected during the drag. Repeat with your default FBX. If you work with skeletal meshes, select a joint in the Skeleton Tree and repeat, then press **3** and confirm that clicking the visible surface selects a face.
+For a skeletal viewport check, load your mesh and select **spine_01** or a comparable joint in the Skeleton Tree. Press **W** and drag an arrow over the character. Press **E** and drag a ring, then repeat from another orbit angle. Press **Q** to hide the handles. Press **3** and click a face to check component selection.
 
 ## FBX export and preview
 
@@ -50,13 +50,13 @@ For a quick viewport check, load the demo, click a face, and drag a **W** arrow 
 
 `NGonFbx` reads original polygon loops from the SDK. `NGonTopology` builds polygons in `FMeshDescription` and maps the resulting triangles back to source face IDs. `NGonPicking` uses an AABB tree for face hits and screen-space snapping for edges and vertices.
 
-`NGonPreviewScene` builds the color overlay indices when the topology loads, then edits values in place for heatmap and face selection changes. Bend uses the dynamic mesh position update path, rebuilds the picking tree, and updates the existing preview line and point geometry in place. The counters show plugin update requests.
+`NGonPreviewScene` keeps the asset material IDs and vertex colors. Face selection uses a secondary render pass, and heatmap colors use a temporary render override. The viewport projects transform handle geometry once per frame for drawing and projects the same geometry on mouse-down for picking. Bend updates dynamic mesh positions and the picking tree in place.
 
 [Epic's mesh description polygon API](https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/MeshDescription/FMeshDescription/CreatePolygon) · [Epic's attribute update constraints](https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/GeometryFramework/UDynamicMeshComponent/NotifyMeshVertex-) · [Autodesk's FBX mesh API](https://help.autodesk.com/cloudhelp/2020/ENU/FBX-API-Reference/cpp_ref/class_fbx_mesh.html)
 
 ## Run the tests
 
-Run `Automation RunTests NGon` in the Unreal Editor console. The suite covers demo topology and picking, edge loops, face deletion, default FBX precedence, FBX import, viewport gizmo visibility across transform modes, and paint updates with face selection and heatmap enabled.
+Run `Automation RunTests NGon` in the Unreal Editor console. The suite covers demo topology and picking, edge loops, face deletion, default FBX precedence, FBX import, projected gizmo handles, and restoration of asset materials and vertex colors after paint or heatmap use.
 
 ```bat
 "D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" "D:\Projects\MyProject\MyProject.uproject" -ExecCmds="Automation RunTests NGon" -unattended -nopause -nullrhi -log -TestExit="Automation Test Queue Empty"

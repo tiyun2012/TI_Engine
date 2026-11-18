@@ -360,7 +360,6 @@ void ClearSceneSkeleton(FNGonPreviewScene* Scene)
     Accel.bBoneDragActive = false;
     Accel.bPendingSkinningUpdate = false;
     Accel.bPendingFullSkinReset = false;
-    Scene->UpdateGizmo();
 }
 
 bool HasSceneBones(const FNGonPreviewScene* Scene)
@@ -390,7 +389,6 @@ void SelectSceneBone(FNGonPreviewScene* Scene, int32 BoneIndex, bool bActivateBo
         Accel.SelectedBoneIndex = INDEX_NONE;
         Accel.bBoneGizmoActive = false;
     }
-    Scene->UpdateGizmo();
 }
 
 int32 GetSelectedSceneBone(const FNGonPreviewScene* Scene)
@@ -420,7 +418,6 @@ void SetBoneGizmoActive(FNGonPreviewScene* Scene, bool bActive)
         Accel.SelectedBoneIndex = 0;
     }
     Accel.bBoneGizmoActive = bActive && Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex);
-    Scene->UpdateGizmo();
 }
 
 bool IsBoneTransformActive(const FNGonPreviewScene* Scene)
@@ -466,7 +463,7 @@ void SetSceneBoneLocalTransform(FNGonPreviewScene* Scene, int32 BoneIndex, const
     }
     Accel.Bones[BoneIndex].CurrentLocalTransform = NewLocalTransform;
     Accel.bPendingSkinningUpdate = true;
-    Scene->UpdateGizmo();
+    Scene->RefreshBoneDeformation();
 }
 
 bool ResetSelectedSceneBoneTransform(FNGonPreviewScene* Scene)
@@ -482,7 +479,7 @@ bool ResetSelectedSceneBoneTransform(FNGonPreviewScene* Scene)
     }
     Accel.Bones[Accel.SelectedBoneIndex].CurrentLocalTransform = Accel.Bones[Accel.SelectedBoneIndex].RefLocalTransform;
     Accel.bPendingSkinningUpdate = true;
-    Scene->UpdateGizmo();
+    Scene->RefreshBoneDeformation();
     return true;
 }
 
@@ -505,7 +502,7 @@ bool ResetAllSceneBonesTransforms(FNGonPreviewScene* Scene)
     }
     Accel.bPendingFullSkinReset = true;
     Accel.bPendingSkinningUpdate = true;
-    Scene->UpdateGizmo();
+    Scene->RefreshBoneDeformation();
     return true;
 }
 
@@ -759,7 +756,6 @@ void SetSceneCoordinateSystem(FNGonPreviewScene* Scene, bool bUseWorldSpace)
         return;
     }
     GetSceneAccel(Scene).bUseWorldCoordinateSystem = bUseWorldSpace;
-    Scene->UpdateGizmo();
 }
 
 bool IsSceneWorldCoordinateSystem(const FNGonPreviewScene* Scene)

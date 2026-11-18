@@ -22,6 +22,7 @@
 #include "Rendering/SkeletalMeshLODModel.h"
 #include "Rendering/SkeletalMeshModel.h"
 #include "STiPaintEditor.h"
+#include "StaticMeshAttributes.h"
 #include "TiPaintDocument.h"
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/SBoxPanel.h"
@@ -38,6 +39,53 @@ using NGon::FNGonSkeletonTreeUIState;
 using NGon::GetSkeletonTreeUIState;
 
 #define LOCTEXT_NAMESPACE "NGonPreview"
+
+namespace
+{
+template <typename SlotType>
+TArray<UMaterialInterface*> BindPreviewMaterials(const FMeshDescription& Source,
+    const TArray<SlotType>& AssetSlots, FNGonMeshData& Data)
+{
+    const auto SlotNames = FStaticMeshConstAttributes(Source).GetPolygonGroupMaterialSlotNames();
+    TMap<FPolygonGroupID, int32> GroupToPreviewSlot;
+    TArray<UMaterialInterface*> Materials;
+    for (const FPolygonGroupID Group : Source.PolygonGroups().GetElementIDs())
+    {
+        const FName Name = SlotNames.IsValid() ? SlotNames[Group] : NAME_None;
+        const SlotType* Slot = nullptr;
+        if (!Name.IsNone())
+        {
+            Slot = AssetSlots.FindByPredicate([Name](const SlotType& Entry) { return Entry.ImportedMaterialSlotName == Name; });
+            if (!Slot)
+            {
+                Slot = AssetSlots.FindByPredicate([Name](const SlotType& Entry) { return Entry.MaterialSlotName == Name; });
+            }
+        }
+        if (!Slot && AssetSlots.IsValidIndex(Group.GetValue()))
+        {
+            Slot = &AssetSlots[Group.GetValue()];
+        }
+        GroupToPreviewSlot.Add(Group, Materials.Add(Slot ? Slot->MaterialInterface.Get() : nullptr));
+    }
+
+    auto* Attributes = Data.Mesh.Attributes();
+    if (!Attributes->HasMaterialID())
+    {
+        Attributes->EnableMaterialID();
+    }
+    auto* MaterialIds = Attributes->GetMaterialID();
+    for (const TPair<int32, FNGonFace>& Face : Data.Topology.Faces)
+    {
+        const FPolygonGroupID Group = Source.GetPolygonPolygonGroup(FPolygonID(Face.Key));
+        const int32 Index = GroupToPreviewSlot.FindChecked(Group);
+        for (const int32 TriangleId : Face.Value.Triangles)
+        {
+            MaterialIds->SetValue(TriangleId, Index);
+        }
+    }
+    return Materials;
+}
+}
 
 void SNGonPreview::Construct(const FArguments& InArgs)
 {
@@ -261,8 +309,9 @@ void SNGonPreview::LoadStaticMesh(const FAssetData& Asset)
 
     bShowEdges = !bTriangleOnly;
     bShowVertices = false;
+    TArray<UMaterialInterface*> Materials = BindPreviewMaterials(*Source, StaticMesh->GetStaticMaterials(), Data);
     ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("StaticMeshType", "Static Mesh"),
-        ENGonViewportShading::Smooth);
+        ENGonViewportShading::Smooth, MoveTemp(Materials));
     if (bTriangleOnly)
     {
         ShowError(LOCTEXT("TrianglesOnly",
@@ -525,8 +574,9 @@ void SNGonPreview::LoadSkeletalMesh(const FAssetData& Asset)
     bShowVertices = false;
     SkelUIState.BoneDrawMode = 2; // Selected Bone Only (matching image_3b0306.jpg)
 
+    TArray<UMaterialInterface*> Materials = BindPreviewMaterials(SourceMeshDesc, SkeletalMesh->GetMaterials(), Data);
     ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("SkeletalMeshType", "Skeletal Mesh"),
-        ENGonViewportShading::Smooth);
+        ENGonViewportShading::Smooth, MoveTemp(Materials));
 
     NGon::SetSceneSkeleton(&Viewport->Preview(), SceneBonesInit, ExtractedSkinWeights);
     if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
@@ -608,7 +658,7 @@ FReply SNGonPreview::OpenFbx()
 }
 
 void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const FText& InSourceType,
-    ENGonViewportShading Shading)
+    ENGonViewportShading Shading, TArray<UMaterialInterface*> Materials)
 {
     TArray<FTiPaintUVTriangle> PaintTriangles;
     if (Data.Mesh.HasAttributes() && Data.Mesh.Attributes()->PrimaryUV())
@@ -636,7 +686,7 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const
     HeatBias = 0.0f;
     Bend = 0.0f;
     NGon::SetActiveViewportUVMesh(Data, SourceName, InSourceType);
-    Viewport->SetMesh(MoveTemp(Data));
+    Viewport->SetMesh(MoveTemp(Data), MoveTemp(Materials));
     Viewport->SetShadingMode(Shading);
     if (Painter.IsValid())
     {

@@ -8,6 +8,8 @@
 #include "Components/DynamicMeshComponent.h"
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "HAL/FileManager.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -92,31 +94,63 @@ bool FNGonPreviewMaterialTest::RunTest(const FString& Parameters)
         return false;
     }
 
+    auto* Attributes = Data.Mesh.Attributes();
+    if (!Attributes->HasMaterialID())
+    {
+        Attributes->EnableMaterialID();
+    }
+    Attributes->DisablePrimaryColors();
+    Attributes->EnablePrimaryColors();
+    const FVector4f SourceColor(0.32f, 0.45f, 0.64f, 1.0f);
+    for (const int32 TriangleId : Data.Mesh.TriangleIndicesItr())
+    {
+        Attributes->GetMaterialID()->SetValue(TriangleId, Data.Mesh.GetTriangleGroup(TriangleId) == 0 ? 1 : 0);
+        auto* Colors = Attributes->PrimaryColors();
+        UE::Geometry::FIndex3i CornerIds;
+        for (int32 Corner = 0; Corner < 3; ++Corner)
+        {
+            CornerIds[Corner] = Colors->AppendElement(SourceColor);
+        }
+        Colors->SetTriangle(TriangleId, CornerIds);
+    }
+
     FNGonPreviewScene Scene;
-    Scene.SetMesh(MoveTemp(Data));
+    UMaterial* Default = UMaterial::GetDefaultMaterial(MD_Surface);
+    UMaterialInstanceDynamic* SlotA = UMaterialInstanceDynamic::Create(Default, GetTransientPackage());
+    UMaterialInstanceDynamic* SlotB = UMaterialInstanceDynamic::Create(Default, GetTransientPackage());
+    Scene.SetMesh(MoveTemp(Data), { SlotA, SlotB });
+    const auto& Mesh = Scene.Surface->GetDynamicMesh()->GetMeshRef();
+    const auto* Colors = Mesh.Attributes()->PrimaryColors();
+    const int32 Triangle = Scene.GetTopology().Faces.FindChecked(0).Triangles[0];
+    const int32 ColorElement = Colors->GetTriangle(Triangle).A;
+
+    TestTrue(TEXT("Preview retains both asset material slots"), Scene.Surface->GetMaterial(0) == SlotA
+        && Scene.Surface->GetMaterial(1) == SlotB);
+    TestEqual(TEXT("Triangle retains its material assignment"), Mesh.Attributes()->GetMaterialID()->GetValue(Triangle), 1);
+    TestTrue(TEXT("Asset vertex colors survive mesh setup"), Colors->GetElement(ColorElement) == SourceColor);
+
+    TArray<FColor> Pixels;
+    Pixels.Init(FColor::Transparent, 4);
+    Scene.SetPaintTexture(Pixels, 2, 2);
+    TestFalse(TEXT("Blank painter leaves the asset material active"), Scene.PaintTexture.IsValid());
+
     Scene.SelectElement(ENGonElement::Face, 0);
     FNGonSoftSelectionSettings Settings;
     Settings.bEnabled = true;
     Scene.SetSoftSelection(Settings);
     Scene.SetHeatmapVisible(true);
+    const FVector4f Heat = Colors->GetElement(ColorElement);
+    TestTrue(TEXT("Selected vertices get a heatmap color"), Heat.X > 0.9f);
 
-    const UMaterialInterface* Material = Scene.Surface->GetMaterial(0);
-    const auto& Mesh = Scene.Surface->GetDynamicMesh()->GetMeshRef();
-    const auto* Colors = Mesh.Attributes()->PrimaryColors();
-    const int32 Triangle = Scene.GetTopology().Faces.FindChecked(0).Triangles[0];
-    const int32 ColorElement = Colors->GetTriangle(Triangle).A;
-    const FVector4f SelectionAndHeat = Colors->GetElement(ColorElement);
-    TestTrue(TEXT("Selected face and heatmap channels set"), SelectionAndHeat.Y == 1.0f && SelectionAndHeat.Z == 1.0f);
-
-    TArray<FColor> Pixels;
     Pixels.Init(FColor(0, 0, 255, 255), 4);
     Scene.SetPaintTexture(Pixels, 2, 2);
-    TestTrue(TEXT("Preview paint texture uploaded"), Scene.PaintTexture.IsValid());
-    TestTrue(TEXT("Paint upload uses the existing surface material"), Scene.Surface->GetMaterial(0) == Material);
-    TestTrue(TEXT("Paint preserves face selection and heatmap channels"), Colors->GetElement(ColorElement) == SelectionAndHeat);
+    TestTrue(TEXT("Paint material is prepared for nontransparent strokes"), Scene.PaintTexture.IsValid());
+    TestTrue(TEXT("Painting does not overwrite an active heatmap color"), Colors->GetElement(ColorElement) == Heat);
     Scene.ClearPaintTexture();
+    Scene.SetHeatmapVisible(false);
     TestFalse(TEXT("Clearing paint releases the paint texture"), Scene.PaintTexture.IsValid());
-    TestTrue(TEXT("Clearing paint preserves the surface material"), Scene.Surface->GetMaterial(0) == Material);
+    TestTrue(TEXT("Disabling the heatmap restores imported vertex colors"), Colors->GetElement(ColorElement) == SourceColor);
+    TestTrue(TEXT("Clearing overrides retains the assigned asset material"), Scene.Surface->GetMaterial(1) == SlotB);
     return true;
 }
 

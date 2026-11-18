@@ -27,8 +27,7 @@ public class NGon : ModuleRules
             "StaticMeshDescription",
             "MeshConversion",
             "InteractiveToolsFramework",
-            "ModelingComponents"
-            ,
+            "ModelingComponents",
             "ImageWrapper"
         });
 

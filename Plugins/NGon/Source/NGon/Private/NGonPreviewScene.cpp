@@ -1,12 +1,7 @@
 #include "NGonPreviewScene.h"
 #include "NGonSceneSkeleton.h"
 
-#include "BaseGizmos/CombinedTransformGizmo.h"
-#include "BaseGizmos/GizmoBaseComponent.h"
-#include "BaseGizmos/GizmoViewContext.h"
-#include "BaseGizmos/TransformGizmoUtil.h"
-#include "BaseGizmos/TransformProxy.h"
-#include "BaseGizmos/ViewAdjustedStaticMeshGizmoComponent.h"
+#include "Algo/AnyOf.h"
 #include "Components/DynamicMeshComponent.h"
 #include "Drawing/LineSetComponent.h"
 #include "Drawing/PointSetComponent.h"
@@ -14,16 +9,16 @@
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "DynamicMesh/MeshNormals.h"
 #include "Engine/Texture2D.h"
-#include "InteractiveGizmoManager.h"
 #include "MaterialEditingLibrary.h"
+#include "MaterialShared.h"
 #include "Materials/Material.h"
-#include "Materials/MaterialExpressionCameraVectorWS.h"
 #include "Materials/MaterialExpressionCustom.h"
-#include "Materials/MaterialExpressionPixelNormalWS.h"
+#include "Materials/MaterialExpressionConstant3Vector.h"
+#include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionTextureCoordinate.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
-#include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "SceneInterface.h"
 #include "TextureResource.h"
 #include "ToolSetupUtil.h"
 #include "UDynamicMesh.h"
@@ -41,14 +36,23 @@ const FColor PointColor(230, 249, 255);
 const FColor SelectionColor(255, 181, 65);
 const FName PaintTextureParameter(TEXT("PaintTexture"));
 
-UMaterial* MakeSurfaceMaterial(UTexture2D* PaintTexture)
+const FLinearColor StudioColor(0.46f, 0.49f, 0.53f);
+
+FLinearColor HeatColor(float Alpha)
+{
+    const FLinearColor Cold(0.025f, 0.11f, 0.85f);
+    const FLinearColor Mid(0.055f, 0.76f, 0.34f);
+    const FLinearColor Hot(0.98f, 0.08f, 0.018f);
+    const float T = FMath::Clamp(Alpha, 0.0f, 1.0f) * 2.0f;
+    return T < 1.0f ? FMath::Lerp(Cold, Mid, T) : FMath::Lerp(Mid, Hot, T - 1.0f);
+}
+
+UMaterial* MakePaintMaterial(UTexture2D* PaintTexture)
 {
     UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
-    Material->SetShadingModel(MSM_Unlit);
+    Material->SetShadingModel(MSM_DefaultLit);
     Material->TwoSided = true;
 
-    auto* VertexColor = UMaterialEditingLibrary::CreateMaterialExpression(
-        Material, UMaterialExpressionVertexColor::StaticClass(), -400, 0);
     auto* PaintSample = CastChecked<UMaterialExpressionTextureSampleParameter2D>(UMaterialEditingLibrary::CreateMaterialExpression(
         Material, UMaterialExpressionTextureSampleParameter2D::StaticClass(), -400, 180));
     PaintSample->Texture = PaintTexture;
@@ -64,52 +68,16 @@ UMaterial* MakeSurfaceMaterial(UTexture2D* PaintTexture)
     PaintUV->Inputs[0].Input.Connect(0, MeshUV);
     PaintUV->Code = TEXT("return float2(MeshUV.x, 1.0 - MeshUV.y);");
     PaintSample->Coordinates.Connect(0, PaintUV);
-    auto* Normal = UMaterialEditingLibrary::CreateMaterialExpression(
-        Material, UMaterialExpressionPixelNormalWS::StaticClass(), -400, 360);
-    auto* Camera = UMaterialEditingLibrary::CreateMaterialExpression(
-        Material, UMaterialExpressionCameraVectorWS::StaticClass(), -400, 490);
-    auto* Shade = CastChecked<UMaterialExpressionCustom>(UMaterialEditingLibrary::CreateMaterialExpression(
-        Material, UMaterialExpressionCustom::StaticClass(), -180, 0));
-    Shade->OutputType = CMOT_Float3;
-    Shade->Inputs.SetNum(5);
-    Shade->Inputs[0].InputName = TEXT("MeshData");
-    Shade->Inputs[0].Input.Connect(0, VertexColor);
-    Shade->Inputs[1].InputName = TEXT("PaintColor");
-    Shade->Inputs[1].Input.Connect(0, PaintSample);
-    Shade->Inputs[2].InputName = TEXT("PaintAlpha");
-    // Texture Sample exposes RGB at output 0 and alpha at output 4.
-    Shade->Inputs[2].Input.Connect(4, PaintSample);
-    Shade->Inputs[3].InputName = TEXT("SurfaceNormal");
-    Shade->Inputs[3].Input.Connect(0, Normal);
-    Shade->Inputs[4].InputName = TEXT("ViewDirection");
-    Shade->Inputs[4].Input.Connect(0, Camera);
-    // MeshData contains soft weight, face selection and heatmap visibility.
-    // Paint is sampled separately in UV space so it cannot change those flags.
-    Shade->Code = TEXT(
-        "float t = saturate(MeshData.r);\n"
-        "float3 cold = float3(0.025, 0.11, 0.85);\n"
-        "float3 mid = float3(0.055, 0.76, 0.34);\n"
-        "float3 hot = float3(0.98, 0.08, 0.018);\n"
-        "float3 ramp = lerp(lerp(cold, mid, saturate(2 * t)), hot, saturate(2 * t - 1));\n"
-        "float3 baseAlbedo = float3(0.56, 0.58, 0.61);\n"
-        "float3 painted = lerp(baseAlbedo, PaintColor.rgb, saturate(PaintAlpha));\n"
-        "float3 surface = lerp(painted, ramp, MeshData.b);\n"
-        "float3 albedo = lerp(surface, float3(1.0, 0.48, 0.075), 0.65 * MeshData.g);\n"
-        "float3 N = SurfaceNormal;\n"
-        "float3 V = ViewDirection;\n"
-        "float3 Lkey = normalize(float3(0.42, -0.52, 0.74));\n"
-        "float3 Lfill = normalize(float3(-0.65, 0.38, 0.25));\n"
-        "float ndotlKey = saturate(dot(N, Lkey));\n"
-        "float ndotlFill = saturate(dot(N, Lfill));\n"
-        "float ndotv = abs(dot(N, V));\n"
-        "float hemi = saturate(N.z * 0.5 + 0.5);\n"
-        "float3 halfVector = Lkey + V;\n"
-        "float3 H = halfVector * rsqrt(max(dot(halfVector, halfVector), 1e-6));\n"
-        "float spec = pow(saturate(dot(N, H)), 28.0) * 0.22 * (1.0 - MeshData.b);\n"
-        "float lighting = 0.28 + 0.48 * ndotlKey + 0.18 * ndotlFill + 0.14 * hemi + 0.16 * ndotv;\n"
-        "return albedo * lighting + float3(spec, spec, spec);");
 
-    Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Shade);
+    auto* Base = CastChecked<UMaterialExpressionConstant3Vector>(UMaterialEditingLibrary::CreateMaterialExpression(
+        Material, UMaterialExpressionConstant3Vector::StaticClass(), -400, 0));
+    Base->Constant = StudioColor;
+    auto* Composite = CastChecked<UMaterialExpressionLinearInterpolate>(UMaterialEditingLibrary::CreateMaterialExpression(
+        Material, UMaterialExpressionLinearInterpolate::StaticClass(), -160, 0));
+    Composite->A.Connect(0, Base);
+    Composite->B.Connect(0, PaintSample);
+    Composite->Alpha.Connect(4, PaintSample);
+    Material->GetEditorOnlyData()->BaseColor.Connect(0, Composite);
     Material->PostEditChange();
     return Material;
 }
@@ -161,7 +129,7 @@ bool UploadPaintPixels(UTexture2D* Texture, const FColor* Pixels, int64 PixelCou
 }
 
 FNGonPreviewScene::FNGonPreviewScene()
-    : Scene(FPreviewScene::ConstructionValues().SetCreatePhysicsScene(true))
+    : Scene(FPreviewScene::ConstructionValues().SetCreatePhysicsScene(false))
 {
     GetSceneAccel(this);
 
@@ -170,14 +138,8 @@ FNGonPreviewScene::FNGonPreviewScene()
     Surface->SetCastShadow(false);
     Surface->SetEnableFlatShading(bFlatShading);
     Surface->SetVertexColorSpaceTransformMode(EDynamicMeshVertexColorTransformMode::NoTransform);
-    EmptyPaintTexture.Reset(MakePaintTexture(1, 1));
-    const FColor Transparent(0, 0, 0, 0);
-    if (UploadPaintPixels(EmptyPaintTexture.Get(), &Transparent, 1))
-    {
-        SurfaceMaterial = UMaterialInstanceDynamic::Create(MakeSurfaceMaterial(EmptyPaintTexture.Get()), Surface);
-    }
-    Surface->SetMaterial(0, SurfaceMaterial ? static_cast<UMaterialInterface*>(SurfaceMaterial)
-        : UMaterial::GetDefaultMaterial(MD_Surface));
+    Surface->SetTangentsType(EDynamicMeshComponentTangentsMode::AutoCalculated);
+    Surface->SetMaterial(0, UMaterial::GetDefaultMaterial(MD_Surface));
     Scene.AddComponent(Surface, FTransform::Identity);
 
     Overlay.Reset(NewObject<UPreviewGeometry>());
@@ -192,83 +154,10 @@ FNGonPreviewScene::FNGonPreviewScene()
 
 FNGonPreviewScene::~FNGonPreviewScene()
 {
-    TeardownGizmo();
     NGon::RemoveSceneAccel(this);
     Picker.SetMesh(nullptr);
     Overlay->Disconnect();
     Scene.RemoveComponent(Surface);
-}
-
-void FNGonPreviewScene::SetupGizmo(UInteractiveGizmoManager* InGizmoManager, UGizmoViewContext* ViewContext)
-{
-    TeardownGizmo();
-    GizmoManager = InGizmoManager;
-    TransformGizmo = UE::TransformGizmoUtil::CreateCustomTransformGizmo(
-        GizmoManager, ETransformGizmoSubElements::FullTranslateRotateScale, this, TEXT("NGonPreview"));
-    if (!ensureMsgf(TransformGizmo, TEXT("NGon could not create its preview transform gizmo.")))
-    {
-        return;
-    }
-
-    TransformGizmo->bUseContextGizmoMode = false;
-    TransformGizmo->bUseContextCoordinateSystem = false;
-    TransformGizmo->bSnapToWorldGrid = false;
-    TransformGizmo->bSnapToWorldRotGrid = false;
-    TransformGizmo->bSnapToScaleGrid = false;
-    TransformGizmo->SetDisallowNegativeScaling(true);
-    TransformGizmo->SetIsNonUniformScaleAllowedFunction([this]()
-    {
-        return !NGon::IsBoneGizmoActive(this) || !NGon::IsSceneWorldCoordinateSystem(this);
-    });
-    TransformProxy = NewObject<UTransformProxy>(GizmoManager);
-    TransformProxy->OnBeginTransformEdit.AddLambda([this](UTransformProxy* Proxy)
-    {
-        BeginSoftTransform(Proxy->GetTransform(), SoftTransformMode);
-    });
-    TransformProxy->OnTransformChanged.AddLambda([this](UTransformProxy*, FTransform Transform)
-    {
-        ApplyGizmoTransform(Transform);
-    });
-    TransformGizmo->SetActiveTarget(TransformProxy, nullptr);
-    if (ACombinedTransformGizmoActor* Actor = TransformGizmo->GetGizmoActor())
-    {
-        for (UGizmoBaseComponent* Component : TInlineComponentArray<UGizmoBaseComponent*>(Actor))
-        {
-            Component->SetGizmoViewContext(ViewContext);
-            Component->MarkRenderStateDirty();
-        }
-        for (UViewAdjustedStaticMeshGizmoComponent* Component : TInlineComponentArray<UViewAdjustedStaticMeshGizmoComponent*>(Actor))
-        {
-            Component->SetGizmoViewContext(ViewContext);
-            Component->MarkRenderStateDirty();
-        }
-    }
-    UpdateGizmo();
-}
-
-void FNGonPreviewScene::TeardownGizmo()
-{
-    if (TransformProxy)
-    {
-        TransformProxy->OnBeginTransformEdit.Clear();
-        TransformProxy->OnTransformChanged.Clear();
-    }
-    if (TransformGizmo)
-    {
-        GizmoManager->DestroyGizmo(TransformGizmo);
-    }
-    TransformGizmo = nullptr;
-    TransformProxy = nullptr;
-    GizmoManager = nullptr;
-}
-
-void FNGonPreviewScene::SetGizmoMode(ENGonGizmoMode InMode)
-{
-    if (GizmoMode != InMode)
-    {
-        GizmoMode = InMode;
-        UpdateGizmo();
-    }
 }
 
 bool FNGonPreviewScene::HasGizmoTarget() const
@@ -276,7 +165,7 @@ bool FNGonPreviewScene::HasGizmoTarget() const
     return GizmoMode != ENGonGizmoMode::None && (NGon::IsBoneGizmoActive(this) || !SelectedIds.IsEmpty());
 }
 
-void FNGonPreviewScene::UpdateGizmo()
+void FNGonPreviewScene::RefreshBoneDeformation()
 {
     FNGonSceneAccel& Accel = GetSceneAccel(this);
 
@@ -338,42 +227,6 @@ void FNGonPreviewScene::UpdateGizmo()
             ++PositionUpdates;
         }
     }
-
-    if (!TransformGizmo || SoftSession.IsActive() || Accel.bBoneDragActive)
-    {
-        return;
-    }
-
-    switch (GizmoMode)
-    {
-    case ENGonGizmoMode::Translate:
-        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::Translation;
-        break;
-    case ENGonGizmoMode::Rotate:
-        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::Rotation;
-        break;
-    case ENGonGizmoMode::Scale:
-        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::Scale;
-        break;
-    case ENGonGizmoMode::None:
-        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::NoGizmo;
-        break;
-    case ENGonGizmoMode::Combined:
-    default:
-        TransformGizmo->ActiveGizmoMode = EToolContextTransformGizmoMode::Combined;
-        break;
-    }
-    TransformGizmo->CurrentCoordinateSystem = Accel.bUseWorldCoordinateSystem
-        ? EToolContextCoordinateSystem::World
-        : EToolContextCoordinateSystem::Local;
-
-    const bool bVisible = HasGizmoTarget();
-    if (bVisible)
-    {
-        TransformGizmo->ReinitializeGizmoTransform(GetSelectionGizmoTransform(), true);
-    }
-    TransformGizmo->SetVisibility(bVisible);
-    GizmoManager->Tick(0.0f);
 }
 
 FBox FNGonPreviewScene::GetMeshBounds() const
@@ -442,8 +295,24 @@ FBox FNGonPreviewScene::GetSelectionOrMeshBounds() const
     return Bounds.IsValid ? Bounds : GetMeshBounds();
 }
 
-void FNGonPreviewScene::SetOverlayMaterials(UInteractiveToolManager* ToolManager)
+void FNGonPreviewScene::SetPreviewMaterials(UInteractiveToolManager* ToolManager)
 {
+    if (!ToolManager)
+    {
+        return;
+    }
+    StudioMaterial.Reset(ToolSetupUtil::GetSimpleCustomMaterial(ToolManager, StudioColor));
+    ColorMaterial.Reset(ToolSetupUtil::GetVertexColorMaterial(ToolManager, true));
+    if (UMaterialInterface* Highlight = ToolSetupUtil::GetSelectionMaterial(FLinearColor(SelectionColor), ToolManager, 0.10f))
+    {
+        Surface->SetSecondaryRenderMaterial(Highlight);
+        Surface->EnableSecondaryTriangleBuffers([this](const FDynamicMesh3* Mesh, int32 TriangleId)
+        {
+            return SelectedElement == ENGonElement::Face && SelectedIds.Contains(Mesh->GetTriangleGroup(TriangleId));
+        });
+        bSecondaryFaceHighlight = true;
+    }
+
     if (UMaterialInterface* LineMaterial = ToolSetupUtil::GetDefaultLineComponentMaterial(ToolManager, true))
     {
         Overlay->SetAllLineSetsMaterial(LineMaterial);
@@ -454,9 +323,11 @@ void FNGonPreviewScene::SetOverlayMaterials(UInteractiveToolManager* ToolManager
     }
 }
 
-void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
+void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data, TArray<UMaterialInterface*> Materials)
 {
+    bHeatmapVisible = false;
     ClearPaintTexture();
+    UpdateSurfaceDisplay(false);
     Picker.SetMesh(nullptr);
     SelectedElement = ENGonElement::Face;
     SelectedIds.Reset();
@@ -466,7 +337,6 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
     SoftSession.Cancel();
     SoftSolver.Reset();
     SoftInfluences.Reset();
-    bHeatmapVisible = false;
     bSmoothNormalsDirty = false;
     Bend = 0.0f;
     HeatBias = 0.0f;
@@ -514,11 +384,24 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data)
         return ColorElements[ElemIdx].LogicalVertex;
     });
 
+    Surface->SetTwoSided(Materials.IsEmpty());
     Surface->SetMesh(MoveTemp(Data.Mesh));
+    UMaterialInterface* Neutral = StudioMaterial.IsValid() ? StudioMaterial.Get() : UMaterial::GetDefaultMaterial(MD_Surface);
+    if (Materials.IsEmpty())
+    {
+        Materials.Add(Neutral);
+    }
+    for (UMaterialInterface*& Material : Materials)
+    {
+        if (!Material || Material == UMaterial::GetDefaultMaterial(MD_Surface))
+        {
+            Material = Neutral;
+        }
+    }
+    Surface->ConfigureMaterialSet(Materials, true);
     Picker.SetMesh(Surface->GetDynamicMesh()->GetMeshPtr());
     RebuildOverlays();
     ++TopologyUpdates;
-    UpdateGizmo();
 }
 
 void FNGonPreviewScene::InitializeColorOverlay(FDynamicMesh3& Mesh)
@@ -529,52 +412,66 @@ void FNGonPreviewScene::InitializeColorOverlay(FDynamicMesh3& Mesh)
     }
 
     FDynamicMeshAttributeSet* Attributes = Mesh.Attributes();
-    Attributes->DisableMaterialID();
+    const FDynamicMeshUVOverlay* UVs = Attributes->PrimaryUV();
+    const FDynamicMeshColorOverlay* Previous = Attributes->PrimaryColors();
+    ColorElements.Reset(Mesh.TriangleCount() * 3);
+    for (const int32 TriangleId : Mesh.TriangleIndicesItr())
+    {
+        const FIndex3i Vertices = Mesh.GetTriangle(TriangleId);
+        const bool bHasColor = Previous && Previous->IsSetTriangle(TriangleId);
+        const bool bHasUV = UVs && UVs->IsSetTriangle(TriangleId);
+        const FIndex3i ColorIds = bHasColor ? Previous->GetTriangle(TriangleId) : FIndex3i(-1, -1, -1);
+        const FIndex3i UVIds = bHasUV ? UVs->GetTriangle(TriangleId) : FIndex3i(-1, -1, -1);
+        for (int32 Corner = 0; Corner < 3; ++Corner)
+        {
+            const FVector4f Color = bHasColor ? Previous->GetElement(ColorIds[Corner]) : FVector4f(1, 1, 1, 1);
+            const FVector2f UV = bHasUV ? UVs->GetElement(UVIds[Corner]) : FVector2f::ZeroVector;
+            ColorElements.Add({ INDEX_NONE, Topology.DynamicToLogicalVertex[Vertices[Corner]], Color, UV });
+        }
+    }
+
     Attributes->DisablePrimaryColors();
     Attributes->EnablePrimaryColors();
     FDynamicMeshColorOverlay* Colors = Attributes->PrimaryColors();
-    ColorElements.Reset();
-    TMap<uint64, int32> CornerElements;
+    int32 ElementIndex = 0;
     for (const int32 TriangleId : Mesh.TriangleIndicesItr())
     {
-        const int32 Face = Mesh.GetTriangleGroup(TriangleId);
-        const FIndex3i Vertices = Mesh.GetTriangle(TriangleId);
         FIndex3i ColorIds;
         for (int32 Corner = 0; Corner < 3; ++Corner)
         {
-            const int32 Vertex = Vertices[Corner];
-            const uint64 Key = (static_cast<uint64>(static_cast<uint32>(Face)) << 32)
-                | static_cast<uint32>(Vertex);
-            int32* ColorId = CornerElements.Find(Key);
-            if (!ColorId)
-            {
-                const int32 NewId = Colors->AppendElement(FVector4f(0, 0, 0, 1));
-                ColorElements.Add({NewId, Topology.DynamicToLogicalVertex[Vertex], Face});
-                ColorId = &CornerElements.Add(Key, NewId);
-            }
-            ColorIds[Corner] = *ColorId;
+            FColorElement& Element = ColorElements[ElementIndex++];
+            Element.OverlayId = Colors->AppendElement(Element.SourceColor);
+            ColorIds[Corner] = Element.OverlayId;
         }
         Colors->SetTriangle(TriangleId, ColorIds);
     }
-
-    WriteColors(Mesh);
 }
 
-FVector4f FNGonPreviewScene::EncodeOverlayColor(const FColorElement& Element, bool bUseSoftHeat) const
+FVector4f FNGonPreviewScene::GetOverlayColor(const FColorElement& Element) const
 {
-    const float Sample = bUseSoftHeat && SoftHeatSamples.IsValidIndex(Element.LogicalVertex)
-        ? SoftHeatSamples[Element.LogicalVertex] : 0.0f;
-    const bool bSelected = SelectedElement == ENGonElement::Face && SelectedIds.Contains(Element.Face);
-    return FVector4f(Sample, bSelected ? 1.0f : 0.0f, bUseSoftHeat ? 1.0f : 0.0f, 1.0f);
+    if (SurfaceDisplay == ESurfaceDisplay::Heatmap)
+    {
+        const float Sample = SoftHeatSamples.IsValidIndex(Element.LogicalVertex) ? SoftHeatSamples[Element.LogicalVertex] : 0.0f;
+        const FLinearColor Color = HeatColor(Sample);
+        return FVector4f(Color.R, Color.G, Color.B, 1.0f);
+    }
+    if (SurfaceDisplay == ESurfaceDisplay::PaintColors)
+    {
+        const int32 X = FMath::RoundToInt(FMath::Clamp(Element.UV.X, 0.0f, 1.0f) * (PaintWidth - 1));
+        const int32 Y = FMath::RoundToInt((1.0f - FMath::Clamp(Element.UV.Y, 0.0f, 1.0f)) * (PaintHeight - 1));
+        const FLinearColor Paint(PaintPixels[Y * PaintWidth + X]);
+        const FLinearColor Composite = FMath::Lerp(StudioColor, Paint, Paint.A);
+        return FVector4f(Composite.R, Composite.G, Composite.B, 1.0f);
+    }
+    return Element.SourceColor;
 }
 
 void FNGonPreviewScene::WriteColors(FDynamicMesh3& Mesh) const
 {
     FDynamicMeshColorOverlay* Colors = Mesh.Attributes()->PrimaryColors();
-    const bool bUseSoftHeat = bHeatmapVisible && SoftSettings.bEnabled && !SoftInfluences.IsEmpty();
     for (const FColorElement& Element : ColorElements)
     {
-        Colors->SetElement(Element.OverlayId, EncodeOverlayColor(Element, bUseSoftHeat));
+        Colors->SetElement(Element.OverlayId, GetOverlayColor(Element));
     }
 }
 
@@ -597,15 +494,68 @@ void FNGonPreviewScene::RebuildSoftHeatSamples()
     }
 }
 
-void FNGonPreviewScene::UpdateColors()
+bool FNGonPreviewScene::IsPaintMaterialReady()
 {
-    if (!ColorElements.IsEmpty())
+    FSceneInterface* RenderScene = Scene.GetScene();
+    FMaterialResource* Resource = PaintMaterial.IsValid() && RenderScene
+        ? PaintMaterial->GetMaterialResource(RenderScene->GetShaderPlatform(), EMaterialQualityLevel::Num)
+        : nullptr;
+    return Resource && Resource->HasValidGameThreadShaderMap();
+}
+
+void FNGonPreviewScene::UpdateSurfaceDisplay(bool bColorsChanged)
+{
+    const bool bShowHeat = bHeatmapVisible && HasSoftSelectionInfluence();
+    ESurfaceDisplay Desired = ESurfaceDisplay::Source;
+    if (bShowHeat)
     {
-        // This private preview owns the mesh. A direct edit plus the fast notification
-        // keeps the color-overlay elements and the surface triangulation in place.
+        Desired = ESurfaceDisplay::Heatmap;
+    }
+    else if (!PaintPixels.IsEmpty())
+    {
+        Desired = IsPaintMaterialReady() ? ESurfaceDisplay::PaintTexture : ESurfaceDisplay::PaintColors;
+    }
+
+    const bool bModeChanged = SurfaceDisplay != Desired;
+    SurfaceDisplay = Desired;
+    const bool bVertexColors = Desired == ESurfaceDisplay::Heatmap || Desired == ESurfaceDisplay::PaintColors;
+    if (!ColorElements.IsEmpty() && (bModeChanged || (bVertexColors && bColorsChanged)))
+    {
         WriteColors(Surface->GetDynamicMesh()->GetMeshRef());
         Surface->FastNotifyColorsUpdated();
         ++ColorUpdates;
+    }
+    if (bModeChanged)
+    {
+        UMaterialInterface* Override = bVertexColors ? ColorMaterial.Get() : nullptr;
+        if (Desired == ESurfaceDisplay::PaintTexture)
+        {
+            Override = PaintMaterial.Get();
+        }
+        if (Override)
+        {
+            Surface->SetOverrideRenderMaterial(Override);
+        }
+        else
+        {
+            Surface->ClearOverrideRenderMaterial();
+        }
+    }
+}
+
+void FNGonPreviewScene::RefreshPaintMaterial()
+{
+    if (SurfaceDisplay == ESurfaceDisplay::PaintColors && IsPaintMaterialReady())
+    {
+        UpdateSurfaceDisplay(false);
+    }
+}
+
+void FNGonPreviewScene::UpdateFaceHighlight()
+{
+    if (bSecondaryFaceHighlight)
+    {
+        Surface->FastNotifySecondaryTrianglesChanged();
     }
 }
 
@@ -747,7 +697,7 @@ void FNGonPreviewScene::SetHeatmapVisible(bool bShow)
     if (bHeatmapVisible != bShow)
     {
         bHeatmapVisible = bShow;
-        UpdateColors();
+        UpdateSurfaceDisplay(true);
     }
 }
 
@@ -781,36 +731,52 @@ void FNGonPreviewScene::NotifySurfacePositionsChanged(FDynamicMesh3& Mesh)
 
 void FNGonPreviewScene::SetPaintTexture(const TArray<FColor>& Pixels, int32 Width, int32 Height)
 {
-    const int64 Expected = static_cast<int64>(FMath::Max(0, Width)) * static_cast<int64>(FMath::Max(0, Height));
-    if (Expected <= 0 || Pixels.Num() != Expected)
+    const int64 Expected = static_cast<int64>(Width) * Height;
+    if (Width <= 0 || Height <= 0 || Pixels.Num() != Expected
+        || !Algo::AnyOf(Pixels, [](FColor Pixel) { return Pixel.A != 0; }))
     {
         ClearPaintTexture();
         return;
     }
-    if (!SurfaceMaterial)
+
+    if (!PaintTexture.IsValid() || PaintWidth != Width || PaintHeight != Height)
     {
-        return;
+        TStrongObjectPtr<UTexture2D> NewTexture(MakePaintTexture(Width, Height));
+        if (!UploadPaintPixels(NewTexture.Get(), Pixels.GetData(), Expected))
+        {
+            return;
+        }
+        PaintTexture = MoveTemp(NewTexture);
+        if (!PaintMaterial.IsValid())
+        {
+            PaintMaterial.Reset(UMaterialInstanceDynamic::Create(MakePaintMaterial(PaintTexture.Get()), Surface));
+        }
+        if (PaintMaterial.IsValid())
+        {
+            PaintMaterial->SetTextureParameterValue(PaintTextureParameter, PaintTexture.Get());
+        }
     }
-    if (PaintTexture.IsValid() && PaintTexture->GetSizeX() == Width && PaintTexture->GetSizeY() == Height)
+    else if (!UploadPaintPixels(PaintTexture.Get(), Pixels.GetData(), Expected))
     {
-        UploadPaintPixels(PaintTexture.Get(), Pixels.GetData(), Expected);
         return;
     }
 
-    TStrongObjectPtr<UTexture2D> NewPaint(MakePaintTexture(Width, Height));
-    if (UploadPaintPixels(NewPaint.Get(), Pixels.GetData(), Expected))
-    {
-        SurfaceMaterial->SetTextureParameterValue(PaintTextureParameter, NewPaint.Get());
-        PaintTexture = MoveTemp(NewPaint);
-    }
+    PaintPixels = Pixels;
+    PaintWidth = Width;
+    PaintHeight = Height;
+    UpdateSurfaceDisplay(true);
 }
 
 void FNGonPreviewScene::ClearPaintTexture()
 {
-    if (PaintTexture.IsValid())
+    if (!PaintPixels.IsEmpty())
     {
-        SurfaceMaterial->SetTextureParameterValue(PaintTextureParameter, EmptyPaintTexture.Get());
+        PaintPixels.Reset();
+        PaintWidth = 0;
+        PaintHeight = 0;
         PaintTexture.Reset();
+        PaintMaterial.Reset();
+        UpdateSurfaceDisplay(false);
     }
 }
 
@@ -819,7 +785,7 @@ void FNGonPreviewScene::SetHeatBias(float Value)
     if (HeatBias != Value)
     {
         HeatBias = Value;
-        UpdateColors();
+        UpdateSurfaceDisplay(true);
     }
 }
 
@@ -856,7 +822,6 @@ void FNGonPreviewScene::SetBend(float Value)
         GetSceneAccel(this).bBoneGizmoActive = false;
     }
     RebuildSoftSelection();
-    UpdateGizmo();
     ++PositionUpdates;
 }
 
@@ -886,7 +851,7 @@ void FNGonPreviewScene::RebuildSoftSelection()
     SoftInfluences = SoftSolver.Solve(Topology, Positions, Seeds, FTransform::Identity, SoftSettings);
     RebuildSoftHeatSamples();
     DrawSoftSelection();
-    UpdateColors();
+    UpdateSurfaceDisplay(true);
 }
 
 FTransform FNGonPreviewScene::GetSelectionGizmoTransform() const
@@ -904,6 +869,16 @@ FTransform FNGonPreviewScene::GetSelectionGizmoTransform() const
         CompFrame.SetRotation(FQuat::Identity);
     }
     return CompFrame;
+}
+
+FTransform FNGonPreviewScene::GetGizmoDisplayTransform() const
+{
+    const FNGonSceneAccel& Accel = GetSceneAccel(this);
+    if (SoftSession.IsActive() || Accel.bBoneDragActive)
+    {
+        return FTransform(Accel.DragStartGizmoTransform.GetRotation(), ActiveGizmoTransform.GetLocation());
+    }
+    return GetSelectionGizmoTransform();
 }
 
 void FNGonPreviewScene::RebuildGizmoAdjacency()
@@ -1473,10 +1448,9 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
             }
             DrawSoftSelection();
 
-            if (bHeatmapVisible && !ColorElements.IsEmpty())
+            if (SurfaceDisplay == ESurfaceDisplay::Heatmap && !ColorElements.IsEmpty())
             {
                 FDynamicMeshColorOverlay* Colors = Mesh.Attributes()->PrimaryColors();
-                const bool bUseSoftHeat = !SoftInfluences.IsEmpty();
                 for (const int32 LogicalId : Accel.DirtyVertices)
                 {
                     const int32 StartC = Accel.LogicalToColorOffsets[LogicalId];
@@ -1484,7 +1458,7 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
                     for (int32 i = StartC; i < EndC; ++i)
                     {
                         const FColorElement& Element = ColorElements[Accel.LogicalToColorElements[i]];
-                        Colors->SetElement(Element.OverlayId, EncodeOverlayColor(Element, bUseSoftHeat));
+                        Colors->SetElement(Element.OverlayId, GetOverlayColor(Element));
                     }
                 }
                 Surface->FastNotifyColorsUpdated();
@@ -1502,7 +1476,6 @@ void FNGonPreviewScene::EndSoftTransform()
     if (Accel.bBoneDragActive)
     {
         Accel.bBoneDragActive = false;
-        UpdateGizmo();
         return;
     }
     SoftSession.End();
@@ -1511,7 +1484,6 @@ void FNGonPreviewScene::EndSoftTransform()
         GetSceneAccel(this).bBoneGizmoActive = false;
     }
     RebuildSoftSelection();
-    UpdateGizmo();
 }
 
 void FNGonPreviewScene::CancelSoftTransform()
@@ -1525,7 +1497,7 @@ void FNGonPreviewScene::CancelSoftTransform()
             Accel.Bones[Accel.SelectedBoneIndex].CurrentLocalTransform = Accel.DragStartBoneLocalTransform;
             Accel.bPendingSkinningUpdate = true;
         }
-        UpdateGizmo();
+        RefreshBoneDeformation();
         return;
     }
     if (!SoftSession.IsActive()) return;
@@ -1545,7 +1517,6 @@ void FNGonPreviewScene::CancelSoftTransform()
         GetSceneAccel(this).bBoneGizmoActive = false;
     }
     RebuildSoftSelection();
-    UpdateGizmo();
 }
 
 int32 FNGonPreviewScene::Pick(
@@ -1567,7 +1538,6 @@ void FNGonPreviewScene::BoxSelect(
 void FNGonPreviewScene::ApplySelectionSet(ENGonElement Element, const TSet<int32>& Ids, bool bAdd)
 {
     const bool bHadFaces = SelectedElement == ENGonElement::Face && !SelectedIds.IsEmpty();
-    const bool bHadOverlaySelection = SelectedElement != ENGonElement::Face && !SelectedIds.IsEmpty();
     if (!bAdd || SelectedElement != Element) SelectedIds.Reset();
     SelectedElement = Element;
     for (const int32 Id : Ids) SelectedIds.Add(Id);
@@ -1578,9 +1548,11 @@ void FNGonPreviewScene::ApplySelectionSet(ENGonElement Element, const TSet<int32
         GetSceneAccel(this).bBoneGizmoActive = false;
     }
     RebuildSoftSelection();
-    UpdateGizmo();
-    if (bHadFaces || (Element == ENGonElement::Face && !Ids.IsEmpty())) UpdateColors();
-    if (bHadOverlaySelection || (Element != ENGonElement::Face && !Ids.IsEmpty())) DrawSelection();
+    if (bHadFaces || (Element == ENGonElement::Face && !Ids.IsEmpty()))
+    {
+        UpdateFaceHighlight();
+    }
+    DrawSelection();
 }
 
 bool FNGonPreviewScene::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
@@ -1661,11 +1633,16 @@ bool FNGonPreviewScene::DeleteSelectedFaces()
 
     TArray<TArray<int32>> RemainingFaces;
     RemainingFaces.Reserve(Topology.Faces.Num() - ValidSelectedIds.Num());
+    TArray<int32> RemainingMaterials;
+    RemainingMaterials.Reserve(RemainingFaces.Max());
+    const FDynamicMeshMaterialAttribute* OldMaterials = Surface->GetDynamicMesh()->GetMeshRef().Attributes()->GetMaterialID();
     for (const TPair<int32, FNGonFace>& FacePair : Topology.Faces)
     {
         if (!ValidSelectedIds.Contains(FacePair.Key) && FacePair.Value.Perimeter.Num() >= 3)
         {
             RemainingFaces.Add(FacePair.Value.Perimeter);
+            RemainingMaterials.Add(OldMaterials && !FacePair.Value.Triangles.IsEmpty()
+                ? OldMaterials->GetValue(FacePair.Value.Triangles[0]) : 0);
         }
     }
     if (RemainingFaces.IsEmpty()) return false;
@@ -1673,6 +1650,19 @@ bool FNGonPreviewScene::DeleteSelectedFaces()
     FNGonMeshData Replacement;
     FText Error;
     if (!NGon::BuildPolygonMesh(Positions, RemainingFaces, Replacement, Error)) return false;
+    if (!Replacement.Mesh.Attributes()->HasMaterialID())
+    {
+        Replacement.Mesh.Attributes()->EnableMaterialID();
+    }
+    FDynamicMeshMaterialAttribute* ReplacementMaterials = Replacement.Mesh.Attributes()->GetMaterialID();
+    for (const TPair<int32, FNGonFace>& Face : Replacement.Topology.Faces)
+    {
+        const int32 Material = RemainingMaterials.IsValidIndex(Face.Key) ? RemainingMaterials[Face.Key] : 0;
+        for (const int32 TriangleId : Face.Value.Triangles)
+        {
+            ReplacementMaterials->SetValue(TriangleId, Material);
+        }
+    }
 
     const FNGonSoftSelectionSettings SavedSoftSettings = SoftSettings;
     const ENGonSoftTransformMode SavedSoftMode = SoftTransformMode;
@@ -1692,11 +1682,11 @@ bool FNGonPreviewScene::DeleteSelectedFaces()
         }
     }
 
-    SetMesh(MoveTemp(Replacement));
+    SetMesh(MoveTemp(Replacement), Surface->GetMaterials());
     SoftTransformMode = SavedSoftMode;
     SoftSettings = SavedSoftSettings;
     HeatBias = SavedHeatBias;
-    UpdateColors();
+    UpdateSurfaceDisplay(true);
     RebuildSoftSelection();
     return true;
 }
@@ -1713,7 +1703,6 @@ void FNGonPreviewScene::UpdateSelection(ENGonElement Element, int32 Id, bool bAd
     }
 
     const bool bHadFaces = SelectedElement == ENGonElement::Face && !SelectedIds.IsEmpty();
-    const bool bHadOverlaySelection = SelectedElement != ENGonElement::Face && !SelectedIds.IsEmpty();
 
     if (!bAdd || SelectedElement != Element)
     {
@@ -1735,15 +1724,11 @@ void FNGonPreviewScene::UpdateSelection(ENGonElement Element, int32 Id, bool bAd
         GetSceneAccel(this).bBoneGizmoActive = false;
     }
     RebuildSoftSelection();
-    UpdateGizmo();
     if (bHadFaces || (Element == ENGonElement::Face && Id != INDEX_NONE))
     {
-        UpdateColors();
+        UpdateFaceHighlight();
     }
-    if (bHadOverlaySelection || (Element != ENGonElement::Face && Id != INDEX_NONE))
-    {
-        DrawSelection();
-    }
+    DrawSelection();
 }
 
 void FNGonPreviewScene::DrawSelection()
@@ -1751,7 +1736,24 @@ void FNGonPreviewScene::DrawSelection()
     SelectedEdge->Clear();
     SelectedVertex->Clear();
 
-    if (SelectedElement == ENGonElement::Edge && !SelectedIds.IsEmpty())
+    if (SelectedElement == ENGonElement::Face && !SelectedIds.IsEmpty())
+    {
+        TArray<FVector> Starts;
+        TArray<FVector> Ends;
+        for (const int32 Id : SelectedIds)
+        {
+            if (const FNGonFace* Face = Topology.Faces.Find(Id))
+            {
+                for (int32 Corner = 0; Corner < Face->Perimeter.Num(); ++Corner)
+                {
+                    Starts.Add(Positions[Face->Perimeter[Corner]]);
+                    Ends.Add(Positions[Face->Perimeter[(Corner + 1) % Face->Perimeter.Num()]]);
+                }
+            }
+        }
+        SelectedEdge->AddLines(Starts, Ends, SelectionColor, 2.5f, 1.2f);
+    }
+    else if (SelectedElement == ENGonElement::Edge && !SelectedIds.IsEmpty())
     {
         TArray<FVector> Starts;
         TArray<FVector> Ends;

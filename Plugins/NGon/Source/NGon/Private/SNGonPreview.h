@@ -9,6 +9,7 @@
 
 struct FAssetData;
 struct FNGonMeshData;
+class UMaterialInterface;
 class SVerticalBox;
 class STiPaintEditor;
 
@@ -37,7 +38,7 @@ public:
     bool IsHeatmapVisible() const;
     void SetGridVisible(bool bVisible);
     bool IsGridVisible() const { return bGridVisible; }
-    void SetMesh(FNGonMeshData&& Data);
+    void SetMesh(FNGonMeshData&& Data, TArray<UMaterialInterface*> Materials = {});
     void FrameMesh();
     void FocusViewport();
     bool DeleteSelectedFaces();
@@ -120,7 +121,7 @@ private:
     void LoadStaticMesh(const FAssetData& Asset);
     void LoadSkeletalMesh(const FAssetData& Asset);
     void ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const FText& InSourceType,
-        ENGonViewportShading Shading = ENGonViewportShading::Faceted);
+        ENGonViewportShading Shading = ENGonViewportShading::Faceted, TArray<UMaterialInterface*> Materials = {});
     void ShowError(const FText& Error);
     void SetSelectionMode(ENGonElement Element);
     void SetActiveToolTab(ENGonToolShelfTab Tab);

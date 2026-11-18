@@ -1,27 +1,19 @@
 #include "SNGonPreview.h"
 #include "NGonSceneSkeleton.h"
 #include "NGonUIIcons.h"
+#include "NGonViewportGizmo.h"
 
 #include "AssetEditorModeManager.h"
-#include "BaseGizmos/GizmoViewContext.h"
-#include "BaseGizmos/TransformGizmoUtil.h"
 #include "CanvasItem.h"
 #include "CanvasTypes.h"
-#include "ContextObjectStore.h"
 #include "EditorViewportClient.h"
 #include "Framework/Application/SlateApplication.h"
 #include "InputCoreTypes.h"
-#include "InputRouter.h"
-#include "InputState.h"
-#include "InteractiveGizmoManager.h"
-#include "InteractiveToolChange.h"
 #include "InteractiveToolManager.h"
-#include "InteractiveToolsContext.h"
-#include "Materials/Material.h"
 #include "SceneManagement.h"
 #include "SceneView.h"
 #include "Slate/SceneViewport.h"
-#include "ToolContextInterfaces.h"
+#include "Tools/EdModeInteractiveToolsContext.h"
 #include "Widgets/SViewport.h"
 
 namespace NGon
@@ -48,29 +40,7 @@ struct FNGonPreviewSceneOwner
     TSharedRef<FAssetEditorModeManager> ModeToolsOwner;
 };
 
-class FNGonGizmoRenderContext final : public IToolsContextRenderAPI
-{
-public:
-    FNGonGizmoRenderContext(const FSceneView* InView, FPrimitiveDrawInterface* InPDI,
-        const FViewCameraState& InCamera, EViewInteractionState InInteraction)
-        : View(InView), PDI(InPDI), Camera(InCamera), Interaction(InInteraction)
-    {
-    }
-
-    FPrimitiveDrawInterface* GetPrimitiveDrawInterface() override { return PDI; }
-    const FSceneView* GetSceneView() override { return View; }
-    FViewCameraState GetCameraState() override { return Camera; }
-    EViewInteractionState GetViewInteractionState() override { return Interaction; }
-
-private:
-    const FSceneView* View;
-    FPrimitiveDrawInterface* PDI;
-    const FViewCameraState& Camera;
-    EViewInteractionState Interaction;
-};
-
-class FNGonViewportClient final : private FNGonPreviewSceneOwner, public FEditorViewportClient,
-    private IToolsContextQueriesAPI, private IToolsContextTransactionsAPI
+class FNGonViewportClient final : private FNGonPreviewSceneOwner, public FEditorViewportClient
 {
 public:
     FNGonViewportClient(
@@ -81,39 +51,21 @@ public:
         , ViewportWidget(InWidget)
     {
         SetViewportType(LVT_Perspective);
-        SetViewMode(VMI_Unlit);
+        SetViewMode(VMI_Lit);
         SetRealtime(true);
         SetAllowCinematicControl(false);
         EngineShowFlags.SetGrid(true);
         EngineShowFlags.SetSelectionOutline(false);
         EngineShowFlags.SetEyeAdaptation(false);
-        EngineShowFlags.SetPostProcessing(false);
         EngineShowFlags.SetModeWidgets(true);
+        ModeToolsOwner->ActivateDefaultMode();
         ModeToolsOwner->SetWidgetMode(UE::Widget::WM_None);
 
-        // This context uses the preview world and only receives NGon's mouse events.
-        ToolsContext.Reset(NewObject<UInteractiveToolsContext>());
-        ToolsContext->Initialize(this, this);
-        UInteractiveToolManager* ToolManager = ToolsContext->ToolManager.Get();
-        UContextObjectStore* ContextStore = ToolManager->GetContextObjectStore();
-        UE::TransformGizmoUtil::RegisterTransformGizmoContextObject(ToolsContext.Get());
-        GizmoViewContext = ContextStore->FindContext<UGizmoViewContext>();
-        if (!GizmoViewContext)
+        if (UModeManagerInteractiveToolsContext* Context = ModeToolsOwner->GetInteractiveToolsContext())
         {
-            GizmoViewContext = NewObject<UGizmoViewContext>(ToolsContext.Get());
-            ContextStore->AddContextObject(GizmoViewContext);
+            Context->SetViewportInteractionsEnabled(false);
+            PreviewOwner->SetPreviewMaterials(Context->ToolManager.Get());
         }
-
-        PreviewOwner->SetOverlayMaterials(ToolManager);
-        PreviewOwner->SetupGizmo(ToolsContext->GizmoManager.Get(), GizmoViewContext);
-    }
-
-    ~FNGonViewportClient() override
-    {
-        ToolsContext->InputRouter->ForceTerminateAll();
-        PreviewOwner->TeardownGizmo();
-        UE::TransformGizmoUtil::DeregisterTransformGizmoContextObject(ToolsContext.Get());
-        ToolsContext->Shutdown();
     }
 
     void SetGridShowFlag(bool bVisible)
@@ -155,10 +107,10 @@ public:
     {
         FEditorViewportClient::Tick(DeltaSeconds);
         ApplyPendingFrame();
-        ToolsContext->GizmoManager->Tick(DeltaSeconds);
-        if (bPendingGizmoMove && Viewport)
+        PreviewOwner->RefreshPaintMaterial();
+        if (bPendingGizmoMove)
         {
-            UpdateGizmoDrag(Viewport, PendingGizmoMouse);
+            UpdateGizmoDrag(PendingGizmoMouse);
         }
     }
 
@@ -245,15 +197,12 @@ public:
             return;
         }
         FEditorViewportClient::MouseMove(InViewport, X, Y);
-        if (InViewport && !IsNavigating(InViewport) && PreviewOwner->HasGizmoTarget())
+        HoverPixel.Reset();
+        if (InViewport && !IsNavigating(InViewport))
         {
-            FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
-            if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
-            {
-                FInputDeviceState State = MakeMouseInput(*View, FIntPoint(X, Y), FVector2D::ZeroVector);
-                ToolsContext->InputRouter->PostHoverInputEvent(State);
-            }
+            HoverPixel = FVector2D(X, Y);
         }
+        PostInvalidation();
     }
 
     void CapturedMouseMove(FViewport* InViewport, int32 X, int32 Y) override
@@ -264,19 +213,10 @@ public:
         }
     }
 
-    void MouseEnter(FViewport* InViewport, int32 X, int32 Y) override
-    {
-        bMouseOverViewport = true;
-        FEditorViewportClient::MouseEnter(InViewport, X, Y);
-    }
-
     void MouseLeave(FViewport* InViewport) override
     {
-        bMouseOverViewport = false;
-        if (PointerAction == EPointerAction::None)
-        {
-            ToolsContext->InputRouter->ForceTerminateAll();
-        }
+        HoverPixel.Reset();
+        PostInvalidation();
         FEditorViewportClient::MouseLeave(InViewport);
     }
 
@@ -293,49 +233,46 @@ public:
 
     void Draw(const FSceneView* View, FPrimitiveDrawInterface* PDI) override
     {
-        if (View)
-        {
-            UpdateViewContext(*View);
-        }
         FEditorViewportClient::Draw(View, PDI);
-        if (View && PDI)
+        if (View && PDI && NGon::HasSceneBones(&PreviewOwner.Get()))
         {
-            if (!PDI->IsHitTesting() && PreviewOwner->HasGizmoTarget())
-            {
-                const EViewInteractionState Interaction = GetFocusedViewport()
-                    ? (bMouseOverViewport ? EViewInteractionState::All : EViewInteractionState::Focused)
-                    : (bMouseOverViewport ? EViewInteractionState::Hovered : EViewInteractionState::None);
-                FNGonGizmoRenderContext Context(View, PDI, CameraState, Interaction);
-                ToolsContext->GizmoManager->Render(&Context);
-            }
-            if (NGon::HasSceneBones(&PreviewOwner.Get()))
-            {
-                const FNGonSkeletonTreeUIState* UIState = GetUIState();
-                NGon::DrawSceneSkeleton(&PreviewOwner.Get(), View, PDI, UIState ? UIState->BoneDrawMode : 0);
-            }
+            const FNGonSkeletonTreeUIState* UIState = GetUIState();
+            NGon::DrawSceneSkeleton(&PreviewOwner.Get(), View, PDI, UIState ? UIState->BoneDrawMode : 0);
         }
     }
 
     void Draw(FViewport* InViewport, FCanvas* Canvas) override
     {
         FEditorViewportClient::Draw(InViewport, Canvas);
-        if (InViewport && Canvas && NGon::HasSceneBones(&PreviewOwner.Get()))
+        if (InViewport && Canvas && !Canvas->IsHitTesting())
         {
             const FNGonSkeletonTreeUIState* UIState = GetUIState();
-            if (!UIState || (UIState->bShowBoneNames && UIState->BoneDrawMode != 3))
+            const bool bDrawBoneNames = NGon::HasSceneBones(&PreviewOwner.Get())
+                && (!UIState || (UIState->bShowBoneNames && UIState->BoneDrawMode != 3));
+            const bool bDrawGizmo = PreviewOwner->HasGizmoTarget();
+            if (bDrawBoneNames || bDrawGizmo)
             {
                 FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
-                if (FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+                if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
                 {
-                    NGon::DrawSceneSkeletonLabels(&PreviewOwner.Get(), View, InViewport, Canvas, true);
+                    if (bDrawBoneNames)
+                    {
+                        NGon::DrawSceneSkeletonLabels(&PreviewOwner.Get(), View, InViewport, Canvas, true);
+                    }
+                    if (bDrawGizmo)
+                    {
+                        BuildGizmo(*View);
+                        ForegroundGizmo.Draw(*Canvas, HoverPixel);
+                    }
                 }
             }
         }
 
-        if (bMarqueeActive && Canvas)
+        if (bMarqueeActive && Canvas && !Canvas->IsHitTesting())
         {
             const FBox2D Rect = MakeMarquee();
-            FCanvasBoxItem Box(Rect.Min, Rect.GetSize());
+            const double DPIScale = FMath::Max(static_cast<double>(Canvas->GetDPIScale()), 0.01);
+            FCanvasBoxItem Box(Rect.Min / DPIScale, Rect.GetSize() / DPIScale);
             Box.SetColor(FLinearColor(0.15f, 0.65f, 1.0f, 0.85f));
             Box.LineThickness = 2.0f;
             Canvas->DrawItem(Box);
@@ -345,30 +282,7 @@ public:
 private:
     enum class EPointerAction : uint8 { None, Select, EdgeLoop, Gizmo };
 
-    // The preview is transient. Gizmo changes are applied by the preview scene
-    // and must not enter the level editor's undo stack as proxy-only changes.
-    UWorld* GetCurrentEditingWorld() override { return PreviewOwner->GetPreviewScene().GetWorld(); }
-    FViewport* GetFocusedViewport() override { return Viewport && Viewport->HasFocus() ? Viewport : nullptr; }
-    FViewport* GetHoveredViewport() override { return bMouseOverViewport ? Viewport : nullptr; }
-    void GetCurrentSelectionState(FToolBuilderState& State) const override
-    {
-        State = FToolBuilderState{};
-        State.World = PreviewOwner->GetPreviewScene().GetWorld();
-        State.ToolManager = ToolsContext->ToolManager.Get();
-        State.GizmoManager = ToolsContext->GizmoManager.Get();
-    }
-    void GetCurrentViewState(FViewCameraState& State) const override { State = CameraState; }
-    UMaterialInterface* GetStandardMaterial(EStandardToolContextMaterials MaterialType) const override
-    {
-        return UMaterial::GetDefaultMaterial(MD_Surface);
-    }
-    void DisplayMessage(const FText& Message, EToolMessageLevel Level) override {}
-    void PostInvalidation() override { Invalidate(false, false); }
-    void BeginUndoTransaction(const FText& Description) override {}
-    void EndUndoTransaction() override {}
-    void CancelUndoTransaction() override {}
-    void AppendChange(UObject* Target, TUniquePtr<FToolCommandChange> Change, const FText& Description) override {}
-    bool RequestSelectionChange(const FSelectedObjectsChangeList& Change) override { return false; }
+    void PostInvalidation() { Invalidate(false, false); }
 
     FNGonSkeletonTreeUIState* GetUIState() const
     {
@@ -400,7 +314,7 @@ private:
             || (InViewport && (InViewport->KeyState(EKeys::RightMouseButton) || InViewport->KeyState(EKeys::MiddleMouseButton)));
     }
 
-    bool HandleViewportShortcut(SNGonViewport& Widget, const FKey& Key)
+    bool HandleViewportShortcut(SNGonViewport& PreviewViewport, const FKey& Key)
     {
         if (Key == EKeys::Q || Key == EKeys::W || Key == EKeys::E || Key == EKeys::R)
         {
@@ -408,11 +322,11 @@ private:
             if (Key == EKeys::W) Mode = ENGonGizmoMode::Translate;
             if (Key == EKeys::E) Mode = ENGonGizmoMode::Rotate;
             if (Key == EKeys::R) Mode = ENGonGizmoMode::Scale;
-            Widget.SetGizmoMode(Mode);
+            PreviewViewport.SetGizmoMode(Mode);
         }
         else if (Key == EKeys::One || Key == EKeys::Two || Key == EKeys::Three)
         {
-            Widget.SetSelectionMode(Key == EKeys::One ? ENGonElement::Vertex
+            PreviewViewport.SetSelectionMode(Key == EKeys::One ? ENGonElement::Vertex
                 : Key == EKeys::Two ? ENGonElement::Edge : ENGonElement::Face);
         }
         else if (Key == EKeys::Four)
@@ -422,15 +336,15 @@ private:
         }
         else if (Key == EKeys::H)
         {
-            Widget.ToggleHeatmap();
+            PreviewViewport.ToggleHeatmap();
         }
         else if (Key == EKeys::F)
         {
-            Widget.FrameMesh();
+            PreviewViewport.FrameMesh();
         }
         else if (Key == EKeys::Delete || Key == EKeys::BackSpace)
         {
-            Widget.DeleteSelectedFaces();
+            PreviewViewport.DeleteSelectedFaces();
         }
         else
         {
@@ -452,42 +366,21 @@ private:
         {
             return nullptr;
         }
-        FSceneView* View = CalcSceneView(&ViewFamily);
-        if (View)
-        {
-            UpdateViewContext(*View);
-        }
-        return View;
+        return CalcSceneView(&ViewFamily);
     }
 
-    void UpdateViewContext(const FSceneView& View)
+    void BuildGizmo(const FSceneView& View)
     {
-        GizmoViewContext->ResetFromSceneView(View);
-        CameraState.DPIScale = GetDPIScale();
-        GizmoViewContext->SetDPIScale(CameraState.DPIScale);
-        CameraState.Position = View.ViewLocation;
-        CameraState.Orientation = View.ViewRotation.Quaternion();
-        CameraState.HorizontalFOVDegrees = ViewFOV;
-        CameraState.AspectRatio = static_cast<float>(View.UnscaledViewRect.Width()) / FMath::Max(1, View.UnscaledViewRect.Height());
-        CameraState.bIsOrthographic = !View.IsPerspectiveProjection();
-        CameraState.OrthoWorldCoordinateWidth = CameraState.bIsOrthographic && Viewport
-            ? GetOrthoUnitsPerPixel(Viewport) * View.UnscaledViewRect.Width() : 0.0f;
-    }
-
-    FInputDeviceState MakeMouseInput(const FSceneView& View, const FIntPoint& Mouse, const FVector2D& Delta) const
-    {
-        const FVector2D Pixel(Mouse.X, Mouse.Y);
-        FVector Origin;
-        FVector Direction;
-        View.DeprojectFVector2D(Pixel, Origin, Direction);
-
-        FInputDeviceState State{};
-        State.InputDevice = EInputDevices::Mouse;
-        State.SetModifierKeyStates(IsShiftPressed(), IsAltPressed(), IsCtrlPressed(), false);
-        State.Mouse.Position2D = Pixel;
-        State.Mouse.Delta2D = Delta;
-        State.Mouse.WorldRay = FRay(Origin, Direction);
-        return State;
+        const FTransform Frame = PreviewOwner->GetGizmoDisplayTransform();
+        // One pixel at the pivot's depth, also valid for orthographic views where W is 1.
+        const double ClipW = View.WorldToScreen(Frame.GetLocation()).W;
+        const double ProjectionWidth = View.UnscaledViewRect.Width() * FMath::Abs(View.ViewMatrices.GetViewToClip().M[0][0]);
+        const double UnitsPerPixel = ClipW > 0.0 && ProjectionWidth > 0.0 ? 2.0 * ClipW / ProjectionWidth : 0.0;
+        const bool bAxisScale = !NGon::IsBoneGizmoActive(&PreviewOwner.Get())
+            || !NGon::IsSceneWorldCoordinateSystem(&PreviewOwner.Get());
+        ForegroundGizmo.Build(Frame, PreviewOwner->GetGizmoMode(), UnitsPerPixel, GetDPIScale(),
+            View.ViewRotation.RotateVector(FVector::RightVector), View.ViewRotation.RotateVector(FVector::UpVector),
+            bAxisScale, [&View](const FVector& Point, FVector2D& Pixel) { return View.WorldToPixel(Point, Pixel); });
     }
 
     void BeginPointerAction(FViewport* InViewport, const FIntPoint& Mouse)
@@ -503,15 +396,18 @@ private:
             FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
             if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
             {
-                FInputDeviceState State = MakeMouseInput(*View, Mouse, FVector2D::ZeroVector);
-                State.Mouse.Left.SetStates(true, true, false);
-                ToolsContext->InputRouter->PostInputEvent(State);
-                if (ToolsContext->InputRouter->HasActiveMouseCapture())
+                BuildGizmo(*View);
+                if (ForegroundGizmo.BeginDrag(FVector2D(Mouse.X, Mouse.Y)))
                 {
-                    PointerAction = EPointerAction::Gizmo;
-                    LastGizmoMouse = Mouse;
-                    PostInvalidation();
-                    return;
+                    const FTransform Start = PreviewOwner->GetSelectionGizmoTransform();
+                    if (PreviewOwner->BeginSoftTransform(Start, PreviewOwner->GetSoftTransformMode()))
+                    {
+                        PointerAction = EPointerAction::Gizmo;
+                        LastGizmoMouse = Mouse;
+                        PostInvalidation();
+                        return;
+                    }
+                    ForegroundGizmo.EndDrag();
                 }
             }
         }
@@ -545,56 +441,29 @@ private:
         return PointerAction == EPointerAction::EdgeLoop;
     }
 
-    void UpdateGizmoDrag(FViewport* InViewport, const FIntPoint& Mouse)
+    void UpdateGizmoDrag(const FIntPoint& Mouse)
     {
         bPendingGizmoMove = false;
         if (Mouse == LastGizmoMouse)
         {
             return;
         }
-
-        FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
-        if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+        PreviewOwner->ApplyGizmoTransform(ForegroundGizmo.DragTo(FVector2D(Mouse.X, Mouse.Y)));
+        LastGizmoMouse = Mouse;
+        if (NGon::IsBoneTransformActive(&PreviewOwner.Get()))
         {
-            const FIntPoint Delta = Mouse - LastGizmoMouse;
-            FInputDeviceState State = MakeMouseInput(*View, Mouse, FVector2D(Delta.X, Delta.Y));
-            State.Mouse.Left.SetStates(false, true, false);
-            ToolsContext->InputRouter->PostInputEvent(State);
-            LastGizmoMouse = Mouse;
-            if (NGon::IsBoneTransformActive(&PreviewOwner.Get()))
-            {
-                NotifyBoneTransformChanged();
-            }
-            PostInvalidation();
+            NotifyBoneTransformChanged();
         }
+        PostInvalidation();
     }
 
     void FinishPointerAction(FViewport* InViewport, const FIntPoint& Mouse)
     {
         if (PointerAction == EPointerAction::Gizmo)
         {
-            UpdateGizmoDrag(InViewport, Mouse);
-            FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
-            if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
-            {
-                FInputDeviceState State = MakeMouseInput(*View, Mouse, FVector2D::ZeroVector);
-                State.Mouse.Left.SetStates(false, false, true);
-                ToolsContext->InputRouter->PostInputEvent(State);
-                const bool bBoneDrag = NGon::IsBoneTransformActive(&PreviewOwner.Get());
-                if (bBoneDrag || PreviewOwner->IsSoftTransformActive())
-                {
-                    PreviewOwner->EndSoftTransform();
-                }
-                if (bBoneDrag)
-                {
-                    NotifyBoneTransformChanged();
-                }
-            }
-            else
-            {
-                CancelPointerAction();
-                return;
-            }
+            UpdateGizmoDrag(Mouse);
+            PreviewOwner->EndSoftTransform();
+            ForegroundGizmo.EndDrag();
         }
         else
         {
@@ -648,7 +517,8 @@ private:
 
     void CancelPointerAction()
     {
-        ToolsContext->InputRouter->ForceTerminateAll();
+        ForegroundGizmo.EndDrag();
+        HoverPixel.Reset();
         const bool bBoneDrag = NGon::IsBoneTransformActive(&PreviewOwner.Get());
         PreviewOwner->CancelSoftTransform();
         if (bBoneDrag)
@@ -670,9 +540,8 @@ private:
     }
 
     TWeakPtr<SNGonViewport> ViewportWidget;
-    TStrongObjectPtr<UInteractiveToolsContext> ToolsContext;
-    UGizmoViewContext* GizmoViewContext = nullptr;
-    FViewCameraState CameraState{};
+    FNGonViewportGizmo ForegroundGizmo;
+    TOptional<FVector2D> HoverPixel;
     FBox PendingFrameBounds{ForceInit};
 
     EPointerAction PointerAction = EPointerAction::None;
@@ -682,7 +551,6 @@ private:
     FVector2D MarqueeEnd = FVector2D::ZeroVector;
     bool bPendingGizmoMove = false;
     bool bMarqueeActive = false;
-    bool bMouseOverViewport = false;
 };
 }
 
@@ -698,32 +566,32 @@ TSharedRef<FEditorViewportClient> SNGonViewport::MakeEditorViewportClient()
     return MakeShared<FNGonViewportClient>(PreviewScene.ToSharedRef(), SharedThis(this));
 }
 
-void SNGonViewport::SetMesh(FNGonMeshData&& Data)
+void SNGonViewport::SetMesh(FNGonMeshData&& Data, TArray<UMaterialInterface*> Materials)
 {
     bHeatmapVisible = false;
     NGon::ClearSceneSkeleton(PreviewScene.Get());
-    PreviewScene->SetMesh(MoveTemp(Data));
-    if (const TSharedPtr<FEditorViewportClient> Client = GetViewportClient())
+    PreviewScene->SetMesh(MoveTemp(Data), MoveTemp(Materials));
+    if (const TSharedPtr<FEditorViewportClient> PreviewClient = GetViewportClient())
     {
-        static_cast<FNGonViewportClient*>(Client.Get())->FrameBounds(PreviewScene->GetMeshBounds(), true);
+        static_cast<FNGonViewportClient*>(PreviewClient.Get())->FrameBounds(PreviewScene->GetMeshBounds(), true);
     }
 }
 
 void SNGonViewport::FrameMesh()
 {
-    if (const TSharedPtr<FEditorViewportClient> Client = GetViewportClient())
+    if (const TSharedPtr<FEditorViewportClient> PreviewClient = GetViewportClient())
     {
-        static_cast<FNGonViewportClient*>(Client.Get())->FrameBounds(PreviewScene->GetSelectionOrMeshBounds(), false);
+        static_cast<FNGonViewportClient*>(PreviewClient.Get())->FrameBounds(PreviewScene->GetSelectionOrMeshBounds(), false);
     }
 }
 
 void SNGonViewport::FocusViewport()
 {
-    if (const TSharedPtr<FSceneViewport> SceneViewport = GetSceneViewport())
+    if (const TSharedPtr<FSceneViewport> PreviewSceneViewport = GetSceneViewport())
     {
-        if (const TSharedPtr<SViewport> Widget = SceneViewport->GetViewportWidget().Pin())
+        if (const TSharedPtr<SViewport> SlateViewport = PreviewSceneViewport->GetViewportWidget().Pin())
         {
-            FSlateApplication::Get().SetKeyboardFocus(Widget, EFocusCause::SetDirectly);
+            FSlateApplication::Get().SetKeyboardFocus(SlateViewport, EFocusCause::SetDirectly);
         }
     }
 }
@@ -732,9 +600,9 @@ void SNGonViewport::SetShadingMode(ENGonViewportShading Mode)
 {
     ShadingMode = Mode;
     PreviewScene->SetFlatShading(Mode == ENGonViewportShading::Faceted);
-    if (const TSharedPtr<FEditorViewportClient> Client = GetViewportClient())
+    if (const TSharedPtr<FEditorViewportClient> PreviewClient = GetViewportClient())
     {
-        Client->SetViewMode(Mode == ENGonViewportShading::Wireframe ? VMI_Wireframe : VMI_Unlit);
+        PreviewClient->SetViewMode(Mode == ENGonViewportShading::Wireframe ? VMI_Wireframe : VMI_Lit);
         Invalidate();
     }
 }
