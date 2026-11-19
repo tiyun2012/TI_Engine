@@ -206,7 +206,15 @@ TSharedRef<SWidget> SNGonPreview::MakeLeftToolSidebar()
                     ENGonToolShelfTab::Model,
                     LOCTEXT("ModelIcon", "MODEL"),
                     LOCTEXT("ModelLabel", "Model"),
-                    LOCTEXT("ModelTip", "N-Gon polygon, edge, and vertex modeling and face deletion tools."))
+                    LOCTEXT("ModelTip", "N-Gon Mesh Studio: primitives, extrude, inset, bevel, subdivide, edge/vertex ops."))
+            ]
+            + SVerticalBox::Slot().AutoHeight()
+            [
+                MakeToolButton(
+                    ENGonToolShelfTab::AIStudio,
+                    LOCTEXT("AIStudioIcon", "AI API"),
+                    LOCTEXT("AIStudioLabel", "AI API"),
+                    LOCTEXT("AIStudioTip", "Open Mesh Studio & AI JSON Command Console for programmatic mesh control."))
             ]
             + SVerticalBox::Slot().AutoHeight()
             [
@@ -254,7 +262,13 @@ void SNGonPreview::SetActiveToolTab(ENGonToolShelfTab Tab)
     }
     else if (Tab == ENGonToolShelfTab::Model)
     {
-        ActiveUpperTab = ENGonRightUpperTab::Topology;
+        ActiveUpperTab = ENGonRightUpperTab::MeshStudio;
+        ActiveLowerTab = ENGonRightLowerTab::Details;
+    }
+    else if (Tab == ENGonToolShelfTab::AIStudio)
+    {
+        ActiveUpperTab = ENGonRightUpperTab::MeshStudio;
+        ActiveLowerTab = ENGonRightLowerTab::AIConsole;
     }
     else if (Tab == ENGonToolShelfTab::Display)
     {

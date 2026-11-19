@@ -9,6 +9,7 @@ public class NGon : ModuleRules
         PrivateDependencyModuleNames.AddRange(new[]
         {
             "Core",
+            "ApplicationCore",
             "CoreUObject",
             "Engine",
             "UnrealEd",
@@ -28,7 +29,9 @@ public class NGon : ModuleRules
             "MeshConversion",
             "InteractiveToolsFramework",
             "ModelingComponents",
-            "ImageWrapper"
+            "ImageWrapper",
+            "Json",
+            "JsonUtilities"
         });
 
         AddEngineThirdPartyPrivateStaticDependencies(Target, "FBX");

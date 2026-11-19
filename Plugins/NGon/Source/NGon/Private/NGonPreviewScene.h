@@ -78,6 +78,11 @@ public:
     FText DescribeMesh() const;
     FText DescribeUpdates() const;
     const FNGonTopology& GetTopology() const { return Topology; }
+    const TArray<FVector>& GetPositions() const { return Positions; }
+    ENGonElement GetSelectedElement() const { return SelectedElement; }
+    const TSet<int32>& GetSelectedIds() const { return SelectedIds; }
+    void SetSelectionSet(ENGonElement Element, const TSet<int32>& Ids, bool bAdd = false) { ApplySelectionSet(Element, Ids, bAdd); }
+    bool ReplacePolygonMesh(const TArray<FVector>& NewPositions, const TArray<TArray<int32>>& NewFaces, FText& OutError);
 
 private:
 #if WITH_DEV_AUTOMATION_TESTS

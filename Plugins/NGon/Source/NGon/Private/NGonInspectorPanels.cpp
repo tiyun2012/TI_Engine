@@ -115,24 +115,41 @@ TSharedRef<SWidget> SNGonPreview::MakeRightInspectorPanel()
                 .AutoHeight()
                 .Padding(0.0f, 0.0f, 0.0f, 6.0f)
                 [
-                    SNew(SHorizontalBox)
-                    + SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 4.0f, 0.0f)
+                    SNew(SWrapBox)
+                    .UseAllottedSize(true)
+                    .InnerSlotPadding(FVector2D(4.0f, 4.0f))
+                    + SWrapBox::Slot()
                     [
-                        MakeUpperTabButton(ENGonRightUpperTab::SkeletonTree, LOCTEXT("SkeletonTreeTab", "Skeleton Tree"))
+                        MakeUpperTabButton(ENGonRightUpperTab::MeshStudio, LOCTEXT("MeshStudioTab", "Mesh Studio"))
                     ]
-                    + SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 4.0f, 0.0f)
+                    + SWrapBox::Slot()
                     [
-                        MakeUpperTabButton(ENGonRightUpperTab::MorphTargets, LOCTEXT("MorphTargetsTab", "Morph Targets"))
+                        MakeUpperTabButton(ENGonRightUpperTab::SkeletonTree, LOCTEXT("SkeletonTreeTab", "Skeleton"))
                     ]
-                    + SHorizontalBox::Slot().AutoWidth()
+                    + SWrapBox::Slot()
                     [
-                        MakeUpperTabButton(ENGonRightUpperTab::Topology, LOCTEXT("TopologyTab", "N-Gon Topology"))
+                        MakeUpperTabButton(ENGonRightUpperTab::MorphTargets, LOCTEXT("MorphTargetsTab", "Morphs"))
+                    ]
+                    + SWrapBox::Slot()
+                    [
+                        MakeUpperTabButton(ENGonRightUpperTab::Topology, LOCTEXT("TopologyTab", "Topology"))
                     ]
                 ]
                 + SVerticalBox::Slot()
                 .FillHeight(1.0f)
                 [
                     SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [
+                        SNew(SBox)
+                        .Visibility_Lambda([this]
+                        {
+                            return ActiveUpperTab == ENGonRightUpperTab::MeshStudio ? EVisibility::Visible : EVisibility::Collapsed;
+                        })
+                        [
+                            MakeMeshStudioTab()
+                        ]
+                    ]
                     + SOverlay::Slot()
                     [
                         SNew(SBox)
@@ -181,20 +198,26 @@ TSharedRef<SWidget> SNGonPreview::MakeRightInspectorPanel()
                 .AutoHeight()
                 .Padding(0.0f, 0.0f, 0.0f, 6.0f)
                 [
-                    SNew(SHorizontalBox)
-                    + SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 4.0f, 0.0f)
+                    SNew(SWrapBox)
+                    .UseAllottedSize(true)
+                    .InnerSlotPadding(FVector2D(4.0f, 4.0f))
+                    + SWrapBox::Slot()
+                    [
+                        MakeLowerTabButton(ENGonRightLowerTab::AIConsole, LOCTEXT("AIConsoleTab", "AI Console"))
+                    ]
+                    + SWrapBox::Slot()
                     [
                         MakeLowerTabButton(ENGonRightLowerTab::Details, LOCTEXT("DetailsTab", "Details"))
                     ]
-                    + SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 4.0f, 0.0f)
+                    + SWrapBox::Slot()
                     [
-                        MakeLowerTabButton(ENGonRightLowerTab::AssetDetails, LOCTEXT("AssetDetailsTab", "Asset Details"))
+                        MakeLowerTabButton(ENGonRightLowerTab::AssetDetails, LOCTEXT("AssetDetailsTab", "Asset"))
                     ]
-                    + SHorizontalBox::Slot().AutoWidth()
+                    + SWrapBox::Slot()
                     [
-                        MakeLowerTabButton(ENGonRightLowerTab::PreviewSettings, LOCTEXT("PreviewSettingsTab", "Preview Settings"))
+                        MakeLowerTabButton(ENGonRightLowerTab::PreviewSettings, LOCTEXT("PreviewSettingsTab", "Settings"))
                     ]
-                    + SHorizontalBox::Slot().AutoWidth()
+                    + SWrapBox::Slot()
                     [
                         MakeLowerTabButton(ENGonRightLowerTab::Painter, LOCTEXT("PainterTab", "Painter"))
                     ]
@@ -206,6 +229,17 @@ TSharedRef<SWidget> SNGonPreview::MakeRightInspectorPanel()
                     + SScrollBox::Slot()
                     [
                         SNew(SOverlay)
+                        + SOverlay::Slot()
+                        [
+                            SNew(SBox)
+                            .Visibility_Lambda([this]
+                            {
+                                return ActiveLowerTab == ENGonRightLowerTab::AIConsole ? EVisibility::Visible : EVisibility::Collapsed;
+                            })
+                            [
+                                MakeAIConsoleTab()
+                            ]
+                        ]
                         + SOverlay::Slot()
                         [
                             SNew(SBox)

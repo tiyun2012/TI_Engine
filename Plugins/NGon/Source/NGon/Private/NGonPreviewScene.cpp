@@ -1,5 +1,6 @@
 #include "NGonPreviewScene.h"
 #include "NGonSceneSkeleton.h"
+#include "NGonMeshAPI.h"
 
 #include "Algo/AnyOf.h"
 #include "Components/DynamicMeshComponent.h"
@@ -45,6 +46,39 @@ FLinearColor HeatColor(float Alpha)
     const FLinearColor Hot(0.98f, 0.08f, 0.018f);
     const float T = FMath::Clamp(Alpha, 0.0f, 1.0f) * 2.0f;
     return T < 1.0f ? FMath::Lerp(Cold, Mid, T) : FMath::Lerp(Mid, Hot, T - 1.0f);
+}
+
+UMaterial* MakeFaceHighlightMaterial()
+{
+    UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
+    Material->SetShadingModel(MSM_DefaultLit);
+    Material->TwoSided = true;
+
+    auto* Shade = CastChecked<UMaterialExpressionCustom>(UMaterialEditingLibrary::CreateMaterialExpression(
+        Material, UMaterialExpressionCustom::StaticClass(), -320, 0));
+    Shade->OutputType = CMOT_Float3;
+    Shade->Inputs.Reset();
+    Shade->Code = TEXT(
+        "float3 N = normalize(Parameters.WorldNormal);\n"
+        "float3 V = normalize(Parameters.CameraVector);\n"
+        "float3 R = normalize(cross(V, float3(0.0, 0.0, 1.0)) + float3(1e-5, 0.0, 0.0));\n"
+        "float3 U = normalize(cross(R, V));\n"
+        "float3 Lkey = normalize(V * 0.45 + R * 0.42 + U * 0.62);\n"
+        "float3 Lfill = normalize(V * 0.35 - R * 0.60 - U * 0.25);\n"
+        "float ndotlKey = saturate(dot(N, Lkey));\n"
+        "float ndotlFill = saturate(dot(N, Lfill));\n"
+        "float ndotv = abs(dot(N, V));\n"
+        "float hemi = saturate(N.z * 0.5 + 0.5);\n"
+        "float3 H = normalize(Lkey + V);\n"
+        "float spec = pow(saturate(dot(N, H)), 28.0) * 0.18;\n"
+        "float3 baseAlbedo = float3(0.76, 0.60, 0.36);\n"
+        "float lighting = 0.30 + 0.46 * ndotlKey + 0.20 * ndotlFill + 0.14 * hemi + 0.18 * ndotv;\n"
+        "return baseAlbedo * lighting + float3(spec, spec, spec);");
+
+    Material->GetEditorOnlyData()->BaseColor.Connect(0, Shade);
+    Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Shade);
+    Material->PostEditChange();
+    return Material;
 }
 
 UMaterial* MakeStudioMaterial(bool bUseVertexColor)
@@ -229,6 +263,7 @@ FNGonPreviewScene::FNGonPreviewScene()
 
 FNGonPreviewScene::~FNGonPreviewScene()
 {
+    FNGonMeshAPI::ClearHistory(this);
     NGon::RemoveSceneAccel(this);
     Picker.SetMesh(nullptr);
     Overlay->Disconnect();
@@ -387,7 +422,7 @@ void FNGonPreviewScene::SetPreviewMaterials(UInteractiveToolManager* ToolManager
     {
         return;
     }
-    if (UMaterialInterface* Highlight = ToolSetupUtil::GetSelectionMaterial(FLinearColor(SelectionColor), ToolManager, 0.10f))
+    if (UMaterialInterface* Highlight = MakeFaceHighlightMaterial())
     {
         Surface->SetSecondaryRenderMaterial(Highlight);
         Surface->EnableSecondaryTriangleBuffers([this](const FDynamicMesh3* Mesh, int32 TriangleId)
@@ -1884,6 +1919,31 @@ bool FNGonPreviewScene::DeleteSelectedFaces()
     }
 
     SetMesh(MoveTemp(Replacement), Surface->GetMaterials());
+    SoftTransformMode = SavedSoftMode;
+    SoftSettings = SavedSoftSettings;
+    HeatBias = SavedHeatBias;
+    UpdateSurfaceDisplay(true);
+    RebuildSoftSelection();
+    return true;
+}
+
+bool FNGonPreviewScene::ReplacePolygonMesh(
+    const TArray<FVector>& NewPositions,
+    const TArray<TArray<int32>>& NewFaces,
+    FText& OutError)
+{
+    FNGonMeshData Replacement;
+    if (!NGon::BuildPolygonMesh(NewPositions, NewFaces, Replacement, OutError))
+    {
+        return false;
+    }
+
+    const ENGonSoftTransformMode SavedSoftMode = SoftTransformMode;
+    const FNGonSoftSelectionSettings SavedSoftSettings = SoftSettings;
+    const float SavedHeatBias = HeatBias;
+    const TArray<UMaterialInterface*> SavedMaterials = Surface ? Surface->GetMaterials() : TArray<UMaterialInterface*>();
+
+    SetMesh(MoveTemp(Replacement), SavedMaterials);
     SoftTransformMode = SavedSoftMode;
     SoftSettings = SavedSoftSettings;
     HeatBias = SavedHeatBias;

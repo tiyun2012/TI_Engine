@@ -68,11 +68,13 @@ enum class ENGonToolShelfTab : uint8
     Sculpt,
     Deform,
     Skin,
+    AIStudio,
     Display
 };
 
 enum class ENGonRightUpperTab : uint8
 {
+    MeshStudio,
     SkeletonTree,
     MorphTargets,
     Topology
@@ -80,6 +82,7 @@ enum class ENGonRightUpperTab : uint8
 
 enum class ENGonRightLowerTab : uint8
 {
+    AIConsole,
     Details,
     AssetDetails,
     PreviewSettings,
@@ -138,6 +141,8 @@ private:
     TSharedRef<SWidget> MakeRightInspectorPanel();
     TSharedRef<SWidget> MakeSkeletonTreeTab();
     TSharedRef<SWidget> MakeMorphTargetsTab();
+    TSharedRef<SWidget> MakeMeshStudioTab();
+    TSharedRef<SWidget> MakeAIConsoleTab();
     TSharedRef<SWidget> MakeTopologyTab();
     TSharedRef<SWidget> MakeDetailsTab();
     TSharedRef<SWidget> MakeAssetDetailsTab();
@@ -163,8 +168,8 @@ private:
 
     ENGonElement SelectionMode = ENGonElement::Face;
     ENGonToolShelfTab ActiveToolTab = ENGonToolShelfTab::Model;
-    ENGonRightUpperTab ActiveUpperTab = ENGonRightUpperTab::SkeletonTree;
-    ENGonRightLowerTab ActiveLowerTab = ENGonRightLowerTab::Details;
+    ENGonRightUpperTab ActiveUpperTab = ENGonRightUpperTab::MeshStudio;
+    ENGonRightLowerTab ActiveLowerTab = ENGonRightLowerTab::AIConsole;
 
     bool bShowEdges = true;
     bool bShowVertices = true;

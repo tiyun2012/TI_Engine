@@ -380,7 +380,7 @@ private:
         const FVector Origin = Frame.GetLocation();
 
         // Extract camera basis directly from ViewMatrices so Alt+LMB orbit camera rotation is always exact
-        const FMatrix& ViewMatrix = View.ViewMatrices.GetViewMatrix();
+        const FMatrix& ViewMatrix = View.ViewMatrices.GetWorldToView();
         const FVector CamRight = ViewMatrix.GetColumn(0).GetSafeNormal();
         const FVector CamUp = ViewMatrix.GetColumn(1).GetSafeNormal();
         const FVector CamForward = ViewMatrix.GetColumn(2).GetSafeNormal();
@@ -388,7 +388,7 @@ private:
 
         const double ClipW = View.WorldToScreen(Origin).W;
         const double ProjectionWidth = static_cast<double>(View.UnscaledViewRect.Width())
-            * FMath::Abs(View.ViewMatrices.GetProjectionMatrix().M[0][0]);
+            * FMath::Abs(View.ViewMatrices.GetViewToClip().M[0][0]);
         double UnitsPerPixel = (ClipW > 0.0 && ProjectionWidth > 1e-4)
             ? (2.0 * ClipW / ProjectionWidth)
             : 0.0;
