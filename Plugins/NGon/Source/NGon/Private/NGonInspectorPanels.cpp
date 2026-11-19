@@ -1359,9 +1359,21 @@ TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
         .Padding(0.0f, 4.0f)
         [
             SNew(SCheckBox)
-            .IsChecked_Lambda([this] { return bSoftSelection ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .IsChecked_Lambda([this]
+            {
+                const bool bLive = Viewport.IsValid() ? Viewport->Preview().GetSoftSelectionSettings().bEnabled : bSoftSelection;
+                return bLive ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+            })
             .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
             {
+                if (Viewport.IsValid())
+                {
+                    const FNGonSoftSelectionSettings Live = Viewport->Preview().GetSoftSelectionSettings();
+                    if (Live.Radius > 0.1)
+                    {
+                        SoftRadius = static_cast<float>(Live.Radius);
+                    }
+                }
                 bSoftSelection = (State == ECheckBoxState::Checked);
                 ApplySoftSelectionSettings();
             })
@@ -1383,9 +1395,19 @@ TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
                 SNew(SSlider)
                 .MinValue(1.0f)
                 .MaxValue(500.0f)
-                .Value_Lambda([this] { return SoftRadius; })
+                .Value_Lambda([this]
+                {
+                    const float LiveR = Viewport.IsValid()
+                        ? static_cast<float>(Viewport->Preview().GetSoftSelectionSettings().Radius)
+                        : SoftRadius;
+                    return FMath::Clamp(LiveR, 1.0f, 500.0f);
+                })
                 .OnValueChanged_Lambda([this](float Value)
                 {
+                    if (Viewport.IsValid())
+                    {
+                        bSoftSelection = Viewport->Preview().GetSoftSelectionSettings().bEnabled;
+                    }
                     SoftRadius = Value;
                     ApplySoftSelectionSettings();
                 })
@@ -1393,7 +1415,13 @@ TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6.0f, 0.0f, 0.0f, 0.0f)
             [
                 SNew(STextBlock)
-                .Text_Lambda([this] { return FText::AsNumber(FMath::RoundToInt(SoftRadius)); })
+                .Text_Lambda([this]
+                {
+                    const float LiveR = Viewport.IsValid()
+                        ? static_cast<float>(Viewport->Preview().GetSoftSelectionSettings().Radius)
+                        : SoftRadius;
+                    return FText::AsNumber(FMath::RoundToInt(LiveR));
+                })
             ]
         ]
         + SVerticalBox::Slot()
@@ -1506,7 +1534,7 @@ TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
                 SNew(SSlider)
                 .MinValue(0.0f)
                 .MaxValue(1.0f)
-                .IsEnabled_Lambda([this] { return bSoftSelection && SoftMetric == ENGonSoftMetric::Hybrid; })
+                .IsEnabled_Lambda([this] { return (Viewport.IsValid() ? Viewport->Preview().GetSoftSelectionSettings().bEnabled : bSoftSelection) && SoftMetric == ENGonSoftMetric::Hybrid; })
                 .Value_Lambda([this] { return SoftSurfaceBlend; })
                 .OnValueChanged_Lambda([this](float Value)
                 {

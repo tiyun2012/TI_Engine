@@ -4,7 +4,13 @@
 #include "CanvasTypes.h"
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
+#include "Engine/Texture2D.h"
+#include "Fonts/FontMeasure.h"
+#include "Framework/Application/SlateApplication.h"
 #include "InputCoreTypes.h"
+#include "Styling/CoreStyle.h"
+#include "TextureResource.h"
+#include "UObject/StrongObjectPtr.h"
 
 namespace
 {
@@ -15,41 +21,200 @@ bool IsInsideBox(const FBox2D& Box, const FVector2D& P)
     return P.X >= Box.Min.X && P.X < Box.Max.X && P.Y >= Box.Min.Y && P.Y < Box.Max.Y;
 }
 
-void DrawFilledCircle(FCanvas& Canvas, const FVector2D& Center, float Radius, const FLinearColor& Color)
+float SmoothStep(float Edge0, float Edge1, float X)
 {
-    if (Radius <= 0.5f) return;
-    // Draw clean anti-aliased horizontal scanline disk via thin tiles
-    const int32 Steps = FMath::Clamp(FMath::CeilToInt(Radius), 6, 36);
-    for (int32 i = -Steps; i <= Steps; ++i)
-    {
-        const float Dy = (static_cast<float>(i) / static_cast<float>(Steps)) * Radius;
-        const float HalfW = FMath::Sqrt(FMath::Max(0.0f, Radius * Radius - Dy * Dy));
-        if (HalfW <= 0.25f) continue;
-        const float SliceH = (Radius / static_cast<float>(Steps)) * 1.35f;
-        FCanvasTileItem Tile(
-            FVector2D(Center.X - HalfW, Center.Y + Dy - SliceH * 0.5f),
-            FVector2D(HalfW * 2.0f, SliceH),
-            Color);
-        Tile.BlendMode = SE_BLEND_Translucent;
-        Canvas.DrawItem(Tile);
-    }
+    const float T = FMath::Clamp((X - Edge0) / FMath::Max(Edge1 - Edge0, 1.e-6f), 0.0f, 1.0f);
+    return T * T * (3.0f - 2.0f * T);
 }
 
-void DrawCircleOutline(FCanvas& Canvas, const FVector2D& Center, float Radius, const FLinearColor& Color, float Thickness)
+UTexture2D* CreateSdfTexture(int32 Width, int32 Height, TFunctionRef<FColor(float U, float V)> EvalPixel)
+{
+    UTexture2D* Tex = UTexture2D::CreateTransient(Width, Height, PF_B8G8R8A8);
+    if (!Tex)
+    {
+        return nullptr;
+    }
+    Tex->SRGB = false;
+    Tex->Filter = TF_Bilinear;
+    Tex->AddressX = TA_Clamp;
+    Tex->AddressY = TA_Clamp;
+    Tex->NeverStream = true;
+
+    FTexturePlatformData* PlatformData = Tex->GetPlatformData();
+    if (!PlatformData || PlatformData->Mips.IsEmpty())
+    {
+        return nullptr;
+    }
+    FTexture2DMipMap& Mip = PlatformData->Mips[0];
+    FColor* Pixels = static_cast<FColor*>(Mip.BulkData.Lock(LOCK_READ_WRITE));
+    if (Pixels)
+    {
+        for (int32 Y = 0; Y < Height; ++Y)
+        {
+            const float V = (static_cast<float>(Y) + 0.5f) / static_cast<float>(Height);
+            for (int32 X = 0; X < Width; ++X)
+            {
+                const float U = (static_cast<float>(X) + 0.5f) / static_cast<float>(Width);
+                Pixels[Y * Width + X] = EvalPixel(U, V);
+            }
+        }
+        Mip.BulkData.Unlock();
+        Tex->UpdateResource();
+    }
+    return Tex;
+}
+
+struct FPieSdfTextures
+{
+    TStrongObjectPtr<UTexture2D> CircleFill;
+    TStrongObjectPtr<UTexture2D> CircleRingThin;
+    TStrongObjectPtr<UTexture2D> CircleRingThick;
+    TStrongObjectPtr<UTexture2D> SoftGlow;
+    TStrongObjectPtr<UTexture2D> PillFill;
+    TStrongObjectPtr<UTexture2D> PillBorder;
+
+    void EnsureInitialized()
+    {
+        if (!CircleFill.IsValid())
+        {
+            // Smoothly anti-aliased disc with subtle top-lit studio glass gradient
+            CircleFill.Reset(CreateSdfTexture(128, 128, [](float U, float V)
+            {
+                const float Dx = U * 2.0f - 1.0f;
+                const float Dy = V * 2.0f - 1.0f;
+                const float Dist = FMath::Sqrt(Dx * Dx + Dy * Dy);
+                const float Alpha = 1.0f - SmoothStep(0.92f, 0.985f, Dist);
+                // Subtle top-down sheen (brighter at top, deeper at bottom)
+                const float Sheen = FMath::Lerp(1.0f, 0.80f, FMath::Clamp(V, 0.0f, 1.0f));
+                // Subtle inner rim highlight near top
+                const float InnerRim = SmoothStep(0.78f, 0.92f, Dist) * FMath::Clamp(1.0f - V * 1.4f, 0.0f, 1.0f) * 0.12f;
+                const uint8 Lum = static_cast<uint8>(FMath::Clamp((Sheen + InnerRim) * 255.0f, 0.0f, 255.0f));
+                const uint8 A = static_cast<uint8>(FMath::Clamp(Alpha * 255.0f, 0.0f, 255.0f));
+                return FColor(Lum, Lum, Lum, A);
+            }));
+        }
+        if (!CircleRingThin.IsValid())
+        {
+            // Ultra-crisp anti-aliased thin circular ring
+            CircleRingThin.Reset(CreateSdfTexture(256, 256, [](float U, float V)
+            {
+                const float Dx = U * 2.0f - 1.0f;
+                const float Dy = V * 2.0f - 1.0f;
+                const float Dist = FMath::Sqrt(Dx * Dx + Dy * Dy);
+                const float Band = FMath::Abs(Dist - 0.945f);
+                const float Alpha = 1.0f - SmoothStep(0.012f, 0.032f, Band);
+                const uint8 A = static_cast<uint8>(FMath::Clamp(Alpha * 255.0f, 0.0f, 255.0f));
+                return FColor(255, 255, 255, A);
+            }));
+        }
+        if (!CircleRingThick.IsValid())
+        {
+            // Crisp hover ring (2.2px look, zero jaggies)
+            CircleRingThick.Reset(CreateSdfTexture(256, 256, [](float U, float V)
+            {
+                const float Dx = U * 2.0f - 1.0f;
+                const float Dy = V * 2.0f - 1.0f;
+                const float Dist = FMath::Sqrt(Dx * Dx + Dy * Dy);
+                const float Band = FMath::Abs(Dist - 0.935f);
+                const float Alpha = 1.0f - SmoothStep(0.028f, 0.052f, Band);
+                const uint8 A = static_cast<uint8>(FMath::Clamp(Alpha * 255.0f, 0.0f, 255.0f));
+                return FColor(255, 255, 255, A);
+            }));
+        }
+        if (!SoftGlow.IsValid())
+        {
+            // Smooth radial Gaussian halo for drop shadows and active hover bloom
+            SoftGlow.Reset(CreateSdfTexture(128, 128, [](float U, float V)
+            {
+                const float Dx = U * 2.0f - 1.0f;
+                const float Dy = V * 2.0f - 1.0f;
+                const float DistSq = Dx * Dx + Dy * Dy;
+                const float Falloff = FMath::Exp(-DistSq * 4.2f) * (1.0f - SmoothStep(0.75f, 1.0f, FMath::Sqrt(DistSq)));
+                const uint8 A = static_cast<uint8>(FMath::Clamp(Falloff * 255.0f, 0.0f, 255.0f));
+                return FColor(255, 255, 255, A);
+            }));
+        }
+        if (!PillFill.IsValid())
+        {
+            // Anti-aliased rounded pill fill (256x64 aspect)
+            PillFill.Reset(CreateSdfTexture(256, 64, [](float U, float V)
+            {
+                const float Aspect = 4.0f;
+                const float X = (U * 2.0f - 1.0f) * Aspect;
+                const float Y = V * 2.0f - 1.0f;
+                const float HalfX = Aspect - 0.92f;
+                const float HalfY = 0.08f;
+                const float Qx = FMath::Max(FMath::Abs(X) - HalfX, 0.0f);
+                const float Qy = FMath::Max(FMath::Abs(Y) - HalfY, 0.0f);
+                const float Sdf = FMath::Sqrt(Qx * Qx + Qy * Qy) - 0.84f;
+                const float Alpha = 1.0f - SmoothStep(-0.04f, 0.05f, Sdf);
+                const float Sheen = FMath::Lerp(1.0f, 0.86f, V);
+                const uint8 Lum = static_cast<uint8>(FMath::Clamp(Sheen * 255.0f, 0.0f, 255.0f));
+                const uint8 A = static_cast<uint8>(FMath::Clamp(Alpha * 255.0f, 0.0f, 255.0f));
+                return FColor(Lum, Lum, Lum, A);
+            }));
+        }
+        if (!PillBorder.IsValid())
+        {
+            // Anti-aliased rounded pill border
+            PillBorder.Reset(CreateSdfTexture(256, 64, [](float U, float V)
+            {
+                const float Aspect = 4.0f;
+                const float X = (U * 2.0f - 1.0f) * Aspect;
+                const float Y = V * 2.0f - 1.0f;
+                const float HalfX = Aspect - 0.92f;
+                const float HalfY = 0.08f;
+                const float Qx = FMath::Max(FMath::Abs(X) - HalfX, 0.0f);
+                const float Qy = FMath::Max(FMath::Abs(Y) - HalfY, 0.0f);
+                const float Sdf = FMath::Sqrt(Qx * Qx + Qy * Qy) - 0.84f;
+                const float Alpha = 1.0f - SmoothStep(0.02f, 0.08f, FMath::Abs(Sdf));
+                const uint8 A = static_cast<uint8>(FMath::Clamp(Alpha * 255.0f, 0.0f, 255.0f));
+                return FColor(255, 255, 255, A);
+            }));
+        }
+    }
+};
+
+FPieSdfTextures& GetPieTextures()
+{
+    static FPieSdfTextures Textures;
+    Textures.EnsureInitialized();
+    return Textures;
+}
+
+void DrawSpriteCentered(FCanvas& Canvas, UTexture2D* Tex, const FVector2D& Center, const FVector2D& Size, const FLinearColor& Tint)
+{
+    if (!Tex || !Tex->GetResource() || Size.X <= 0.5 || Size.Y <= 0.5)
+    {
+        return;
+    }
+    FCanvasTileItem Tile(Center - Size * 0.5, Tex->GetResource(), Size, Tint);
+    Tile.BlendMode = SE_BLEND_Translucent;
+    Canvas.DrawItem(Tile);
+}
+
+void DrawCircleSdf(FCanvas& Canvas, const FVector2D& Center, float Radius, const FLinearColor& Color)
 {
     if (Radius <= 0.5f) return;
-    constexpr int32 Segs = 32;
-    FVector2D Prev(Center.X + Radius, Center.Y);
-    for (int32 i = 1; i <= Segs; ++i)
-    {
-        const float Angle = (PieTau * static_cast<float>(i)) / static_cast<float>(Segs);
-        const FVector2D Curr(Center.X + FMath::Cos(Angle) * Radius, Center.Y + FMath::Sin(Angle) * Radius);
-        FCanvasLineItem Line(Prev, Curr);
-        Line.SetColor(Color);
-        Line.LineThickness = Thickness;
-        Canvas.DrawItem(Line);
-        Prev = Curr;
-    }
+    FPieSdfTextures& Tex = GetPieTextures();
+    // Compensate for 0.955 SDF edge radius so visual radius matches Radius accurately
+    const float Diam = Radius * 2.08f;
+    DrawSpriteCentered(Canvas, Tex.CircleFill.Get(), Center, FVector2D(Diam, Diam), Color);
+}
+
+void DrawRingSdf(FCanvas& Canvas, const FVector2D& Center, float Radius, const FLinearColor& Color, bool bThick)
+{
+    if (Radius <= 0.5f) return;
+    FPieSdfTextures& Tex = GetPieTextures();
+    const float Diam = Radius * 2.12f;
+    DrawSpriteCentered(Canvas, bThick ? Tex.CircleRingThick.Get() : Tex.CircleRingThin.Get(), Center, FVector2D(Diam, Diam), Color);
+}
+
+void DrawGlowSdf(FCanvas& Canvas, const FVector2D& Center, float Radius, const FLinearColor& Color)
+{
+    if (Radius <= 0.5f) return;
+    FPieSdfTextures& Tex = GetPieTextures();
+    DrawSpriteCentered(Canvas, Tex.SoftGlow.Get(), Center, FVector2D(Radius * 2.0f, Radius * 2.0f), Color);
 }
 
 void DrawFilledRect(FCanvas& Canvas, const FBox2D& Rect, const FLinearColor& Color)
@@ -71,13 +236,25 @@ void DrawRectOutline(FCanvas& Canvas, const FBox2D& Rect, const FLinearColor& Co
     Canvas.DrawItem(Box);
 }
 
-void DrawCenteredText(FCanvas& Canvas, UFont* Font, const FVector2D& Center, const FString& Text, const FLinearColor& Color)
+FVector2D MeasureSlateText(const FString& Text, const FSlateFontInfo& FontInfo)
 {
-    if (!Font || Text.IsEmpty()) return;
-    int32 W = 0, H = 0;
-    Font->GetStringHeightAndWidth(Text, H, W);
-    FCanvasTextItem Item(FVector2D(Center.X - W * 0.5, Center.Y - H * 0.5), FText::FromString(Text), Font, Color);
-    Item.EnableShadow(FLinearColor(0.0f, 0.0f, 0.0f, 0.85f));
+    if (FSlateApplication::IsInitialized())
+    {
+        if (TSharedPtr<FSlateRenderer> Renderer = FSlateApplication::Get().GetRenderer())
+        {
+            return Renderer->GetFontMeasureService()->Measure(Text, FontInfo);
+        }
+    }
+    return FVector2D(Text.Len() * 7.0, 14.0);
+}
+
+void DrawCenteredSlateText(FCanvas& Canvas, const FSlateFontInfo& FontInfo, const FVector2D& Center, const FString& Text, const FLinearColor& Color)
+{
+    if (Text.IsEmpty()) return;
+    const FVector2D Sz = MeasureSlateText(Text, FontInfo);
+    const FVector2D Pos(FMath::RoundToDouble(Center.X - Sz.X * 0.5), FMath::RoundToDouble(Center.Y - Sz.Y * 0.5));
+    FCanvasTextItem Item(Pos, FText::FromString(Text), FontInfo, Color);
+    Item.EnableShadow(FLinearColor(0.0f, 0.0f, 0.0f, 0.72f), FVector2D(0.0f, 1.0f));
     Canvas.DrawItem(Item);
 }
 } // anonymous namespace
@@ -533,77 +710,122 @@ void FNGonPieMenu::Draw(FCanvas& Canvas, const FVector2D& ViewLogicalSize) const
 {
     if (!bOpen || Items.IsEmpty()) return;
 
-    UFont* Font = GEngine ? GEngine->GetSmallFont() : nullptr;
+    FPieSdfTextures& Tex = GetPieTextures();
+    const FSlateFontInfo TagFont = FCoreStyle::GetDefaultFontStyle("Bold", 9);
+    const FSlateFontInfo LabelFont = FCoreStyle::GetDefaultFontStyle("Bold", 10);
+    const FSlateFontInfo MenuFont = FCoreStyle::GetDefaultFontStyle("Regular", 10);
+    const FSlateFontInfo MenuBoldFont = FCoreStyle::GetDefaultFontStyle("Bold", 10);
 
-    const FLinearColor Accent(0.24f, 0.78f, 1.0f, 1.0f);
-    const FLinearColor Track(0.085f, 0.095f, 0.12f, 0.94f);
-    const FLinearColor ActiveBg(0.14f, 0.24f, 0.36f, 0.98f);
-    const FLinearColor SurfaceBg(0.06f, 0.068f, 0.085f, 0.96f);
-    const FLinearColor BorderCol(0.22f, 0.27f, 0.35f, 0.95f);
-    const FLinearColor TextCol(0.92f, 0.95f, 0.98f, 1.0f);
-    const FLinearColor MutedCol(0.55f, 0.60f, 0.68f, 0.90f);
+    const FLinearColor Accent(0.26f, 0.84f, 1.0f, 1.0f);
+    const FLinearColor AccentSoft(0.20f, 0.76f, 1.0f, 0.36f);
+    const FLinearColor NodeBg(0.11f, 0.13f, 0.17f, 0.92f);
+    const FLinearColor NodeActiveBg(0.12f, 0.30f, 0.46f, 0.96f);
+    const FLinearColor NodeDisabledBg(0.07f, 0.08f, 0.10f, 0.78f);
+    const FLinearColor HubBg(0.09f, 0.105f, 0.14f, 0.94f);
+    const FLinearColor PanelBg(0.075f, 0.085f, 0.11f, 0.96f);
+    const FLinearColor BorderCol(0.32f, 0.38f, 0.48f, 0.65f);
+    const FLinearColor TrackRingCol(0.36f, 0.46f, 0.62f, 0.28f);
+    const FLinearColor TextCol(0.92f, 0.95f, 0.99f, 1.0f);
+    const FLinearColor TextActiveCol(1.0f, 1.0f, 1.0f, 1.0f);
+    const FLinearColor MutedCol(0.50f, 0.56f, 0.64f, 0.85f);
+    const FLinearColor ShadowCol(0.0f, 0.0f, 0.0f, 0.48f);
 
     const float Step = PieTau / static_cast<float>(Items.Num());
     const float HalfBtn = ButtonDiameter * 0.5f;
+    const float HubR = DeadZoneRadius * 0.68f;
 
-    // 1. Subtle radial connector ring
-    DrawCircleOutline(Canvas, Center, VisualRadius, FLinearColor(0.22f, 0.28f, 0.38f, 0.40f), 1.2f);
+    // 1. Soft dark backdrop aura + silky anti-aliased radial orbit ring
+    DrawGlowSdf(Canvas, Center, VisualRadius + HalfBtn + 26.0f, FLinearColor(0.01f, 0.015f, 0.025f, 0.46f));
+    DrawRingSdf(Canvas, Center, VisualRadius, TrackRingCol, false);
 
-    // 2. Radial Root Buttons
+    // 2. Active directional beam from hub edge to highlighted node edge
+    if (Highlighted.IsSet() && Items.IsValidIndex(Highlighted.GetValue()))
+    {
+        const float SelAngle = StartAngle + Step * static_cast<float>(Highlighted.GetValue());
+        const FVector2D Dir(FMath::Cos(SelAngle), FMath::Sin(SelAngle));
+        const FVector2D BeamStart = Center + Dir * (HubR + 1.0f);
+        const FVector2D BeamEnd = Center + Dir * (VisualRadius - HalfBtn - 2.0f);
+
+        FCanvasLineItem GlowBeam(BeamStart, BeamEnd);
+        GlowBeam.SetColor(FLinearColor(0.24f, 0.82f, 1.0f, 0.28f));
+        GlowBeam.LineThickness = 4.5f;
+        Canvas.DrawItem(GlowBeam);
+
+        FCanvasLineItem CoreBeam(BeamStart, BeamEnd);
+        CoreBeam.SetColor(FLinearColor(0.45f, 0.92f, 1.0f, 0.92f));
+        CoreBeam.LineThickness = 1.6f;
+        Canvas.DrawItem(CoreBeam);
+    }
+
+    // 3. Radial Root Nodes (SDF anti-aliased discs, soft drop shadows, luminous hover halo)
     for (int32 i = 0; i < Items.Num(); ++i)
     {
         const float Angle = StartAngle + Step * static_cast<float>(i);
-        const FVector2D Pos(Center.X + FMath::Cos(Angle) * VisualRadius, Center.Y + FMath::Sin(Angle) * VisualRadius);
+        const FVector2D Dir(FMath::Cos(Angle), FMath::Sin(Angle));
+        const FVector2D Pos = Center + Dir * VisualRadius;
         const bool bSel = Highlighted.IsSet() && Highlighted.GetValue() == i;
         const FNGonPieItem& Item = Items[i];
+        const float NodeR = bSel ? (HalfBtn + 2.5f) : HalfBtn;
 
-        if (bSel)
+        // Soft offset drop shadow
+        DrawGlowSdf(Canvas, Pos + FVector2D(0.0, 3.0), NodeR + 11.0f, ShadowCol);
+
+        // Luminous outer glow halo on hovered node
+        if (bSel && Item.bEnabled)
         {
-            FCanvasLineItem Spoke(Center, Pos);
-            Spoke.SetColor(FLinearColor(0.24f, 0.78f, 1.0f, 0.55f));
-            Spoke.LineThickness = 1.6f;
-            Canvas.DrawItem(Spoke);
-
-            DrawFilledCircle(Canvas, Pos, HalfBtn + 2.5f, Accent);
+            DrawGlowSdf(Canvas, Pos, NodeR + 14.0f, AccentSoft);
         }
 
-        DrawFilledCircle(Canvas, Pos, HalfBtn, Item.bEnabled ? (bSel ? ActiveBg : Track) : SurfaceBg);
-        DrawCircleOutline(Canvas, Pos, HalfBtn, bSel ? Accent : BorderCol, bSel ? 1.8f : 1.1f);
+        // Smooth glass disc fill + anti-aliased ring border
+        const FLinearColor FillCol = !Item.bEnabled ? NodeDisabledBg : (bSel ? NodeActiveBg : NodeBg);
+        DrawCircleSdf(Canvas, Pos, NodeR, FillCol);
+        DrawRingSdf(Canvas, Pos, NodeR, (bSel && Item.bEnabled) ? Accent : BorderCol, bSel);
 
+        // Crisp TrueType tag label
         const FString Tag = Item.ShortTag.IsEmpty() ? Item.Label.Left(4) : Item.ShortTag;
-        DrawCenteredText(Canvas, Font, Pos, Tag, Item.bEnabled ? (bSel ? Accent : TextCol) : MutedCol);
+        DrawCenteredSlateText(Canvas, TagFont, Pos, Tag, !Item.bEnabled ? MutedCol : (bSel ? TextActiveCol : TextCol));
 
-        // Outward branch indicator dot
+        // Clean anti-aliased submenu indicator dot on outer edge
         if (!Item.Children.IsEmpty())
         {
-            const FVector2D DotPos(Pos.X + FMath::Cos(Angle) * (HalfBtn - 4.0f), Pos.Y + FMath::Sin(Angle) * (HalfBtn - 4.0f));
-            DrawFilledCircle(Canvas, DotPos, 2.6f, Item.bEnabled ? Accent : MutedCol);
+            const FVector2D DotPos = Pos + Dir * (NodeR - 5.5f);
+            DrawCircleSdf(Canvas, DotPos, 2.8f, Item.bEnabled ? Accent : MutedCol);
         }
     }
 
-    // 3. Center Dead-Zone Hub + Highlighted Label Pill
-    const float HubR = DeadZoneRadius * 0.72f;
-    DrawFilledCircle(Canvas, Center, HubR, Track);
-    DrawCircleOutline(Canvas, Center, HubR, BorderCol, 1.2f);
-    DrawFilledCircle(Canvas, Center, 2.5f, Highlighted.IsSet() ? Accent : MutedCol);
+    // 4. Center Dead-Zone Hub
+    DrawGlowSdf(Canvas, Center + FVector2D(0.0, 2.0), HubR + 8.0f, ShadowCol);
+    DrawCircleSdf(Canvas, Center, HubR, HubBg);
+    DrawRingSdf(Canvas, Center, HubR, Highlighted.IsSet() ? FLinearColor(0.26f, 0.84f, 1.0f, 0.72f) : BorderCol, false);
+    if (Highlighted.IsSet())
+    {
+        DrawGlowSdf(Canvas, Center, 7.5f, AccentSoft);
+    }
+    DrawCircleSdf(Canvas, Center, Highlighted.IsSet() ? 3.2f : 2.4f, Highlighted.IsSet() ? Accent : MutedCol);
 
+    // 5. Rounded Tooltip Pill positioned cleanly BELOW the entire pie (never overlapping buttons)
     const FString CenterLabel = (Highlighted.IsSet() && Items.IsValidIndex(Highlighted.GetValue()))
         ? Items[Highlighted.GetValue()].Label
-        : TEXT("Move to select");
-    const FVector2D LabelPos(Center.X, Center.Y + DeadZoneRadius + 14.0);
-    if (Font)
-    {
-        int32 W = 0, H = 0;
-        Font->GetStringHeightAndWidth(CenterLabel, H, W);
-        const FBox2D Pill(
-            FVector2D(LabelPos.X - W * 0.5 - 8.0, LabelPos.Y - H * 0.5 - 3.0),
-            FVector2D(LabelPos.X + W * 0.5 + 8.0, LabelPos.Y + H * 0.5 + 3.0));
-        DrawFilledRect(Canvas, Pill, FLinearColor(0.03f, 0.035f, 0.045f, 0.88f));
-        DrawRectOutline(Canvas, Pill, Highlighted.IsSet() ? Accent : BorderCol, 1.0f);
-        DrawCenteredText(Canvas, Font, LabelPos, CenterLabel, Highlighted.IsSet() ? TextCol : MutedCol);
-    }
+        : TEXT("Move cursor to select");
+    const FVector2D TextSz = MeasureSlateText(CenterLabel, LabelFont);
+    const double PillW = FMath::Max(TextSz.X + 28.0, 96.0);
+    const double PillH = FMath::Max(TextSz.Y + 12.0, 26.0);
+    const double BelowY = Center.Y + VisualRadius + HalfBtn + 22.0;
+    const double AboveY = Center.Y - VisualRadius - HalfBtn - 22.0;
+    const double PillY = (BelowY + PillH * 0.5 <= ViewLogicalSize.Y - 6.0)
+        ? BelowY
+        : FMath::Max(PillH * 0.5 + 6.0, AboveY);
+    const FVector2D PillCenter(
+        FMath::Clamp(Center.X, PillW * 0.5 + 8.0, FMath::Max(PillW * 0.5 + 8.0, ViewLogicalSize.X - PillW * 0.5 - 8.0)),
+        PillY);
 
-    // 4. List-Shaped Fly-Out Branches
+    DrawGlowSdf(Canvas, PillCenter + FVector2D(0.0, 3.0), static_cast<float>(PillW * 0.55), FLinearColor(0.0f, 0.0f, 0.0f, 0.35f));
+    DrawSpriteCentered(Canvas, Tex.PillFill.Get(), PillCenter, FVector2D(PillW, PillH), FLinearColor(0.06f, 0.075f, 0.10f, 0.94f));
+    DrawSpriteCentered(Canvas, Tex.PillBorder.Get(), PillCenter, FVector2D(PillW, PillH),
+        Highlighted.IsSet() ? FLinearColor(0.26f, 0.84f, 1.0f, 0.85f) : BorderCol);
+    DrawCenteredSlateText(Canvas, LabelFont, PillCenter, CenterLabel, Highlighted.IsSet() ? TextActiveCol : MutedCol);
+
+    // 6. Sleek Fly-Out Submenu Panels
     for (int32 Level = 0; Level < Branches.Num(); ++Level)
     {
         const FBranchLevel& Branch = Branches[Level];
@@ -611,10 +833,11 @@ void FNGonPieMenu::Draw(FCanvas& Canvas, const FVector2D& ViewLogicalSize) const
         if (!Children || Children->IsEmpty()) continue;
 
         const FBox2D B = Branch.Bounds;
-        // Drop shadow + surface + border
-        DrawFilledRect(Canvas, FBox2D(B.Min + FVector2D(-2.0, 2.0), B.Max + FVector2D(2.0, 4.0)), FLinearColor(0.0f, 0.0f, 0.0f, 0.35f));
-        DrawFilledRect(Canvas, B, SurfaceBg);
-        DrawRectOutline(Canvas, B, BorderCol, 1.2f);
+        // Soft multi-pass drop shadow + frosted panel + crisp border
+        DrawFilledRect(Canvas, FBox2D(B.Min + FVector2D(-4.0, 4.0), B.Max + FVector2D(4.0, 8.0)), FLinearColor(0.0f, 0.0f, 0.0f, 0.22f));
+        DrawFilledRect(Canvas, FBox2D(B.Min + FVector2D(-2.0, 2.0), B.Max + FVector2D(2.0, 4.0)), FLinearColor(0.0f, 0.0f, 0.0f, 0.32f));
+        DrawFilledRect(Canvas, B, PanelBg);
+        DrawRectOutline(Canvas, B, BorderCol, 1.0f);
 
         for (int32 Row = 0; Row < Branch.Visible; ++Row)
         {
@@ -623,35 +846,38 @@ void FNGonPieMenu::Draw(FCanvas& Canvas, const FVector2D& ViewLogicalSize) const
             const FNGonPieItem& Item = (*Children)[Idx];
 
             const double RowTop = B.Min.Y + static_cast<double>(Row) * BranchRowHeight;
-            const FBox2D RowRect(FVector2D(B.Min.X + 3.0, RowTop + 2.0), FVector2D(B.Max.X - 3.0, FMath::Min(B.Max.Y - 2.0, RowTop + BranchRowHeight - 2.0)));
+            const FBox2D RowRect(
+                FVector2D(B.Min.X + 3.0, RowTop + 2.0),
+                FVector2D(B.Max.X - 3.0, FMath::Min(B.Max.Y - 2.0, RowTop + BranchRowHeight - 2.0)));
             const bool bRowSel = (Idx == Branch.Selected);
 
             if (bRowSel)
             {
-                DrawFilledRect(Canvas, RowRect, ActiveBg);
+                DrawFilledRect(Canvas, RowRect, NodeActiveBg);
+                // Crisp left cyan accent bar
+                DrawFilledRect(Canvas, FBox2D(RowRect.Min, FVector2D(RowRect.Min.X + 2.5, RowRect.Max.Y)), Accent);
             }
 
-            if (Font)
-            {
-                int32 W = 0, H = 0;
-                Font->GetStringHeightAndWidth(Item.Label, H, W);
-                const FVector2D TextPt(B.Min.X + 10.0, RowTop + FMath::Max(0.0, (BranchRowHeight - H) * 0.5));
-                FCanvasTextItem TItem(TextPt, FText::FromString(Item.Label), Font,
-                    Item.bEnabled ? (bRowSel ? Accent : TextCol) : MutedCol);
-                TItem.EnableShadow(FLinearColor(0.0f, 0.0f, 0.0f, 0.85f));
-                Canvas.DrawItem(TItem);
-            }
+            const FSlateFontInfo& RowFont = bRowSel ? MenuBoldFont : MenuFont;
+            const FVector2D ItemSz = MeasureSlateText(Item.Label, RowFont);
+            const FVector2D TextPt(
+                FMath::RoundToDouble(B.Min.X + 12.0),
+                FMath::RoundToDouble(RowTop + FMath::Max(0.0, (BranchRowHeight - ItemSz.Y) * 0.5)));
+            FCanvasTextItem TItem(TextPt, FText::FromString(Item.Label), RowFont,
+                !Item.bEnabled ? MutedCol : (bRowSel ? TextActiveCol : TextCol));
+            TItem.EnableShadow(FLinearColor(0.0f, 0.0f, 0.0f, 0.72f), FVector2D(0.0f, 1.0f));
+            Canvas.DrawItem(TItem);
 
             // Sub-branch chevron
             if (!Item.Children.IsEmpty())
             {
-                const double Cx = B.Max.X - 10.0;
+                const double Cx = B.Max.X - 11.0;
                 const double Cy = RowTop + BranchRowHeight * 0.5;
-                const FLinearColor ChevCol = Item.bEnabled ? TextCol : MutedCol;
+                const FLinearColor ChevCol = !Item.bEnabled ? MutedCol : (bRowSel ? Accent : TextCol);
                 FCanvasLineItem L1(FVector2D(Cx - 2.5, Cy - 3.5), FVector2D(Cx + 1.5, Cy));
-                L1.SetColor(ChevCol); L1.LineThickness = 1.3f; Canvas.DrawItem(L1);
+                L1.SetColor(ChevCol); L1.LineThickness = 1.4f; Canvas.DrawItem(L1);
                 FCanvasLineItem L2(FVector2D(Cx + 1.5, Cy), FVector2D(Cx - 2.5, Cy + 3.5));
-                L2.SetColor(ChevCol); L2.LineThickness = 1.3f; Canvas.DrawItem(L2);
+                L2.SetColor(ChevCol); L2.LineThickness = 1.4f; Canvas.DrawItem(L2);
             }
         }
     }

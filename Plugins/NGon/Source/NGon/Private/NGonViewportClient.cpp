@@ -162,7 +162,7 @@ public:
             }
             if (bPressed)
             {
-                PieMenu.OnKeyDown(ViewSize, Key, EventArgs.IsRepeat());
+                PieMenu.OnKeyDown(ViewSize, Key, (EventArgs.Event == IE_Repeat));
                 PostInvalidation();
                 return true;
             }
@@ -172,7 +172,7 @@ public:
         if (Key == EKeys::RightMouseButton && InViewport && !IsAltPressed() && PointerAction == EPointerAction::None)
         {
             const FIntPoint Mouse(InViewport->GetMouseX(), InViewport->GetMouseY());
-            if (bPressed && !EventArgs.IsRepeat())
+            if (bPressed && !(EventArgs.Event == IE_Repeat))
             {
                 if (IsShiftPressed())
                 {
@@ -198,7 +198,7 @@ public:
             }
         }
 
-        if (bPressed && !EventArgs.IsRepeat() && InViewport && PointerAction == EPointerAction::None && !IsAltPressed() && !IsCtrlPressed())
+        if (bPressed && !(EventArgs.Event == IE_Repeat) && InViewport && PointerAction == EPointerAction::None && !IsAltPressed() && !IsCtrlPressed())
         {
             if (Key == EKeys::SpaceBar)
             {
@@ -218,7 +218,7 @@ public:
         // Maya-style 'B' hotkey: tap B to toggle Soft Selection; hold B + LMB drag left/right to adjust radius
         if (Key == EKeys::B && !IsCtrlPressed() && !IsAltPressed())
         {
-            if (bPressed && !EventArgs.IsRepeat())
+            if (bPressed && !(EventArgs.Event == IE_Repeat))
             {
                 bBKeyHeld = true;
                 bBKeyDragged = false;
@@ -871,7 +871,10 @@ private:
         PreviewOwner->SetSoftSelection(Settings);
         if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
         {
-            Pinned->SetHeatmapVisible(Settings.bEnabled && PreviewOwner->HasSoftSelectionInfluence());
+            if (!Settings.bEnabled)
+            {
+                Pinned->SetHeatmapVisible(false);
+            }
         }
         PostInvalidation();
     }
@@ -914,10 +917,7 @@ private:
             }
         }
 
-        if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-        {
-            Pinned->SetHeatmapVisible(PreviewOwner->HasSoftSelectionInfluence());
-        }
+
         PostInvalidation();
     }
 
@@ -932,10 +932,7 @@ private:
         Settings.bEnabled = true;
         Settings.Radius = NewRadius;
         PreviewOwner->SetSoftSelection(Settings);
-        if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
-        {
-            Pinned->SetHeatmapVisible(PreviewOwner->HasSoftSelectionInfluence());
-        }
+
         PostInvalidation();
     }
 

@@ -16,6 +16,7 @@
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
+#include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionTextureCoordinate.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
@@ -64,27 +65,23 @@ UMaterial* MakeStudioMaterial(bool bUseVertexColor)
     Material->SetShadingModel(MSM_DefaultLit);
     Material->TwoSided = true;
 
+    if (bUseVertexColor)
+    {
+        auto* VertColorExpr = CastChecked<UMaterialExpressionVertexColor>(UMaterialEditingLibrary::CreateMaterialExpression(
+            Material, UMaterialExpressionVertexColor::StaticClass(), -320, 0));
+        Material->GetEditorOnlyData()->BaseColor.Connect(0, VertColorExpr);
+        Material->GetEditorOnlyData()->EmissiveColor.Connect(0, VertColorExpr);
+        Material->PostEditChange();
+        return Material;
+    }
+
     auto* Shade = CastChecked<UMaterialExpressionCustom>(UMaterialEditingLibrary::CreateMaterialExpression(
         Material, UMaterialExpressionCustom::StaticClass(), -320, 0));
     Shade->OutputType = CMOT_Float3;
     Shade->Inputs.Reset();
 
-    if (bUseVertexColor)
+    if (false)
     {
-        Shade->Code = TEXT(
-            "float3 N = normalize(Parameters.WorldNormal);\n"
-            "float3 V = normalize(Parameters.CameraVector);\n"
-            "float3 R = normalize(cross(V, float3(0.0, 0.0, 1.0)) + float3(1e-5, 0.0, 0.0));\n"
-            "float3 U = normalize(cross(R, V));\n"
-            "float3 Lkey = normalize(V * 0.45 + R * 0.42 + U * 0.62);\n"
-            "float3 Lfill = normalize(V * 0.35 - R * 0.60 - U * 0.25);\n"
-            "float ndotlKey = saturate(dot(N, Lkey));\n"
-            "float ndotlFill = saturate(dot(N, Lfill));\n"
-            "float ndotv = abs(dot(N, V));\n"
-            "float hemi = saturate(N.z * 0.5 + 0.5);\n"
-            "float3 vc = Parameters.VertexColor.rgb;\n"
-            "float lighting = 0.32 + 0.44 * ndotlKey + 0.18 * ndotlFill + 0.12 * hemi + 0.16 * ndotv;\n"
-            "return vc * lighting;");
     }
     else
     {
@@ -865,11 +862,12 @@ void FNGonPreviewScene::DrawSoftSelection()
         const FLinearColor Color = FLinearColor::LerpUsingHSV(
             FLinearColor(0.04f, 0.35f, 1.0f), FLinearColor(1.0f, 0.12f, 0.02f), Weight);
         const float DepthScale = Accel.GetVertexCameraDepthScale(Positions[Influence.Vertex]);
+        const float SoftSize = NGonVertexNearSize * DepthScale;
         SoftInfluencePoints->AddPoint(
-            Accel.GetDisplacedVertexPosition(Positions, Influence.Vertex, 1.35f),
+            Accel.GetDisplacedVertexPosition(Positions, Influence.Vertex, 1.0f),
             Color.ToFColor(true),
-            (5.5f + 8.0f * Weight) * DepthScale,
-            5.0f * DepthScale);
+            SoftSize,
+            1.85f);
         ++AddedCount;
     }
     Accel.CachedSoftPointCount = AddedCount;
