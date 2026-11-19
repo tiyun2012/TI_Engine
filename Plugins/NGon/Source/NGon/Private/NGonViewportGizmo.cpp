@@ -962,7 +962,8 @@ bool FNGonViewportGizmo::BeginDrag(const FVector2D& Pixel)
         else
         {
             const FVector2D Radial = (Pixel - OriginPx).GetSafeNormal();
-            DragRotationTangent = FVector2D(-Radial.Y, Radial.X);
+            // Positive rotation around ViewForward (into screen) moves CamRight toward +CamUp (screen-CCW, since pixel +Y is down)
+            DragRotationTangent = FVector2D(Radial.Y, -Radial.X);
             if (DragRotationTangent.IsNearlyZero())
             {
                 DragRotationTangent = FVector2D(1.0, 0.0);

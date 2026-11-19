@@ -15,6 +15,7 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
+#include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionTextureCoordinate.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
@@ -33,11 +34,20 @@ using NGon::GetSceneAccel;
 namespace
 {
 const FColor EdgeColor(80, 224, 246);
-const FColor PointColor(230, 249, 255);
+const FColor PointColor(178, 92, 255);            // Default purple vertex color
 const FColor SelectionColor(255, 181, 65);
+const FColor SelectedVertexColor(255, 232, 48);   // Bright yellow selected vertex color
+
+constexpr float NGonEdgeThickness = 1.6f;
+// 5/4 relative to rendered edge width at near camera, shrinking smoothly to 2/3 when far/zoomed out
+constexpr float NGonVertexNearSize = NGonEdgeThickness * (5.0f / 4.0f) * 2.0f;       // 4.0 px near -> 2.67 px far
+constexpr float NGonSelectedVertexNearSize = NGonVertexNearSize * (5.0f / 4.0f);     // 5.0 px near -> 3.33 px far
+constexpr float NGonVertexDepthBias = 1.4f;
+constexpr float NGonSelectedVertexDepthBias = 2.2f;
 const FName PaintTextureParameter(TEXT("PaintTexture"));
 
 const FLinearColor StudioColor(0.46f, 0.49f, 0.53f);
+TMap<const FNGonPreviewScene*, TStrongObjectPtr<UMaterialInstanceDynamic>> GFaceHighlightMaterialMap;
 
 FLinearColor HeatColor(float Alpha)
 {
@@ -46,39 +56,6 @@ FLinearColor HeatColor(float Alpha)
     const FLinearColor Hot(0.98f, 0.08f, 0.018f);
     const float T = FMath::Clamp(Alpha, 0.0f, 1.0f) * 2.0f;
     return T < 1.0f ? FMath::Lerp(Cold, Mid, T) : FMath::Lerp(Mid, Hot, T - 1.0f);
-}
-
-UMaterial* MakeFaceHighlightMaterial()
-{
-    UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
-    Material->SetShadingModel(MSM_DefaultLit);
-    Material->TwoSided = true;
-
-    auto* Shade = CastChecked<UMaterialExpressionCustom>(UMaterialEditingLibrary::CreateMaterialExpression(
-        Material, UMaterialExpressionCustom::StaticClass(), -320, 0));
-    Shade->OutputType = CMOT_Float3;
-    Shade->Inputs.Reset();
-    Shade->Code = TEXT(
-        "float3 N = normalize(Parameters.WorldNormal);\n"
-        "float3 V = normalize(Parameters.CameraVector);\n"
-        "float3 R = normalize(cross(V, float3(0.0, 0.0, 1.0)) + float3(1e-5, 0.0, 0.0));\n"
-        "float3 U = normalize(cross(R, V));\n"
-        "float3 Lkey = normalize(V * 0.45 + R * 0.42 + U * 0.62);\n"
-        "float3 Lfill = normalize(V * 0.35 - R * 0.60 - U * 0.25);\n"
-        "float ndotlKey = saturate(dot(N, Lkey));\n"
-        "float ndotlFill = saturate(dot(N, Lfill));\n"
-        "float ndotv = abs(dot(N, V));\n"
-        "float hemi = saturate(N.z * 0.5 + 0.5);\n"
-        "float3 H = normalize(Lkey + V);\n"
-        "float spec = pow(saturate(dot(N, H)), 28.0) * 0.18;\n"
-        "float3 baseAlbedo = float3(0.76, 0.60, 0.36);\n"
-        "float lighting = 0.30 + 0.46 * ndotlKey + 0.20 * ndotlFill + 0.14 * hemi + 0.18 * ndotv;\n"
-        "return baseAlbedo * lighting + float3(spec, spec, spec);");
-
-    Material->GetEditorOnlyData()->BaseColor.Connect(0, Shade);
-    Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Shade);
-    Material->PostEditChange();
-    return Material;
 }
 
 UMaterial* MakeStudioMaterial(bool bUseVertexColor)
@@ -91,8 +68,10 @@ UMaterial* MakeStudioMaterial(bool bUseVertexColor)
         Material, UMaterialExpressionCustom::StaticClass(), -320, 0));
     Shade->OutputType = CMOT_Float3;
     Shade->Inputs.Reset();
-    Shade->Code = bUseVertexColor
-        ? TEXT(
+
+    if (bUseVertexColor)
+    {
+        Shade->Code = TEXT(
             "float3 N = normalize(Parameters.WorldNormal);\n"
             "float3 V = normalize(Parameters.CameraVector);\n"
             "float3 R = normalize(cross(V, float3(0.0, 0.0, 1.0)) + float3(1e-5, 0.0, 0.0));\n"
@@ -105,8 +84,19 @@ UMaterial* MakeStudioMaterial(bool bUseVertexColor)
             "float hemi = saturate(N.z * 0.5 + 0.5);\n"
             "float3 vc = Parameters.VertexColor.rgb;\n"
             "float lighting = 0.32 + 0.44 * ndotlKey + 0.18 * ndotlFill + 0.12 * hemi + 0.16 * ndotv;\n"
-            "return vc * lighting;")
-        : TEXT(
+            "return vc * lighting;");
+    }
+    else
+    {
+        auto* AlbedoParam = CastChecked<UMaterialExpressionVectorParameter>(UMaterialEditingLibrary::CreateMaterialExpression(
+            Material, UMaterialExpressionVectorParameter::StaticClass(), -540, 0));
+        AlbedoParam->ParameterName = TEXT("BaseAlbedo");
+        AlbedoParam->DefaultValue = FLinearColor(0.54f, 0.57f, 0.61f, 1.0f);
+
+        Shade->Inputs.SetNum(1);
+        Shade->Inputs[0].InputName = TEXT("BaseAlbedo");
+        Shade->Inputs[0].Input.Connect(0, AlbedoParam);
+        Shade->Code = TEXT(
             "float3 N = normalize(Parameters.WorldNormal);\n"
             "float3 V = normalize(Parameters.CameraVector);\n"
             "float3 R = normalize(cross(V, float3(0.0, 0.0, 1.0)) + float3(1e-5, 0.0, 0.0));\n"
@@ -119,9 +109,9 @@ UMaterial* MakeStudioMaterial(bool bUseVertexColor)
             "float hemi = saturate(N.z * 0.5 + 0.5);\n"
             "float3 H = normalize(Lkey + V);\n"
             "float spec = pow(saturate(dot(N, H)), 28.0) * 0.20;\n"
-            "float3 baseAlbedo = float3(0.54, 0.57, 0.61);\n"
             "float lighting = 0.28 + 0.48 * ndotlKey + 0.20 * ndotlFill + 0.14 * hemi + 0.18 * ndotv;\n"
-            "return baseAlbedo * lighting + float3(spec, spec, spec);");
+            "return BaseAlbedo * lighting + float3(spec, spec, spec);");
+    }
 
     Material->GetEditorOnlyData()->BaseColor.Connect(0, Shade);
     Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Shade);
@@ -263,6 +253,7 @@ FNGonPreviewScene::FNGonPreviewScene()
 
 FNGonPreviewScene::~FNGonPreviewScene()
 {
+    GFaceHighlightMaterialMap.Remove(this);
     FNGonMeshAPI::ClearHistory(this);
     NGon::RemoveSceneAccel(this);
     Picker.SetMesh(nullptr);
@@ -422,9 +413,18 @@ void FNGonPreviewScene::SetPreviewMaterials(UInteractiveToolManager* ToolManager
     {
         return;
     }
-    if (UMaterialInterface* Highlight = MakeFaceHighlightMaterial())
+    TStrongObjectPtr<UMaterialInstanceDynamic>& HighlightRef = GFaceHighlightMaterialMap.FindOrAdd(this);
+    if (!HighlightRef.IsValid() && StudioMaterial.IsValid())
     {
-        Surface->SetSecondaryRenderMaterial(Highlight);
+        if (UMaterialInstanceDynamic* HighlightMID = UMaterialInstanceDynamic::Create(StudioMaterial.Get(), GetTransientPackage()))
+        {
+            HighlightMID->SetVectorParameterValue(TEXT("BaseAlbedo"), FLinearColor(0.84f, 0.58f, 0.24f, 1.0f));
+            HighlightRef.Reset(HighlightMID);
+        }
+    }
+    if (HighlightRef.IsValid())
+    {
+        Surface->SetSecondaryRenderMaterial(HighlightRef.Get());
         Surface->EnableSecondaryTriangleBuffers([this](const FDynamicMesh3* Mesh, int32 TriangleId)
         {
             return SelectedElement == ENGonElement::Face && SelectedIds.Contains(Mesh->GetTriangleGroup(TriangleId));
@@ -497,6 +497,8 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data, TArray<UMaterialInterface*
 
     InitializeColorOverlay(Data.Mesh);
     FNGonSceneAccel& Accel = GetSceneAccel(this);
+    Accel.bHasCameraView = false;
+    Accel.LastVertexSizeUpdateFrame = 0;
     Accel.BuildTopologyTables(Topology, Data.Mesh);
     Accel.BuildColorTables(Positions.Num(), ColorElements.Num(), [this](int32 ElemIdx)
     {
@@ -699,12 +701,12 @@ void FNGonPreviewScene::RebuildOverlays()
         Ends.Add(Accel.GetDisplacedVertexPosition(Positions, Edge.Y, 0.25f));
     }
 
-    EdgeLines->AddLines(Starts, Ends, EdgeColor, 1.6f, 0.8f);
+    EdgeLines->AddLines(Starts, Ends, EdgeColor, NGonEdgeThickness, 0.35f);
     const int32 NumVerts = Accel.DisplacedVertexPositions.Num();
     for (int32 v = 0; v < NumVerts; ++v)
     {
         const float Scale = Accel.GetVertexCameraDepthScale(Positions[v]);
-        VertexPoints->AddPoint(Accel.DisplacedVertexPositions[v], PointColor, 5.4f * Scale, 3.5f * Scale);
+        VertexPoints->AddPoint(Accel.DisplacedVertexPositions[v], PointColor, NGonVertexNearSize * Scale, NGonVertexDepthBias);
     }
     Accel.bEdgesOverlayDirty = false;
     Accel.bVerticesOverlayDirty = false;
@@ -755,16 +757,15 @@ void FNGonPreviewScene::UpdateCameraVertexScales(const FVector& CameraOrigin, co
     Accel.NearCameraDist = MinDist;
     Accel.FarCameraDist = MaxDist;
 
-    // Also scale down toward 0.65x when the camera zooms far out from the mesh center
-    // so combined with DepthScale (1.0 -> 0.5), far vertices shrink cleanly to 1/2 size (2.7 px)
+    // Scale smoothly from 1.0x (close) down to 2/3 (zoomed out / far from mesh)
     const float CamCenterDist = static_cast<float>(FVector::Distance(Bounds.GetCenter(), CameraOrigin));
     Accel.CameraZoomScale = FMath::GetMappedRangeValueClamped(
-        FVector2f(static_cast<float>(MeshRadius * 0.9), static_cast<float>(MeshRadius * 3.8)),
-        FVector2f(1.0f, 0.72f),
+        FVector2f(static_cast<float>(MeshRadius * 1.0), static_cast<float>(MeshRadius * 4.2)),
+        FVector2f(1.0f, 2.0f / 3.0f),
         CamCenterDist);
 
     // Rebuild VertexPoints sizes when visible (throttled on very high-poly meshes during rapid camera motion)
-    if (Accel.bShowVertices && VertexPoints && (NumVerts <= 15000 || (GFrameCounter - Accel.LastVertexSizeUpdateFrame) >= 6))
+    if (Accel.bShowVertices && VertexPoints && (NumVerts <= 15000 || Accel.LastVertexSizeUpdateFrame == 0 || (GFrameCounter - Accel.LastVertexSizeUpdateFrame) >= 6))
     {
         Accel.LastVertexSizeUpdateFrame = GFrameCounter;
         if (Accel.DisplacedVertexPositions.Num() != NumVerts)
@@ -775,7 +776,7 @@ void FNGonPreviewScene::UpdateCameraVertexScales(const FVector& CameraOrigin, co
         for (int32 v = 0; v < NumVerts; ++v)
         {
             const float Scale = Accel.GetVertexCameraDepthScale(Positions[v]);
-            VertexPoints->AddPoint(Accel.DisplacedVertexPositions[v], PointColor, 5.4f * Scale, 3.5f * Scale);
+            VertexPoints->AddPoint(Accel.DisplacedVertexPositions[v], PointColor, NGonVertexNearSize * Scale, NGonVertexDepthBias);
         }
     }
 
@@ -898,7 +899,7 @@ void FNGonPreviewScene::SetShowVertices(bool bShow)
 {
     FNGonSceneAccel& Accel = GetSceneAccel(this);
     Accel.bShowVertices = bShow;
-    if (bShow && Accel.bVerticesOverlayDirty)
+    if (bShow && VertexPoints && Accel.bVerticesOverlayDirty)
     {
         if (Accel.DisplacedVertexPositions.Num() != Positions.Num())
         {
@@ -910,7 +911,10 @@ void FNGonPreviewScene::SetShowVertices(bool bShow)
         }
         Accel.bVerticesOverlayDirty = false;
     }
-    VertexPoints->SetVisibility(bShow);
+    if (VertexPoints)
+    {
+        VertexPoints->SetVisibility(bShow);
+    }
 }
 
 void FNGonPreviewScene::SetHeatmapVisible(bool bShow)
@@ -2038,72 +2042,22 @@ void FNGonPreviewScene::DrawSelection()
     }
     else if (SelectedElement == ENGonElement::Vertex && !SelectedIds.IsEmpty())
     {
-        // Fast in-place update if count matches, or rebuild normal-displaced points + tangent-plane normal markers
-        if (Accel.CachedSelectedVertexCount == SelectedIds.Num() && Accel.CachedSelectedVertexCount > 0)
+        SelectedVertex->Clear();
+        int32 AddedSel = 0;
+        for (const int32 Id : SelectedIds)
         {
-            int32 PtIdx = 0;
-            for (const int32 Id : SelectedIds)
+            if (Positions.IsValidIndex(Id))
             {
-                if (Positions.IsValidIndex(Id))
-                {
-                    SelectedVertex->SetPointPosition(PtIdx++, Accel.GetDisplacedVertexPosition(Positions, Id, 1.65f));
-                }
+                const float DepthScale = Accel.GetVertexCameraDepthScale(Positions[Id]);
+                SelectedVertex->AddPoint(
+                    Accel.GetDisplacedVertexPosition(Positions, Id, 1.35f),
+                    SelectedVertexColor,
+                    NGonSelectedVertexNearSize * DepthScale,
+                    NGonSelectedVertexDepthBias);
+                ++AddedSel;
             }
         }
-        else
-        {
-            SelectedVertex->Clear();
-            int32 AddedSel = 0;
-            for (const int32 Id : SelectedIds)
-            {
-                if (Positions.IsValidIndex(Id))
-                {
-                    const float DepthScale = Accel.GetVertexCameraDepthScale(Positions[Id]);
-                    SelectedVertex->AddPoint(
-                        Accel.GetDisplacedVertexPosition(Positions, Id, 1.65f),
-                        SelectionColor,
-                        9.5f * DepthScale,
-                        7.5f * DepthScale);
-                    ++AddedSel;
-                }
-            }
-            Accel.CachedSelectedVertexCount = AddedSel;
-        }
-
-        // Also draw surface-tangent diamonds oriented by the mesh-space vertex normal so selected vertices
-        // remain 100% visible even at steep grazing camera angles without clipping into adjacent triangles.
-        if (SelectedIds.Num() <= 256)
-        {
-            const double MarkerRadius = FMath::Max(static_cast<double>(Accel.VertexNormalOffset) * 1.45, 0.12);
-            TArray<FVector> Starts;
-            TArray<FVector> Ends;
-            Starts.Reserve(SelectedIds.Num() * 4);
-            Ends.Reserve(SelectedIds.Num() * 4);
-            for (const int32 Id : SelectedIds)
-            {
-                if (!Positions.IsValidIndex(Id)) continue;
-                const FVector N = Accel.GetVertexNormal(Id);
-                FVector TangentU = Accel.GetVertexTangent(Id);
-                TangentU = (TangentU - N * FVector::DotProduct(TangentU, N)).GetSafeNormal();
-                if (TangentU.IsNearlyZero())
-                {
-                    FVector FallbackV;
-                    N.FindBestAxisVectors(TangentU, FallbackV);
-                }
-                const FVector TangentV = FVector::CrossProduct(N, TangentU).GetSafeNormal();
-                const double ScaledRad = MarkerRadius * static_cast<double>(Accel.GetVertexCameraDepthScale(Positions[Id]));
-                const FVector Center = Accel.GetDisplacedVertexPosition(Positions, Id, 1.45f);
-                const FVector C0 = Center + TangentU * ScaledRad;
-                const FVector C1 = Center + TangentV * ScaledRad;
-                const FVector C2 = Center - TangentU * ScaledRad;
-                const FVector C3 = Center - TangentV * ScaledRad;
-                Starts.Add(C0); Ends.Add(C1);
-                Starts.Add(C1); Ends.Add(C2);
-                Starts.Add(C2); Ends.Add(C3);
-                Starts.Add(C3); Ends.Add(C0);
-            }
-            SelectedEdge->AddLines(Starts, Ends, SelectionColor, 2.2f, 4.5f);
-        }
+        Accel.CachedSelectedVertexCount = AddedSel;
     }
     else
     {

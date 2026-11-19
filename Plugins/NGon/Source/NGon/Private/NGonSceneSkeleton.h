@@ -125,7 +125,7 @@ struct FNGonSceneAccel
     TArray<FVector3f> LogicalVertexNormals;
     TArray<FVector3f> LogicalVertexTangents;
     TArray<FVector> DisplacedVertexPositions;
-    float VertexNormalOffset = 0.25f;
+    float VertexNormalOffset = 0.0f;
     int32 CachedSelectedVertexCount = 0;
 
     // Camera-distance vertex size scaling (1.0x at near camera point -> 0.5x (1/2) at far camera point)
@@ -444,7 +444,7 @@ struct FNGonSceneAccel
         }
         const float AvgEdge = SampledEdges > 0 ? static_cast<float>(EdgeSum / SampledEdges) : 1.0f;
         const float BoundsMax = Topology.RestBounds.IsValid ? static_cast<float>(Topology.RestBounds.GetSize().GetMax()) : 100.0f;
-        VertexNormalOffset = FMath::Clamp(FMath::Min(BoundsMax * 0.0038f, AvgEdge * 0.22f), 0.04f, 2.0f);
+        VertexNormalOffset = 0.0f; // Keep overlays flush on mesh; rely on shader DepthBias for Z-ordering
 
         // Precompute initial mesh-space vertex tangents from incident polygon perimeters
         LogicalVertexTangents.Init(FVector3f(1.0f, 0.0f, 0.0f), LogicalCount);
@@ -596,7 +596,7 @@ struct FNGonSceneAccel
         return Positions[LogicalId] + GetVertexNormal(LogicalId) * (VertexNormalOffset * Scale);
     }
 
-    // Returns 1.0f when the vertex is at the near point to the camera and 0.5f (1/2) at the far point of the camera
+    // Returns 1.0f at the near point to the camera and scales smoothly down to 2/3 (0.6667f) at the far point or when zoomed out
     FORCEINLINE float GetVertexCameraDepthScale(const FVector& VertexPos) const
     {
         if (!bHasCameraView)
@@ -606,10 +606,9 @@ struct FNGonSceneAccel
         const float Dist = static_cast<float>(FVector::Distance(VertexPos, LastCameraOrigin));
         const float Span = FMath::Max(FarCameraDist - NearCameraDist, 1.0f);
         const float DepthT = FMath::Clamp((Dist - NearCameraDist) / Span, 0.0f, 1.0f);
-        // Smoothly scale from 1.0x at the near point down to 0.5x (1/2) at the far point,
-        // combined with CameraZoomScale (which also scales down to 0.5x when zooming far out)
-        const float DepthScale = FMath::Lerp(1.0f, 0.5f, DepthT);
-        return FMath::Clamp(DepthScale * CameraZoomScale, 0.45f, 1.0f);
+        constexpr float FarMinScale = 2.0f / 3.0f;
+        const float DepthScale = FMath::Lerp(1.0f, FarMinScale, DepthT);
+        return FMath::Clamp(DepthScale * CameraZoomScale, FarMinScale, 1.0f);
     }
 
     void BuildColorTables(int32 LogicalCount, int32 NumColorElements, TFunctionRef<int32(int32)> GetLogicalVertex)

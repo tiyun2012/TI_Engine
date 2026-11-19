@@ -308,7 +308,8 @@ void SNGonPreview::LoadStaticMesh(const FAssetData& Asset)
     RebuildMorphTargetList();
 
     bShowEdges = !bTriangleOnly;
-    bShowVertices = false;
+    SelectionMode = Viewport.IsValid() ? Viewport->GetSelectionMode() : SelectionMode;
+    bShowVertices = (SelectionMode == ENGonElement::Vertex);
     TArray<UMaterialInterface*> Materials = BindPreviewMaterials(*Source, StaticMesh->GetStaticMaterials(), Data);
     ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("StaticMeshType", "Static Mesh"),
         ENGonViewportShading::Smooth, MoveTemp(Materials));
@@ -571,7 +572,8 @@ void SNGonPreview::LoadSkeletalMesh(const FAssetData& Asset)
 
     // Match native UE5 Skeletal Mesh Editor: smooth lit surface with mesh edges hidden by default (toggleable via Alt+9)
     bShowEdges = false;
-    bShowVertices = false;
+    SelectionMode = Viewport.IsValid() ? Viewport->GetSelectionMode() : SelectionMode;
+    bShowVertices = (SelectionMode == ENGonElement::Vertex);
     SkelUIState.BoneDrawMode = 2; // Selected Bone Only (matching image_3b0306.jpg)
 
     // Use clean 3-point studio clay material for SkeletalMesh preview on UDynamicMeshComponent
@@ -611,8 +613,9 @@ bool SNGonPreview::TryLoadDefault(FText& Error)
 bool SNGonPreview::TryLoadFbx(const FString& Filename, FText& Error)
 {
     FNGonMeshData Data;
+    NGon::FNGonFbxSkeletonData FbxSkeleton;
     const FText Name = FText::FromString(FPaths::GetCleanFilename(Filename));
-    if (!NGon::LoadFbx(Filename, Data, Error))
+    if (!NGon::LoadFbxWithSkeleton(Filename, Data, FbxSkeleton, Error))
     {
         Error = FText::Format(LOCTEXT("LoadFbxFailed", "Could not load {0}. {1}"), Name, Error);
         return false;
@@ -624,12 +627,81 @@ bool SNGonPreview::TryLoadFbx(const FString& Filename, FText& Error)
     SkeletonBones.Reset();
     MorphTargets.Reset();
     SelectedBoneIndex = INDEX_NONE;
+
+    FNGonSkeletonTreeUIState& SkelUIState = GetSkeletonTreeUIState(this);
+    SkelUIState.CollapsedBones.Reset();
+    SkelUIState.Sockets.Reset();
+    SkelUIState.SelectedSocketIndex = INDEX_NONE;
+
+    if (!FbxSkeleton.Bones.IsEmpty())
+    {
+        SkeletonBones.Reserve(FbxSkeleton.Bones.Num());
+        for (const NGon::FNGonSceneBoneInit& InitBone : FbxSkeleton.Bones)
+        {
+            FNGonBoneEntry Entry;
+            Entry.BoneIndex = InitBone.BoneIndex;
+            Entry.ParentIndex = InitBone.ParentIndex;
+            Entry.Name = InitBone.Name;
+            Entry.LocalTransform = InitBone.RefLocalTransform;
+            Entry.ComponentTransform = InitBone.RefComponentTransform;
+            if (Entry.ParentIndex >= 0 && SkeletonBones.IsValidIndex(Entry.ParentIndex))
+            {
+                Entry.Depth = SkeletonBones[Entry.ParentIndex].Depth + 1;
+                ++SkeletonBones[Entry.ParentIndex].ChildCount;
+            }
+            else
+            {
+                Entry.Depth = 0;
+            }
+            SkeletonBones.Add(Entry);
+        }
+        SelectedBoneIndex = 0;
+        for (const FNGonBoneEntry& Entry : SkeletonBones)
+        {
+            const FString LowerName = Entry.Name.ToString().ToLower();
+            if (LowerName == TEXT("spine_01") || LowerName == TEXT("pelvis") || LowerName == TEXT("hips"))
+            {
+                SelectedBoneIndex = Entry.BoneIndex;
+                break;
+            }
+        }
+        SkelUIState.BoneDrawMode = 0; // All Hierarchy visible by default for rigged FBX
+        ActiveUpperTab = ENGonRightUpperTab::SkeletonTree;
+    }
+
+    for (const NGon::FNGonFbxMorphInfo& MorphInfo : FbxSkeleton.MorphTargets)
+    {
+        FNGonMorphEntry MorphEntry;
+        MorphEntry.Name = MorphInfo.Name;
+        MorphEntry.VertexDeltaCount = MorphInfo.VertexDeltaCount;
+        MorphTargets.Add(MorphEntry);
+    }
+
     RebuildSkeletonTreeList();
     RebuildMorphTargetList();
 
     bShowEdges = !bTriangleOnly;
-    bShowVertices = false;
-    ShowMesh(MoveTemp(Data), Name, LOCTEXT("FbxType", "FBX Polygon Mesh"));
+    SelectionMode = Viewport.IsValid() ? Viewport->GetSelectionMode() : SelectionMode;
+    bShowVertices = (SelectionMode == ENGonElement::Vertex);
+    const FText TypeLabel = FbxSkeleton.Bones.IsEmpty()
+        ? LOCTEXT("FbxType", "FBX Polygon Mesh")
+        : LOCTEXT("FbxSkelType", "FBX Skeletal Polygon Mesh");
+    ShowMesh(MoveTemp(Data), Name, TypeLabel);
+
+    if (!FbxSkeleton.Bones.IsEmpty())
+    {
+        NGon::SetSceneSkeleton(&Viewport->Preview(), FbxSkeleton.Bones, FbxSkeleton.VertexSkinWeights);
+        if (SkeletonBones.IsValidIndex(SelectedBoneIndex))
+        {
+            NGon::SelectSceneBone(&Viewport->Preview(), SelectedBoneIndex, false);
+        }
+    }
+    else
+    {
+        NGon::ClearSceneSkeleton(&Viewport->Preview());
+    }
+    Viewport->Invalidate();
+
     if (bTriangleOnly)
     {
         ShowError(LOCTEXT("FbxIsTriangulated", "This FBX contains triangulated faces only. Export it with Triangulate disabled to preview authored polygons."));
@@ -697,6 +769,14 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const
     {
         Painter->ResetForMesh(PaintTriangles);
     }
+    if (Viewport.IsValid())
+    {
+        SelectionMode = Viewport->GetSelectionMode();
+    }
+    if (SelectionMode == ENGonElement::Vertex)
+    {
+        bShowVertices = true;
+    }
     Viewport->Preview().SetShowEdges(bShowEdges);
     Viewport->Preview().SetShowVertices(bShowVertices);
     ApplySoftSelectionSettings();
@@ -710,6 +790,10 @@ void SNGonPreview::ShowError(const FText& Error)
 void SNGonPreview::SetSelectionMode(ENGonElement Element)
 {
     SelectionMode = Element;
+    if (Element == ENGonElement::Vertex)
+    {
+        bShowVertices = true;
+    }
     Viewport->SetSelectionMode(Element);
 }
 

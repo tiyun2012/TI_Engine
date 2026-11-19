@@ -1,3 +1,4 @@
+#include "NGonUVAPI.h"
 #include "NGonUVEditor.h"
 #include "NGonTopology.h"
 #include "Misc/AutomationTest.h"
@@ -41,6 +42,24 @@ bool FNGonUVDocumentTest::RunTest(const FString&)
     TestTrue(TEXT("Island selection selects overlay elements"), Document.GetSelectedElements().Num() > 0);
     Document.NormalizeSelected();
     TestTrue(TEXT("Normalize keeps bounds valid"), Document.GetBounds().Min.X <= Document.GetBounds().Max.X);
+
+    // NGonUVAPI: JSON batch pack + relax + undo/redo + schema
+    const FString BatchJson = TEXT(
+        "[\n"
+        "  {\"op\": \"select_all\"},\n"
+        "  {\"op\": \"relax\", \"iterations\": 2, \"strength\": 0.4, \"pin_border\": true},\n"
+        "  {\"op\": \"pack_islands\", \"padding\": 0.02, \"rotate_to_fit\": true},\n"
+        "  {\"op\": \"inspect\", \"include_islands\": true}\n"
+        "]");
+    const FNGonUVOpResult BatchRes = FNGonUVAPI::ExecuteJsonCommand(Document, BatchJson);
+    TestTrue(TEXT("UV API JSON batch succeeds"), BatchRes.bOk);
+    TestTrue(TEXT("Packed UVs fit within [0,1] bounds"),
+        Document.GetBounds().Min.X >= -0.01 && Document.GetBounds().Max.X <= 1.01
+        && Document.GetBounds().Min.Y >= -0.01 && Document.GetBounds().Max.Y <= 1.01);
+    TestTrue(TEXT("UV API Undo/Redo works"),
+        FNGonUVAPI::CanUndo(&Document) && FNGonUVAPI::Undo(Document).bOk && FNGonUVAPI::Redo(Document).bOk);
+    TestTrue(TEXT("UV API schema lists pack_islands"), FNGonUVAPI::GetApiSchemaJson().Contains(TEXT("pack_islands")));
+
     return true;
 }
 // NGon Unified ABI Sync v5.8.2

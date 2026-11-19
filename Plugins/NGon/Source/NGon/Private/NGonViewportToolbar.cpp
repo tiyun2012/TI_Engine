@@ -653,10 +653,11 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                 MakeIconToolButton(
                     ENGonTreeIconKind::OverlayVerts,
                     LOCTEXT("OverlayVertsBtnTip", "Toggle Logical Vertices Point Overlay"),
-                    [this]() { return bShowVertices; },
+                    [this]() { return Viewport.IsValid() ? NGon::GetSceneAccel(&Viewport->Preview()).bShowVertices : bShowVertices; },
                     [this]()
                     {
-                        bShowVertices = !bShowVertices;
+                        const bool bCurrent = Viewport.IsValid() ? NGon::GetSceneAccel(&Viewport->Preview()).bShowVertices : bShowVertices;
+                        bShowVertices = !bCurrent;
                         Viewport->Preview().SetShowVertices(bShowVertices);
                         Viewport->Invalidate();
                     })
@@ -1150,12 +1151,13 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                         FUIAction(
                             FExecuteAction::CreateLambda([this]()
                             {
-                                bShowVertices = !bShowVertices;
+                                const bool bCurrent = Viewport.IsValid() ? NGon::GetSceneAccel(&Viewport->Preview()).bShowVertices : bShowVertices;
+                                bShowVertices = !bCurrent;
                                 Viewport->Preview().SetShowVertices(bShowVertices);
                                 Viewport->Invalidate();
                             }),
                             FCanExecuteAction(),
-                            FIsActionChecked::CreateLambda([this]() { return bShowVertices; })),
+                            FIsActionChecked::CreateLambda([this]() { return Viewport.IsValid() ? NGon::GetSceneAccel(&Viewport->Preview()).bShowVertices : bShowVertices; })),
                         NAME_None,
                         EUserInterfaceActionType::Check);
                     Menu.AddMenuEntry(
@@ -1427,6 +1429,14 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportHotkeysOverlay()
             + SVerticalBox::Slot().AutoHeight()
             [
                 MakeHotkeyRow(LOCTEXT("HkGizmo", "Transform Gizmo:"), LOCTEXT("HkGizmoKeys", "Q Select / W Move / E Rot / R Scale"))
+            ]
+            + SVerticalBox::Slot().AutoHeight()
+            [
+                MakeHotkeyRow(LOCTEXT("HkSoftSel", "Soft Selection:"), LOCTEXT("HkSoftSelKeys", "B Toggle / B+LMB Drag Radius"))
+            ]
+            + SVerticalBox::Slot().AutoHeight()
+            [
+                MakeHotkeyRow(LOCTEXT("HkPieMenu", "Pie Menu:"), LOCTEXT("HkPieMenuKeys", "RMB Tap / Space (Context Vertex/Edge/Face/Object)"))
             ]
             + SVerticalBox::Slot().AutoHeight()
             [
