@@ -72,6 +72,7 @@ UMaterial* MakeXRayMaterial()
 {
     UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
     Material->BlendMode = BLEND_Translucent;
+    Material->TranslucencyPass = MTP_BeforeDOF;
     Material->SetShadingModel(MSM_Unlit);
     Material->TwoSided = true;
 
@@ -294,6 +295,13 @@ FNGonPreviewScene::FNGonPreviewScene()
     SelectedEdge = Overlay->AddLineSet(TEXT("Selected edge"));
     SelectedVertex = Overlay->AddPointSet(TEXT("Selected vertex"));
     SoftInfluencePoints->SetVisibility(false);
+    // Strict translucency sort layering prevents X-Ray surface, edges, vertices, and foreground bones from flickering at intersections
+    Surface->SetTranslucentSortPriority(0);
+    if (EdgeLines) EdgeLines->SetTranslucentSortPriority(10);
+    if (SelectedEdge) SelectedEdge->SetTranslucentSortPriority(15);
+    if (VertexPoints) VertexPoints->SetTranslucentSortPriority(20);
+    if (SoftInfluencePoints) SoftInfluencePoints->SetTranslucentSortPriority(25);
+    if (SelectedVertex) SelectedVertex->SetTranslucentSortPriority(30);
 }
 
 FNGonPreviewScene::~FNGonPreviewScene()

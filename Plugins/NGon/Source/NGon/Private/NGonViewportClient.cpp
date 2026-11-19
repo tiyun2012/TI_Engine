@@ -400,22 +400,23 @@ public:
         if (InViewport && Canvas && !Canvas->IsHitTesting())
         {
             const FNGonSkeletonTreeUIState* UIState = GetUIState();
-            const bool bDrawBoneNames = NGon::HasSceneBones(&PreviewOwner.Get())
-                && (!UIState || (UIState->bShowBoneNames && UIState->BoneDrawMode != 3));
+            const bool bDrawBonesOverlay = NGon::HasSceneBones(&PreviewOwner.Get())
+                && (!UIState || UIState->BoneDrawMode != 3);
+            const bool bShowBoneNames = !UIState || UIState->bShowBoneNames;
             const bool bDrawGizmo = PreviewOwner->HasGizmoTarget();
             const bool bCheckVertexHover = HoverPixel.IsSet()
                 && !IsNavigating(InViewport)
                 && PointerAction == EPointerAction::None
                 && !NGon::IsBoneGizmoActive(&PreviewOwner.Get())
                 && !PreviewOwner->GetPositions().IsEmpty();
-            if (bDrawBoneNames || bDrawGizmo || bCheckVertexHover)
+            if (bDrawBonesOverlay || bDrawGizmo || bCheckVertexHover)
             {
                 FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
                 if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
                 {
-                    if (bDrawBoneNames)
+                    if (bDrawBonesOverlay)
                     {
-                        NGon::DrawSceneSkeletonLabels(&PreviewOwner.Get(), View, InViewport, Canvas, true);
+                        NGon::DrawSceneSkeletonLabels(&PreviewOwner.Get(), View, InViewport, Canvas, bShowBoneNames);
                     }
                     if (bDrawGizmo)
                     {

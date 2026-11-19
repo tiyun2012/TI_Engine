@@ -86,9 +86,9 @@ void NGonDrawWireJointSphere(
         const float C1 = FMath::Cos(A1) * Radius;
         const float S1 = FMath::Sin(A1) * Radius;
 
-        PDI->DrawLine(Center + AxisX * C0 + AxisY * S0, Center + AxisX * C1 + AxisY * S1, Color, SDPG_Foreground, Thickness, 0.0f, true);
-        PDI->DrawLine(Center + AxisY * C0 + AxisZ * S0, Center + AxisY * C1 + AxisZ * S1, Color, SDPG_Foreground, Thickness, 0.0f, true);
-        PDI->DrawLine(Center + AxisX * C0 + AxisZ * S0, Center + AxisX * C1 + AxisZ * S1, Color, SDPG_Foreground, Thickness, 0.0f, true);
+        PDI->DrawLine(Center + AxisX * C0 + AxisY * S0, Center + AxisX * C1 + AxisY * S1, Color, SDPG_Foreground, Thickness, 0.5f, true);
+        PDI->DrawLine(Center + AxisY * C0 + AxisZ * S0, Center + AxisY * C1 + AxisZ * S1, Color, SDPG_Foreground, Thickness, 0.5f, true);
+        PDI->DrawLine(Center + AxisX * C0 + AxisZ * S0, Center + AxisX * C1 + AxisZ * S1, Color, SDPG_Foreground, Thickness, 0.5f, true);
     }
 }
 
@@ -125,22 +125,22 @@ void NGonDrawWireBoneOctahedron(
     const FVector C3 = BaseCenter + (-SideA + SideB) * (BaseRadius * 0.7071);
 
     // Base struts from joint origin to pyramid base corners
-    PDI->DrawLine(StartPos, C0, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(StartPos, C1, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(StartPos, C2, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(StartPos, C3, Color, SDPG_Foreground, Thickness, 0.0f, true);
+    PDI->DrawLine(StartPos, C0, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(StartPos, C1, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(StartPos, C2, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(StartPos, C3, Color, SDPG_Foreground, Thickness, 0.5f, true);
 
     // Base square ring around the joint sphere
-    PDI->DrawLine(C0, C1, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(C1, C2, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(C2, C3, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(C3, C0, Color, SDPG_Foreground, Thickness, 0.0f, true);
+    PDI->DrawLine(C0, C1, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(C1, C2, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(C2, C3, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(C3, C0, Color, SDPG_Foreground, Thickness, 0.5f, true);
 
     // Long sleek pyramid edges tapering directly to the child joint tip (EndPos)
-    PDI->DrawLine(C0, EndPos, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(C1, EndPos, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(C2, EndPos, Color, SDPG_Foreground, Thickness, 0.0f, true);
-    PDI->DrawLine(C3, EndPos, Color, SDPG_Foreground, Thickness, 0.0f, true);
+    PDI->DrawLine(C0, EndPos, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(C1, EndPos, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(C2, EndPos, Color, SDPG_Foreground, Thickness, 0.5f, true);
+    PDI->DrawLine(C3, EndPos, Color, SDPG_Foreground, Thickness, 0.5f, true);
 }
 } // anonymous namespace
 
@@ -582,23 +582,122 @@ int32 PickSceneBone(
     return HitBone;
 }
 
-void DrawSceneSkeleton(
+namespace
+{
+TMap<const FNGonPreviewScene*, int32> GSceneBoneDrawModeMap;
+
+bool ProjectWorldToCanvas(const FSceneView& View, double InvDPI, const FVector& WorldPos, FVector2D& OutCanvasPos)
+{
+    const FVector4 Clip = View.WorldToScreen(WorldPos);
+    if (Clip.W <= 0.01 || !FMath::IsFinite(Clip.W))
+    {
+        return false;
+    }
+    FVector2D Px;
+    if (!View.ScreenToPixel(Clip, Px) || !FMath::IsFinite(Px.X) || !FMath::IsFinite(Px.Y))
+    {
+        return false;
+    }
+    OutCanvasPos = Px * InvDPI;
+    return true;
+}
+
+void DrawCanvasLine3D(
+    FCanvas& Canvas,
+    const FSceneView& View,
+    double InvDPI,
+    const FVector& A,
+    const FVector& B,
+    const FLinearColor& Color,
+    float Thickness)
+{
+    FVector2D PA, PB;
+    if (!ProjectWorldToCanvas(View, InvDPI, A, PA) || !ProjectWorldToCanvas(View, InvDPI, B, PB))
+    {
+        return;
+    }
+    FCanvasLineItem Line(PA, PB);
+    Line.SetColor(Color);
+    Line.LineThickness = Thickness;
+    Canvas.DrawItem(Line);
+}
+
+void DrawCanvasJointSphere(
+    FCanvas& Canvas,
+    const FSceneView& View,
+    double InvDPI,
+    const FVector& Center,
+    const FQuat& Rot,
+    float Radius,
+    const FLinearColor& Color,
+    float Thickness)
+{
+    const FVector AxisX = Rot.RotateVector(FVector::UnitX()) * Radius;
+    const FVector AxisY = Rot.RotateVector(FVector::UnitY()) * Radius;
+    const FVector AxisZ = Rot.RotateVector(FVector::UnitZ()) * Radius;
+    constexpr int32 Segs = 12;
+    for (int32 i = 0; i < Segs; ++i)
+    {
+        const float A0 = (2.0f * UE_PI * i) / Segs;
+        const float A1 = (2.0f * UE_PI * (i + 1)) / Segs;
+        const float C0 = FMath::Cos(A0), S0 = FMath::Sin(A0);
+        const float C1 = FMath::Cos(A1), S1 = FMath::Sin(A1);
+        DrawCanvasLine3D(Canvas, View, InvDPI, Center + AxisX * C0 + AxisY * S0, Center + AxisX * C1 + AxisY * S1, Color, Thickness);
+        DrawCanvasLine3D(Canvas, View, InvDPI, Center + AxisY * C0 + AxisZ * S0, Center + AxisY * C1 + AxisZ * S1, Color, Thickness);
+        DrawCanvasLine3D(Canvas, View, InvDPI, Center + AxisX * C0 + AxisZ * S0, Center + AxisX * C1 + AxisZ * S1, Color, Thickness);
+    }
+}
+
+void DrawCanvasBoneOctahedron(
+    FCanvas& Canvas,
+    const FSceneView& View,
+    double InvDPI,
+    const FVector& StartPos,
+    const FVector& EndPos,
+    const FLinearColor& Color,
+    float Thickness,
+    float BaseRadius)
+{
+    const FVector Delta = EndPos - StartPos;
+    const double Len = Delta.Size();
+    if (Len <= 0.25) return;
+    const FVector Dir = Delta / Len;
+    const FVector UpRef = FMath::Abs(Dir.Z) < 0.92 ? FVector::UpVector : FVector::RightVector;
+    const FVector SideA = FVector::CrossProduct(Dir, UpRef).GetSafeNormal();
+    const FVector SideB = FVector::CrossProduct(Dir, SideA).GetSafeNormal();
+    const double R = FMath::Clamp(Len * 0.085, static_cast<double>(BaseRadius * 0.65f), static_cast<double>(BaseRadius * 1.45f));
+    const FVector Mid = StartPos + Dir * FMath::Min(Len * 0.16, R * 2.2);
+
+    const FVector C0 = Mid + SideA * R;
+    const FVector C1 = Mid + SideB * R;
+    const FVector C2 = Mid - SideA * R;
+    const FVector C3 = Mid - SideB * R;
+
+    DrawCanvasLine3D(Canvas, View, InvDPI, StartPos, C0, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, StartPos, C1, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, StartPos, C2, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, StartPos, C3, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, C0, C1, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, C1, C2, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, C2, C3, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, C3, C0, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, C0, EndPos, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, C1, EndPos, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, C2, EndPos, Color, Thickness);
+    DrawCanvasLine3D(Canvas, View, InvDPI, C3, EndPos, Color, Thickness);
+}
+
+void DrawSkeletonOverlayOnCanvas(
     const FNGonPreviewScene* Scene,
-    const FSceneView* View,
-    FPrimitiveDrawInterface* PDI,
+    const FSceneView& View,
+    FCanvas& Canvas,
     int32 BoneDrawMode)
 {
-    if (!Scene || !View || !PDI || BoneDrawMode == 3)
-    {
-        return;
-    }
-
+    if (!Scene || BoneDrawMode == 3) return;
     const FNGonSceneAccel& Accel = GetSceneAccel(Scene);
-    if (Accel.Bones.IsEmpty())
-    {
-        return;
-    }
+    if (Accel.Bones.IsEmpty()) return;
 
+    const double InvDPI = 1.0 / FMath::Max(static_cast<double>(Canvas.GetDPIScale()), 0.01);
     const int32 SelectedIdx = Accel.SelectedBoneIndex;
     TSet<int32> SubtreeSet;
     if (Accel.Bones.IsValidIndex(SelectedIdx))
@@ -615,52 +714,42 @@ void DrawSceneSkeleton(
         }
     }
 
-    // 1. Draw unselected / hierarchy bones when BoneDrawMode == 0 (All) or 1 (Selected & Subtree)
     if (BoneDrawMode == 0 || BoneDrawMode == 1)
     {
         for (int32 b = 0; b < Accel.Bones.Num(); ++b)
         {
-            if (b == SelectedIdx)
-            {
-                continue;
-            }
+            if (b == SelectedIdx) continue;
             const bool bInSubtree = SubtreeSet.Contains(b);
             if (BoneDrawMode == 1 && !bInSubtree && b != (Accel.Bones.IsValidIndex(SelectedIdx) ? Accel.Bones[SelectedIdx].ParentIndex : INDEX_NONE))
             {
                 continue;
             }
-
             const FNGonSceneAccel::FSceneBoneState& Bone = Accel.Bones[b];
             const FVector StartPos = Bone.CurrentComponentTransform.GetLocation();
             const bool bIsNonWeighted = NGonIsUtilityNonDeformingBoneName(Bone.Name);
             const FLinearColor WireColor = bInSubtree
-                ? FLinearColor(0.92f, 0.62f, 0.16f, 0.90f)
+                ? FLinearColor(0.96f, 0.68f, 0.18f, 0.95f)
                 : (bIsNonWeighted
-                    ? FLinearColor(0.38f, 0.42f, 0.48f, 0.45f)
-                    : FLinearColor(0.55f, 0.68f, 0.82f, 0.65f));
-
+                    ? FLinearColor(0.42f, 0.48f, 0.56f, 0.55f)
+                    : FLinearColor(0.76f, 0.66f, 0.34f, 0.85f));
             const float SphereRad = bInSubtree ? 0.95f : 0.70f;
-            NGonDrawWireJointSphere(PDI, StartPos, Bone.CurrentComponentTransform.GetRotation(), SphereRad, WireColor, 1.0f);
-
+            DrawCanvasJointSphere(Canvas, View, InvDPI, StartPos, Bone.CurrentComponentTransform.GetRotation(), SphereRad, WireColor, 1.1f);
             for (const int32 ChildIdx : Bone.ChildBones)
             {
                 if (Accel.Bones.IsValidIndex(ChildIdx))
                 {
-                    const FVector EndPos = Accel.Bones[ChildIdx].CurrentComponentTransform.GetLocation();
-                    NGonDrawWireBoneOctahedron(PDI, StartPos, EndPos, WireColor, 1.0f, SphereRad);
+                    DrawCanvasBoneOctahedron(Canvas, View, InvDPI, StartPos, Accel.Bones[ChildIdx].CurrentComponentTransform.GetLocation(), WireColor, 1.1f, SphereRad);
                 }
             }
         }
     }
 
-    // 2. Always draw the Selected Bone in native UE5 SkeletalMesh Editor bright lime-green
-    // (small wireframe joint sphere + inner RGB local coordinate cross + sleek 4-sided pyramid cone to child joint)
     if (Accel.Bones.IsValidIndex(SelectedIdx))
     {
         const FNGonSceneAccel::FSceneBoneState& SelBone = Accel.Bones[SelectedIdx];
         const FVector JointPos = SelBone.CurrentComponentTransform.GetLocation();
         const FQuat JointRot = SelBone.CurrentComponentTransform.GetRotation();
-        const FLinearColor SelectedGreen(0.18f, 1.0f, 0.18f, 1.0f);
+        const FLinearColor SelectedGreen(0.18f, 1.0f, 0.24f, 1.0f);
 
         float RefLen = 10.0f;
         for (const int32 ChildIdx : SelBone.ChildBones)
@@ -668,24 +757,17 @@ void DrawSceneSkeleton(
             if (Accel.Bones.IsValidIndex(ChildIdx) && !NGonIsUtilityNonDeformingBoneName(Accel.Bones[ChildIdx].Name))
             {
                 const float D = FVector::Distance(JointPos, Accel.Bones[ChildIdx].CurrentComponentTransform.GetLocation());
-                if (D > 1.0f)
-                {
-                    RefLen = D;
-                    break;
-                }
+                if (D > 1.0f) { RefLen = D; break; }
             }
         }
         const float JointRadius = FMath::Clamp(RefLen * 0.085f, 0.85f, 1.65f);
+        DrawCanvasJointSphere(Canvas, View, InvDPI, JointPos, JointRot, JointRadius, SelectedGreen, 1.5f);
 
-        NGonDrawWireJointSphere(PDI, JointPos, JointRot, JointRadius, SelectedGreen, 1.4f);
-
-        // Tiny RGB local coordinate cross inside the joint sphere (matching image_3b0306.jpg & image_3b001c.jpg)
         const float AxisLen = JointRadius * 0.92f;
-        PDI->DrawLine(JointPos, JointPos + JointRot.RotateVector(FVector::UnitX()) * AxisLen, FLinearColor(1.0f, 0.15f, 0.15f), SDPG_Foreground, 1.4f, 0.0f, true);
-        PDI->DrawLine(JointPos, JointPos + JointRot.RotateVector(FVector::UnitY()) * AxisLen, FLinearColor(0.15f, 1.0f, 0.15f), SDPG_Foreground, 1.4f, 0.0f, true);
-        PDI->DrawLine(JointPos, JointPos + JointRot.RotateVector(FVector::UnitZ()) * AxisLen, FLinearColor(0.18f, 0.45f, 1.0f), SDPG_Foreground, 1.4f, 0.0f, true);
+        DrawCanvasLine3D(Canvas, View, InvDPI, JointPos, JointPos + JointRot.RotateVector(FVector::UnitX()) * AxisLen, FLinearColor(1.0f, 0.18f, 0.18f, 1.0f), 1.5f);
+        DrawCanvasLine3D(Canvas, View, InvDPI, JointPos, JointPos + JointRot.RotateVector(FVector::UnitY()) * AxisLen, FLinearColor(0.18f, 1.0f, 0.18f, 1.0f), 1.5f);
+        DrawCanvasLine3D(Canvas, View, InvDPI, JointPos, JointPos + JointRot.RotateVector(FVector::UnitZ()) * AxisLen, FLinearColor(0.22f, 0.52f, 1.0f, 1.0f), 1.5f);
 
-        bool bDrewChildCone = false;
         for (const int32 ChildIdx : SelBone.ChildBones)
         {
             if (Accel.Bones.IsValidIndex(ChildIdx))
@@ -693,16 +775,25 @@ void DrawSceneSkeleton(
                 const FVector ChildPos = Accel.Bones[ChildIdx].CurrentComponentTransform.GetLocation();
                 if (FVector::DistSquared(JointPos, ChildPos) > 0.25f)
                 {
-                    NGonDrawWireBoneOctahedron(PDI, JointPos, ChildPos, SelectedGreen, 1.35f, JointRadius);
-                    bDrewChildCone = true;
+                    DrawCanvasBoneOctahedron(Canvas, View, InvDPI, JointPos, ChildPos, SelectedGreen, 1.4f, JointRadius);
                 }
             }
         }
-        if (!bDrewChildCone)
-        {
-            const FVector LeafEnd = JointPos + JointRot.RotateVector(FVector::UnitX()) * 5.0f;
-            NGonDrawWireBoneOctahedron(PDI, JointPos, LeafEnd, SelectedGreen, 1.35f, JointRadius);
-        }
+    }
+}
+} // anonymous namespace
+
+void DrawSceneSkeleton(
+    const FNGonPreviewScene* Scene,
+    const FSceneView* View,
+    FPrimitiveDrawInterface* PDI,
+    int32 BoneDrawMode)
+{
+    // Record BoneDrawMode and defer actual bone rendering to FCanvas in DrawSceneSkeletonLabels
+    // so bones render cleanly post-3D/post-XRay/post-TSR with zero edge intersection flicker.
+    if (Scene)
+    {
+        GSceneBoneDrawModeMap.Add(Scene, BoneDrawMode);
     }
 }
 
@@ -713,7 +804,14 @@ void DrawSceneSkeletonLabels(
     FCanvas* Canvas,
     bool bShowBoneNames)
 {
-    if (!Scene || !View || !InViewport || !Canvas || !bShowBoneNames)
+    if (!Scene || !View || !InViewport || !Canvas)
+    {
+        return;
+    }
+    const int32* StoredDrawMode = GSceneBoneDrawModeMap.Find(Scene);
+    const int32 BoneDrawMode = StoredDrawMode ? *StoredDrawMode : 0;
+    DrawSkeletonOverlayOnCanvas(Scene, *View, *Canvas, BoneDrawMode);
+    if (!bShowBoneNames || BoneDrawMode == 3)
     {
         return;
     }
