@@ -88,6 +88,14 @@ void GetSceneSnapSettings(
     float& OutScaleStep);
 bool IsUtilityNonDeformingBoneName(const FName& Name);
 void UpdateSceneCameraView(FNGonPreviewScene* Scene, const FVector& CameraOrigin, const FVector& CameraDir);
+void SetShowSoftVertexWeights(FNGonPreviewScene* Scene, bool bShow);
+bool IsShowingSoftVertexWeights(const FNGonPreviewScene* Scene);
+void SetXRayEnabled(FNGonPreviewScene* Scene, bool bEnable);
+bool IsXRayEnabled(const FNGonPreviewScene* Scene);
+void SetXRayOpacity(FNGonPreviewScene* Scene, float Opacity);
+float GetXRayOpacity(const FNGonPreviewScene* Scene);
+void SetWireframeEdgesOnly(FNGonPreviewScene* Scene, bool bEdgesOnly);
+bool IsWireframeEdgesOnly(const FNGonPreviewScene* Scene);
 } // namespace NGon
 #endif // NGON_SCENE_BONE_BRIDGE_DECLARED
 

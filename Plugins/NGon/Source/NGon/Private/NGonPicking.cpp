@@ -67,8 +67,9 @@ int32 FNGonPicker::Pick(
         return PickFace(Origin, Direction);
     }
 
-    constexpr double PickRadiusPixels = 10.0;
-    const double DepthTolerance = FMath::Max(0.0001, Topology.RestBounds.GetSize().Size() * 0.000001);
+    constexpr double PickRadiusPixels = 12.0;
+    const double DepthTolerance = FMath::Max(0.15, Topology.RestBounds.GetSize().Size() * 0.0012);
+    const FVector CamOrigin = View.ViewMatrices.GetViewOrigin();
     double BestDistanceSquared = FMath::Square(PickRadiusPixels);
     double BestDepth = TNumericLimits<double>::Max();
     int32 BestId = INDEX_NONE;
@@ -81,19 +82,19 @@ int32 FNGonPicker::Pick(
             return;
         }
 
-        FVector Origin;
-        FVector Direction;
-        View.DeprojectFVector2D(Pixel, Origin, Direction);
-        const double Depth = FVector::DotProduct(Position - Origin, Direction);
-        if (Depth < 0.0 || (DistanceSquared == BestDistanceSquared && Depth >= BestDepth))
+        // Direct 3D eye-to-vertex ray (100% DPI-independent, catches all front-surface occlusion)
+        const FVector ToPos = Position - CamOrigin;
+        const double Depth = ToPos.Size();
+        if (Depth <= KINDA_SMALL_NUMBER || (DistanceSquared == BestDistanceSquared && Depth >= BestDepth))
         {
             return;
         }
+        const FVector Direction = ToPos / Depth;
 
         double HitDepth = 0.0;
         int32 HitTriangle = INDEX_NONE;
         if (Spatial->FindNearestHitTriangle(
-            FRay3d(Origin, Direction), HitDepth, HitTriangle, IMeshSpatial::FQueryOptions())
+            FRay3d(CamOrigin, Direction), HitDepth, HitTriangle, IMeshSpatial::FQueryOptions())
             && HitDepth + DepthTolerance < Depth)
         {
             return;

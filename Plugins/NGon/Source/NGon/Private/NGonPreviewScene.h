@@ -69,6 +69,7 @@ public:
     ENGonGizmoMode GetGizmoMode() const { return GizmoMode; }
     bool HasGizmoTarget() const;
     int32 Pick(ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd);
+    int32 PickHoverVertex(const FSceneView& View, const FVector2D& Cursor, bool bAllowThroughMesh) const;
     void BoxSelect(ENGonElement Element, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
     void ClearSelection();

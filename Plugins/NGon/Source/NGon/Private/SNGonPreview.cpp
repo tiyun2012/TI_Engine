@@ -167,35 +167,43 @@ void SNGonPreview::Construct(const FArguments& InArgs)
                     [
                         MakeViewportOverlayHeader()
                     ]
-                    // 3D Viewport with Top-Left Stats Overlay and Top-Right Hotkeys Overlay
+                    // 3D Viewport + Constant-Height Draggable Bottom Status Bar (vertical splitter prevents viewport jump)
                     + SVerticalBox::Slot()
                     .FillHeight(1.0f)
                     [
-                        SNew(SOverlay)
-                        + SOverlay::Slot()
+                        SNew(SSplitter)
+                        .Orientation(Orient_Vertical)
+                        .PhysicalSplitterHandleSize(4.0f)
+                        + SSplitter::Slot()
+                        .Value(0.92f)
+                        .MinSize(220.0f)
                         [
-                            Viewport.ToSharedRef()
+                            SNew(SOverlay)
+                            + SOverlay::Slot()
+                            [
+                                Viewport.ToSharedRef()
+                            ]
+                            + SOverlay::Slot()
+                            .HAlign(HAlign_Left)
+                            .VAlign(VAlign_Top)
+                            .Padding(12.0f, 10.0f)
+                            [
+                                MakeViewportStatsOverlay()
+                            ]
+                            + SOverlay::Slot()
+                            .HAlign(HAlign_Right)
+                            .VAlign(VAlign_Top)
+                            .Padding(12.0f, 10.0f)
+                            [
+                                MakeViewportHotkeysOverlay()
+                            ]
                         ]
-                        + SOverlay::Slot()
-                        .HAlign(HAlign_Left)
-                        .VAlign(VAlign_Top)
-                        .Padding(12.0f, 10.0f)
+                        + SSplitter::Slot()
+                        .Value(0.08f)
+                        .MinSize(44.0f)
                         [
-                            MakeViewportStatsOverlay()
+                            MakeStatus()
                         ]
-                        + SOverlay::Slot()
-                        .HAlign(HAlign_Right)
-                        .VAlign(VAlign_Top)
-                        .Padding(12.0f, 10.0f)
-                        [
-                            MakeViewportHotkeysOverlay()
-                        ]
-                    ]
-                    // Bottom Status & Transport Bar
-                    + SVerticalBox::Slot()
-                    .AutoHeight()
-                    [
-                        MakeStatus()
                     ]
                 ]
                 + SSplitter::Slot()

@@ -1080,7 +1080,26 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                     };
                     AddShadingMode(ENGonViewportShading::Smooth, LOCTEXT("ShadeSmooth", "Smooth"));
                     AddShadingMode(ENGonViewportShading::Faceted, LOCTEXT("ShadeFaceted", "Faceted"));
-                    AddShadingMode(ENGonViewportShading::Wireframe, LOCTEXT("ShadeWireframe", "Wireframe"));
+                    AddShadingMode(ENGonViewportShading::Wireframe, LOCTEXT("ShadeWireframe", "Wireframe (Edges Only)"));
+                    Menu.AddMenuSeparator();
+                    Menu.AddMenuEntry(
+                        LOCTEXT("ShadeXRayToggle", "X-Ray (Half-Transparent Face)"),
+                        LOCTEXT("ShadeXRayTip", "Make faces half-transparent (0..1 opacity in Details/Settings) and allow through-mesh vertex detection."),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                const bool bNext = !NGon::IsXRayEnabled(&Viewport->Preview());
+                                NGon::SetXRayEnabled(&Viewport->Preview(), bNext);
+                                Viewport->Invalidate();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]()
+                            {
+                                return NGon::IsXRayEnabled(&Viewport->Preview());
+                            })),
+                        NAME_None,
+                        EUserInterfaceActionType::ToggleButton);
                     return Menu.MakeWidget();
                 })
                 .ButtonContent()
@@ -1465,42 +1484,49 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportHotkeysOverlay()
 TSharedRef<SWidget> SNGonPreview::MakeStatus()
 {
     return SNew(SBorder)
+        .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+        .BorderBackgroundColor(FLinearColor(0.055f, 0.062f, 0.075f, 1.0f))
+        .Clipping(EWidgetClipping::ClipToBounds)
         .Padding(FMargin(8.0f, 4.0f))
         [
-            SNew(SVerticalBox)
-            + SVerticalBox::Slot().AutoHeight()
+            SNew(SScrollBox)
+            + SScrollBox::Slot()
             [
-                SNew(SHorizontalBox)
-                + SHorizontalBox::Slot().FillWidth(1.0f)
+                SNew(SVerticalBox)
+                + SVerticalBox::Slot().AutoHeight()
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().FillWidth(1.0f)
+                    [
+                        SNew(STextBlock)
+                        .Text_Lambda([this]
+                        {
+                            return FText::Format(LOCTEXT("BottomStatusMain", "{0} ({1})  |  {2}"),
+                                SourceLabel, SourceTypeLabel, Viewport->Preview().DescribeMesh());
+                        })
+                        .AutoWrapText(true)
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().Padding(12.0f, 0.0f, 0.0f, 0.0f)
+                    [
+                        SNew(STextBlock)
+                        .Text_Lambda([this]
+                        {
+                            return Viewport->Preview().DescribeUpdates();
+                        })
+                        .ColorAndOpacity(FLinearColor(0.62f, 0.68f, 0.75f))
+                    ]
+                ]
+                + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 3.0f, 0.0f, 0.0f)
                 [
                     SNew(STextBlock)
-                    .Text_Lambda([this]
+                    .Text_Lambda([this] { return ErrorText; })
+                    .Visibility_Lambda([this]
                     {
-                        return FText::Format(LOCTEXT("BottomStatusMain", "{0} ({1})  |  {2}"),
-                            SourceLabel, SourceTypeLabel, Viewport->Preview().DescribeMesh());
+                        return ErrorText.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible;
                     })
+                    .ColorAndOpacity(FLinearColor(1.0f, 0.58f, 0.25f))
                     .AutoWrapText(true)
                 ]
-                + SHorizontalBox::Slot().AutoWidth().Padding(12.0f, 0.0f, 0.0f, 0.0f)
-                [
-                    SNew(STextBlock)
-                    .Text_Lambda([this]
-                    {
-                        return Viewport->Preview().DescribeUpdates();
-                    })
-                    .ColorAndOpacity(FLinearColor(0.62f, 0.68f, 0.75f))
-                ]
-            ]
-            + SVerticalBox::Slot().AutoHeight()
-            [
-                SNew(STextBlock)
-                .Text_Lambda([this] { return ErrorText; })
-                .Visibility_Lambda([this]
-                {
-                    return ErrorText.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible;
-                })
-                .ColorAndOpacity(FLinearColor(1.0f, 0.58f, 0.25f))
-                .AutoWrapText(true)
             ]
         ];
 }

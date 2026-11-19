@@ -15,6 +15,7 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
+#include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
@@ -22,6 +23,7 @@
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "SceneInterface.h"
+#include "SceneView.h"
 #include "TextureResource.h"
 #include "ToolSetupUtil.h"
 #include "UDynamicMesh.h"
@@ -49,6 +51,52 @@ const FName PaintTextureParameter(TEXT("PaintTexture"));
 
 const FLinearColor StudioColor(0.46f, 0.49f, 0.53f);
 TMap<const FNGonPreviewScene*, TStrongObjectPtr<UMaterialInstanceDynamic>> GFaceHighlightMaterialMap;
+TStrongObjectPtr<UMaterial> GXRayBaseMaterial;
+TMap<const FNGonPreviewScene*, TStrongObjectPtr<UMaterialInstanceDynamic>> GXRayMaterialMap;
+
+struct FNGonDisplayModeState
+{
+    bool bShowSoftVertexWeights = true;
+    bool bXRayEnabled = false;
+    float XRayOpacity = 0.35f;
+    bool bWireframeEdgesOnly = false;
+};
+TMap<const FNGonPreviewScene*, FNGonDisplayModeState> GDisplayModeStateMap;
+
+FNGonDisplayModeState& GetDisplayState(const FNGonPreviewScene* Scene)
+{
+    return GDisplayModeStateMap.FindOrAdd(Scene);
+}
+
+UMaterial* MakeXRayMaterial()
+{
+    UMaterial* Material = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
+    Material->BlendMode = BLEND_Translucent;
+    Material->SetShadingModel(MSM_Unlit);
+    Material->TwoSided = true;
+
+    auto* OpacityParam = CastChecked<UMaterialExpressionScalarParameter>(UMaterialEditingLibrary::CreateMaterialExpression(
+        Material, UMaterialExpressionScalarParameter::StaticClass(), -320, 120));
+    OpacityParam->ParameterName = TEXT("XRayOpacity");
+    OpacityParam->DefaultValue = 0.35f;
+
+    auto* Shade = CastChecked<UMaterialExpressionCustom>(UMaterialEditingLibrary::CreateMaterialExpression(
+        Material, UMaterialExpressionCustom::StaticClass(), -320, -60));
+    Shade->OutputType = CMOT_Float3;
+    Shade->Inputs.Reset();
+    Shade->Code = TEXT(
+        "float3 N = normalize(Parameters.WorldNormal);\n"
+        "float3 V = normalize(Parameters.CameraVector);\n"
+        "float ndotv = abs(dot(N, V));\n"
+        "float rim = pow(1.0 - ndotv, 1.8) * 0.25;\n"
+        "float lum = 0.34 + 0.36 * ndotv + rim;\n"
+        "return float3(0.56, 0.64, 0.76) * lum;");
+
+    Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Shade);
+    Material->GetEditorOnlyData()->Opacity.Connect(0, OpacityParam);
+    Material->PostEditChange();
+    return Material;
+}
 
 FLinearColor HeatColor(float Alpha)
 {
@@ -252,6 +300,9 @@ FNGonPreviewScene::~FNGonPreviewScene()
 {
     GFaceHighlightMaterialMap.Remove(this);
     FNGonMeshAPI::ClearHistory(this);
+    GFaceHighlightMaterialMap.Remove(this);
+    GXRayMaterialMap.Remove(this);
+    GDisplayModeStateMap.Remove(this);
     NGon::RemoveSceneAccel(this);
     Picker.SetMesh(nullptr);
     Overlay->Disconnect();
@@ -643,7 +694,29 @@ void FNGonPreviewScene::UpdateSurfaceDisplay(bool bColorsChanged)
         Surface->FastNotifyColorsUpdated();
         ++ColorUpdates;
     }
-    if (bModeChanged)
+    const FNGonDisplayModeState& DispState = GetDisplayState(this);
+    if (Surface)
+    {
+        Surface->SetVisibility(!DispState.bWireframeEdgesOnly);
+    }
+    if (DispState.bXRayEnabled && !DispState.bWireframeEdgesOnly)
+    {
+        if (!GXRayBaseMaterial.IsValid())
+        {
+            GXRayBaseMaterial.Reset(MakeXRayMaterial());
+        }
+        TStrongObjectPtr<UMaterialInstanceDynamic>& XRayRef = GXRayMaterialMap.FindOrAdd(this);
+        if (!XRayRef.IsValid() && GXRayBaseMaterial.IsValid())
+        {
+            XRayRef.Reset(UMaterialInstanceDynamic::Create(GXRayBaseMaterial.Get(), GetTransientPackage()));
+        }
+        if (XRayRef.IsValid())
+        {
+            XRayRef->SetScalarParameterValue(TEXT("XRayOpacity"), FMath::Clamp(DispState.XRayOpacity, 0.0f, 1.0f));
+            Surface->SetOverrideRenderMaterial(XRayRef.Get());
+        }
+    }
+    else if (bModeChanged || !DispState.bXRayEnabled)
     {
         UMaterialInterface* Override = bVertexColors ? ColorMaterial.Get() : nullptr;
         if (Desired == ESurfaceDisplay::PaintTexture)
@@ -838,7 +911,7 @@ void FNGonPreviewScene::DrawSoftSelection()
         return;
     }
     FNGonSceneAccel& Accel = GetSceneAccel(this);
-    const bool bVisible = SoftSettings.bEnabled && !SoftInfluences.IsEmpty();
+    const bool bVisible = SoftSettings.bEnabled && !SoftInfluences.IsEmpty() && GetDisplayState(this).bShowSoftVertexWeights;
     SoftInfluencePoints->SetVisibility(bVisible);
     if (!bVisible)
     {
@@ -1757,6 +1830,51 @@ void FNGonPreviewScene::CancelSoftTransform()
     RebuildSoftSelection();
 }
 
+int32 FNGonPreviewScene::PickHoverVertex(const FSceneView& View, const FVector2D& Cursor, bool bAllowThroughMesh) const
+{
+    if (Positions.IsEmpty())
+    {
+        return INDEX_NONE;
+    }
+    if (!bAllowThroughMesh)
+    {
+        // Exact BVH raycast occlusion test: never detect vertices on the back of the mesh in shaded modes
+        return Picker.Pick(ENGonElement::Vertex, View, Cursor, Topology, Positions);
+    }
+
+    // Wireframe / X-Ray mode: allow through-mesh vertex hover detection
+    const FVector CamOrigin = View.ViewMatrices.GetViewOrigin();
+    const FVector CamForward = View.ViewMatrices.GetWorldToView().GetColumn(2).GetSafeNormal();
+    const double MaxHoverDistSq = FMath::Square(15.0);
+    int32 BestVert = INDEX_NONE;
+    double BestScore = TNumericLimits<double>::Max();
+
+    for (int32 v = 0; v < Positions.Num(); ++v)
+    {
+        const FVector ToVert = Positions[v] - CamOrigin;
+        if (FVector::DotProduct(ToVert, CamForward) <= 0.0)
+        {
+            continue;
+        }
+        FVector2D Px;
+        if (!View.WorldToPixel(Positions[v], Px))
+        {
+            continue;
+        }
+        const double DistSq = FVector2D::DistSquared(Px, Cursor);
+        if (DistSq <= MaxHoverDistSq)
+        {
+            const double Score = DistSq + ToVert.Size() * 0.0005;
+            if (Score < BestScore)
+            {
+                BestScore = Score;
+                BestVert = v;
+            }
+        }
+    }
+    return BestVert;
+}
+
 int32 FNGonPreviewScene::Pick(
     ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd)
 {
@@ -2142,9 +2260,10 @@ FText FNGonPreviewScene::DescribeMesh() const
         FText::AsNumber(Topology.Faces.Num()), FText::AsNumber(Topology.TriangleCount),
         FText::AsNumber(Topology.Edges.Num()), FText::AsNumber(Topology.RestPositions.Num()),
         FText::AsNumber(Accel.CachedNGonCount), FText::AsNumber(Topology.MaxFaceCorners));
-    if (SoftSettings.bEnabled && !SelectedIds.IsEmpty())
+    if (SoftSettings.bEnabled)
     {
-        return FText::Format(LOCTEXT("SoftHeatmapStatus", "{0}  |  Soft heatmap follows selection influence"), MeshInfo);
+        return FText::Format(LOCTEXT("SoftStatusCompact", "{0}  |  Soft R={1}"),
+            MeshInfo, FText::AsNumber(FMath::RoundToInt(SoftSettings.Radius)));
     }
     return MeshInfo;
 }
@@ -2156,6 +2275,72 @@ FText FNGonPreviewScene::DescribeUpdates() const
 }
 
 
+
+
+namespace NGon
+{
+void SetShowSoftVertexWeights(FNGonPreviewScene* Scene, bool bShow)
+{
+    if (!Scene) return;
+    GetDisplayState(Scene).bShowSoftVertexWeights = bShow;
+    Scene->SetSoftSelection(Scene->GetSoftSelectionSettings());
+}
+
+bool IsShowingSoftVertexWeights(const FNGonPreviewScene* Scene)
+{
+    return Scene ? GetDisplayState(Scene).bShowSoftVertexWeights : true;
+}
+
+void SetXRayEnabled(FNGonPreviewScene* Scene, bool bEnable)
+{
+    if (!Scene) return;
+    GetDisplayState(Scene).bXRayEnabled = bEnable;
+    Scene->SetHeatmapVisible(Scene->IsHeatmapVisible());
+    // Force surface material refresh
+    Scene->SetSoftSelection(Scene->GetSoftSelectionSettings());
+}
+
+bool IsXRayEnabled(const FNGonPreviewScene* Scene)
+{
+    return Scene ? GetDisplayState(Scene).bXRayEnabled : false;
+}
+
+void SetXRayOpacity(FNGonPreviewScene* Scene, float Opacity)
+{
+    if (!Scene) return;
+    const float Clamped = FMath::Clamp(Opacity, 0.0f, 1.0f);
+    GetDisplayState(Scene).XRayOpacity = Clamped;
+    if (TStrongObjectPtr<UMaterialInstanceDynamic>* XRayRef = GXRayMaterialMap.Find(Scene); XRayRef && XRayRef->IsValid())
+    {
+        (*XRayRef)->SetScalarParameterValue(TEXT("XRayOpacity"), Clamped);
+    }
+    if (GetDisplayState(Scene).bXRayEnabled)
+    {
+        Scene->SetSoftSelection(Scene->GetSoftSelectionSettings());
+    }
+}
+
+float GetXRayOpacity(const FNGonPreviewScene* Scene)
+{
+    return Scene ? GetDisplayState(Scene).XRayOpacity : 0.35f;
+}
+
+void SetWireframeEdgesOnly(FNGonPreviewScene* Scene, bool bEdgesOnly)
+{
+    if (!Scene) return;
+    GetDisplayState(Scene).bWireframeEdgesOnly = bEdgesOnly;
+    if (bEdgesOnly)
+    {
+        Scene->SetShowEdges(true);
+    }
+    Scene->SetSoftSelection(Scene->GetSoftSelectionSettings());
+}
+
+bool IsWireframeEdgesOnly(const FNGonPreviewScene* Scene)
+{
+    return Scene ? GetDisplayState(Scene).bWireframeEdgesOnly : false;
+}
+} // namespace NGon
 
 #undef LOCTEXT_NAMESPACE
 // NGon Unified ABI Sync v5.8.2

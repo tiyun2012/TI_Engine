@@ -782,45 +782,18 @@ private:
         {
             return;
         }
-        const double DPIScale = FMath::Max(static_cast<double>(Canvas.GetDPIScale()), 0.01);
-        const double MaxHoverDistSq = FMath::Square(15.0 * DPIScale);
-        const FVector CamOrigin = View.ViewMatrices.GetViewOrigin();
-        const FVector CamForward = View.ViewMatrices.GetWorldToView().GetColumn(2).GetSafeNormal();
-
-        int32 BestVert = INDEX_NONE;
-        FVector2D BestPx = FVector2D::ZeroVector;
-        double BestScore = TNumericLimits<double>::Max();
-
-        for (int32 v = 0; v < Positions.Num(); ++v)
-        {
-            const FVector ToVert = Positions[v] - CamOrigin;
-            if (FVector::DotProduct(ToVert, CamForward) <= 0.0)
-            {
-                continue;
-            }
-            FVector2D Px;
-            if (!View.WorldToPixel(Positions[v], Px))
-            {
-                continue;
-            }
-            const double DistSq = FVector2D::DistSquared(Px, CursorPx);
-            if (DistSq <= MaxHoverDistSq)
-            {
-                // Prefer closest to cursor, breaking ties toward camera
-                const double Score = DistSq + ToVert.Size() * 0.0005;
-                if (Score < BestScore)
-                {
-                    BestScore = Score;
-                    BestVert = v;
-                    BestPx = Px;
-                }
-            }
-        }
-
-        if (BestVert == INDEX_NONE)
+        const bool bAllowThroughMesh = NGon::IsXRayEnabled(&PreviewOwner.Get()) || NGon::IsWireframeEdgesOnly(&PreviewOwner.Get()) || (GetViewMode() == VMI_Wireframe);
+        const int32 BestVert = PreviewOwner->PickHoverVertex(View, CursorPx, bAllowThroughMesh);
+        if (!Positions.IsValidIndex(BestVert))
         {
             return;
         }
+        FVector2D BestPx = FVector2D::ZeroVector;
+        if (!View.WorldToPixel(Positions[BestVert], BestPx))
+        {
+            return;
+        }
+        const double DPIScale = FMath::Max(static_cast<double>(Canvas.GetDPIScale()), 0.01);
 
         const FVector2D Center = BestPx / DPIScale;
         const bool bAlreadySelected = PreviewOwner->GetSelectedElement() == ENGonElement::Vertex
@@ -1247,10 +1220,13 @@ void SNGonViewport::FocusViewport()
 void SNGonViewport::SetShadingMode(ENGonViewportShading Mode)
 {
     ShadingMode = Mode;
+    const bool bEdgesOnly = (Mode == ENGonViewportShading::Wireframe);
     PreviewScene->SetFlatShading(Mode == ENGonViewportShading::Faceted);
+    NGon::SetWireframeEdgesOnly(PreviewScene.Get(), bEdgesOnly);
     if (const TSharedPtr<FEditorViewportClient> PreviewClient = GetViewportClient())
     {
-        PreviewClient->SetViewMode(Mode == ENGonViewportShading::Wireframe ? VMI_Wireframe : VMI_Lit);
+        // Keep VMI_Lit so Wireframe renders clean authored N-Gon edges only (no triangulated UE wireframe)
+        PreviewClient->SetViewMode(VMI_Lit);
         Invalidate();
     }
 }

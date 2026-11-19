@@ -1383,6 +1383,50 @@ TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
         ]
         + SVerticalBox::Slot()
         .AutoHeight()
+        .Padding(12.0f, 2.0f, 0.0f, 2.0f)
+        [
+            SNew(SCheckBox)
+            .IsChecked_Lambda([this]
+            {
+                return (Viewport.IsValid() && Viewport->IsHeatmapVisible())
+                    ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+            })
+            .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+            {
+                bShowHeatmap = (State == ECheckBoxState::Checked);
+                if (Viewport.IsValid())
+                {
+                    Viewport->SetHeatmapVisible(bShowHeatmap);
+                }
+            })
+            [
+                SNew(STextBlock).Text(LOCTEXT("SoftFaceHeatmapCheck", "Show Face Heatmap (H)"))
+            ]
+        ]
+        + SVerticalBox::Slot()
+        .AutoHeight()
+        .Padding(12.0f, 2.0f, 0.0f, 4.0f)
+        [
+            SNew(SCheckBox)
+            .IsChecked_Lambda([this]
+            {
+                return (Viewport.IsValid() && NGon::IsShowingSoftVertexWeights(&Viewport->Preview()))
+                    ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+            })
+            .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+            {
+                if (Viewport.IsValid())
+                {
+                    NGon::SetShowSoftVertexWeights(&Viewport->Preview(), State == ECheckBoxState::Checked);
+                    Viewport->Invalidate();
+                }
+            })
+            [
+                SNew(STextBlock).Text(LOCTEXT("SoftVertexWeightsCheck", "Show Vertex Weight Colors"))
+            ]
+        ]
+        + SVerticalBox::Slot()
+        .AutoHeight()
         .Padding(0.0f, 4.0f)
         [
             SNew(SHorizontalBox)
@@ -1689,6 +1733,65 @@ TSharedRef<SWidget> SNGonPreview::MakePreviewSettingsTab()
             [
                 SNew(STextBlock).Text(LOCTEXT("PrefShowVertices", "Show Logical Vertices Overlay"))
             ]
+        + SVerticalBox::Slot()
+        .AutoHeight()
+        .Padding(0.0f, 4.0f, 0.0f, 2.0f)
+        [
+            SNew(SCheckBox)
+            .IsChecked_Lambda([this]
+            {
+                return (Viewport.IsValid() && NGon::IsXRayEnabled(&Viewport->Preview()))
+                    ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+            })
+            .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+            {
+                if (Viewport.IsValid())
+                {
+                    NGon::SetXRayEnabled(&Viewport->Preview(), State == ECheckBoxState::Checked);
+                    Viewport->Invalidate();
+                }
+            })
+            [
+                SNew(STextBlock).Text(LOCTEXT("XRayModeCheck", "X-Ray Mode (Half-Transparent Face & Through-Mesh Pick)"))
+            ]
+        ]
+        + SVerticalBox::Slot()
+        .AutoHeight()
+        .Padding(12.0f, 2.0f, 0.0f, 4.0f)
+        [
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 8.0f, 0.0f)
+            [
+                SNew(STextBlock).Text(LOCTEXT("XRayOpacityLabel", "X-Ray Opacity (0 - 1):"))
+            ]
+            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+            [
+                SNew(SSlider)
+                .MinValue(0.0f)
+                .MaxValue(1.0f)
+                .Value_Lambda([this]
+                {
+                    return Viewport.IsValid() ? NGon::GetXRayOpacity(&Viewport->Preview()) : 0.35f;
+                })
+                .OnValueChanged_Lambda([this](float Value)
+                {
+                    if (Viewport.IsValid())
+                    {
+                        NGon::SetXRayOpacity(&Viewport->Preview(), Value);
+                        Viewport->Invalidate();
+                    }
+                })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6.0f, 0.0f, 0.0f, 0.0f)
+            [
+                SNew(STextBlock)
+                .Text_Lambda([this]
+                {
+                    const float Op = Viewport.IsValid() ? NGon::GetXRayOpacity(&Viewport->Preview()) : 0.35f;
+                    return FText::FromString(FString::Printf(TEXT("%.2f"), Op));
+                })
+            ]
+        ]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 3.0f)
         [
