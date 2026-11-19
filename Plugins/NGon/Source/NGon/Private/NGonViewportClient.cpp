@@ -253,8 +253,13 @@ public:
                 FinishPointerAction(InViewport, Mouse);
                 return true;
             }
-            if (EventArgs.Event == IE_DoubleClick && !bNavigating && PointerAction == EPointerAction::None && !bBKeyHeld)
+            const double NowSec = FPlatformTime::Seconds();
+            const bool bFastSecondClick = bPressed
+                && (NowSec - LastLmbClickTime) <= 0.42
+                && FVector2D::DistSquared(FVector2D(Mouse), FVector2D(LastLmbClickPos)) <= 64.0;
+            if ((EventArgs.Event == IE_DoubleClick || bFastSecondClick) && !bNavigating && PointerAction == EPointerAction::None && !bBKeyHeld)
             {
+                LastLmbClickTime = 0.0;
                 if (HandleDoubleClickGesture(InViewport, Mouse))
                 {
                     return true;
@@ -268,6 +273,8 @@ public:
                     BeginSoftRadiusDrag(InViewport, Mouse);
                     return true;
                 }
+                LastLmbClickTime = NowSec;
+                LastLmbClickPos = Mouse;
                 BeginPointerAction(InViewport, Mouse);
                 return true;
             }
@@ -744,6 +751,14 @@ private:
         {
             return false;
         }
+        int32 EffectiveAnchor = PrevAnchor;
+        if ((EffectiveAnchor == INDEX_NONE || EffectiveAnchor == TargetId)
+            && PreviousSelectionAnchorElement == Mode
+            && PreviousSelectionAnchor != INDEX_NONE
+            && PreviousSelectionAnchor != TargetId)
+        {
+            EffectiveAnchor = PreviousSelectionAnchor;
+        }
 
         // Release any active joint in hierarchy when double-clicking mesh components
         if (NGon::GetSelectedSceneBone(&PreviewOwner.Get()) != INDEX_NONE || NGon::IsBoneGizmoActive(&PreviewOwner.Get()))
@@ -761,7 +776,8 @@ private:
             PreviewOwner->SetSelectionSet(Mode, SavedSel, false);
         }
 
-        FNGonMeshAPI::SelectDoubleClickGesture(PreviewOwner.Get(), Mode, PrevAnchor, TargetId, IsShiftPressed());
+        FNGonMeshAPI::SelectDoubleClickGesture(PreviewOwner.Get(), Mode, EffectiveAnchor, TargetId, IsShiftPressed());
+        PreviousSelectionAnchor = INDEX_NONE;
         PostInvalidation();
         return true;
     }
@@ -818,10 +834,19 @@ private:
         else
         {
             const bool bAdd = IsShiftPressed();
+            const ENGonElement CurMode = Pinned->GetSelectionMode();
+            const int32 PreClickAnchor = (PreviewOwner->GetSelectedElement() == CurMode && !PreviewOwner->GetSelectedIds().IsEmpty())
+                ? (PreviewOwner->GetActiveSelectedId() != INDEX_NONE ? PreviewOwner->GetActiveSelectedId() : *PreviewOwner->GetSelectedIds().CreateConstIterator())
+                : INDEX_NONE;
             const int32 Hit = Pinned->Pick(View, Mouse, bAdd);
-            if (PointerAction == EPointerAction::EdgeLoop && Pinned->GetSelectionMode() == ENGonElement::Edge && Hit != INDEX_NONE)
+            if (Hit != INDEX_NONE && PreClickAnchor != INDEX_NONE && PreClickAnchor != Hit)
             {
-                Pinned->SelectEdgeLoop(Hit, bAdd);
+                PreviousSelectionAnchor = PreClickAnchor;
+                PreviousSelectionAnchorElement = CurMode;
+            }
+            if (PointerAction == EPointerAction::EdgeLoop && CurMode == ENGonElement::Edge && Hit != INDEX_NONE)
+            {
+                FNGonMeshAPI::SelectEdgeLoop(PreviewOwner.Get(), Hit, bAdd);
             }
         }
     }
@@ -991,6 +1016,10 @@ private:
     FIntPoint SoftRadiusStartMouse = FIntPoint::ZeroValue;
     double SoftRadiusStartValue = 50.0;
     double SoftRadiusUnitsPerPixel = 0.5;
+    int32 PreviousSelectionAnchor = INDEX_NONE;
+    ENGonElement PreviousSelectionAnchorElement = ENGonElement::Face;
+    double LastLmbClickTime = 0.0;
+    FIntPoint LastLmbClickPos = FIntPoint::ZeroValue;
     FNGonPieMenu PieMenu;
     FVector2D PieOpenPos = FVector2D::ZeroVector;
     bool bTrackingRmbTap = false;

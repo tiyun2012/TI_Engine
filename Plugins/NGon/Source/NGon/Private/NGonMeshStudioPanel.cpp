@@ -482,6 +482,26 @@ TSharedRef<SWidget> SNGonPreview::MakeMeshStudioTab()
                     + SWrapBox::Slot()
                     [
                         MakeActionChip(
+                            LOCTEXT("VertexLoopBtn", "Vertex Loop"),
+                            LOCTEXT("VertexLoopTip", "Trace quad or boundary vertex loop from 2 adjacent vertices (or Click 1st + Double-Click 2nd)"),
+                            FOnClicked::CreateLambda([this, RunOp]()
+                            {
+                                return RunOp(FNGonMeshAPI::SelectVertexLoop(Viewport->Preview()));
+                            }))
+                    ]
+                    + SWrapBox::Slot()
+                    [
+                        MakeActionChip(
+                            LOCTEXT("ShortestPathBtn", "Shortest Path"),
+                            LOCTEXT("ShortestPathTip", "Select 3D Dijkstra shortest path between 2 vertices, edges, or faces (or Click 1st + Double-Click 2nd)"),
+                            FOnClicked::CreateLambda([this, RunOp]()
+                            {
+                                return RunOp(FNGonMeshAPI::SelectShortestPath(Viewport->Preview()));
+                            }))
+                    ]
+                    + SWrapBox::Slot()
+                    [
+                        MakeActionChip(
                             LOCTEXT("EdgeLoopBtn", "Edge Loop"),
                             LOCTEXT("EdgeLoopTip", "Trace continuous edge loop from selected edge"),
                             FOnClicked::CreateLambda([this, RunOp]()

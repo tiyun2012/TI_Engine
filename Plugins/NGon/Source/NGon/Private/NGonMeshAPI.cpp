@@ -2907,7 +2907,7 @@ FNGonMeshOpResult FNGonMeshAPI::SelectVertexLoop(FNGonPreviewScene& Scene, int32
     }
 
     const TSet<int32> PrevSel = bAdd && Scene.GetSelectedElement() == ENGonElement::Vertex ? Scene.GetSelectedIds() : TSet<int32>();
-    if (!Scene.SelectEdgeLoop(StartEdge, false))
+    if (!FNGonMeshAPI::SelectEdgeLoop(Scene, StartEdge, false).bOk)
     {
         Res.Message = TEXT("Could not trace a quad vertex loop from the selected edge.");
         return Res;
