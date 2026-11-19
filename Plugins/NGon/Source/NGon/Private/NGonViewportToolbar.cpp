@@ -576,18 +576,7 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                         Viewport->Invalidate();
                     })
             ]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
-            [
-                MakeIconToolButton(
-                    ENGonTreeIconKind::OcclusionCube,
-                    LOCTEXT("BackfaceToggleTip", "Toggle Camera/Ray Selection Filter"),
-                    [this]() { return GetSkeletonTreeUIState(this).bBackfaceSelect; },
-                    [this]()
-                    {
-                        FNGonSkeletonTreeUIState& State = GetSkeletonTreeUIState(this);
-                        State.bBackfaceSelect = !State.bBackfaceSelect;
-                    })
-            ]
+
 
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
             [

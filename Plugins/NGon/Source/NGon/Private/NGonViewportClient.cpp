@@ -253,6 +253,13 @@ public:
                 FinishPointerAction(InViewport, Mouse);
                 return true;
             }
+            if (EventArgs.Event == IE_DoubleClick && !bNavigating && PointerAction == EPointerAction::None && !bBKeyHeld)
+            {
+                if (HandleDoubleClickGesture(InViewport, Mouse))
+                {
+                    return true;
+                }
+            }
             if ((bPressed || EventArgs.Event == IE_DoubleClick) && !bNavigating
                 && PointerAction == EPointerAction::None)
             {
@@ -708,6 +715,56 @@ private:
         PostInvalidation();
     }
 
+    bool HandleDoubleClickGesture(FViewport* InViewport, const FIntPoint& Mouse)
+    {
+        const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
+        if (!InViewport || !Pinned)
+        {
+            return false;
+        }
+        FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
+        const FSceneView* View = BuildSceneView(InViewport, ViewFamily);
+        if (!View)
+        {
+            return false;
+        }
+
+        const FVector2D Cursor(Mouse.X, Mouse.Y);
+        const ENGonElement Mode = Pinned->GetSelectionMode();
+        const int32 PrevAnchor = (PreviewOwner->GetSelectedElement() == Mode && !PreviewOwner->GetSelectedIds().IsEmpty())
+            ? (PreviewOwner->GetActiveSelectedId() != INDEX_NONE ? PreviewOwner->GetActiveSelectedId() : *PreviewOwner->GetSelectedIds().CreateConstIterator())
+            : INDEX_NONE;
+
+        const TSet<int32> SavedSel = PreviewOwner->GetSelectedIds();
+        const ENGonElement SavedElem = PreviewOwner->GetSelectedElement();
+
+        const int32 TargetId = Pinned->Pick(*View, Cursor, IsShiftPressed());
+        if (TargetId == INDEX_NONE)
+        {
+            return false;
+        }
+
+        // Release any active joint in hierarchy when double-clicking mesh components
+        if (NGon::GetSelectedSceneBone(&PreviewOwner.Get()) != INDEX_NONE || NGon::IsBoneGizmoActive(&PreviewOwner.Get()))
+        {
+            NGon::SelectSceneBone(&PreviewOwner.Get(), INDEX_NONE, false);
+            if (FNGonSkeletonTreeUIState* UI = GetUIState(); UI && UI->OnViewportBonePicked)
+            {
+                UI->OnViewportBonePicked(INDEX_NONE);
+            }
+        }
+
+        // Restore previous selection if Shift-adding so SelectDoubleClickGesture can merge cleanly
+        if (IsShiftPressed() && SavedElem == Mode && !SavedSel.IsEmpty())
+        {
+            PreviewOwner->SetSelectionSet(Mode, SavedSel, false);
+        }
+
+        FNGonMeshAPI::SelectDoubleClickGesture(PreviewOwner.Get(), Mode, PrevAnchor, TargetId, IsShiftPressed());
+        PostInvalidation();
+        return true;
+    }
+
     void SelectAtPointer(const FSceneView& View, const FVector2D& Mouse)
     {
         const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
@@ -718,12 +775,26 @@ private:
 
         FNGonSkeletonTreeUIState* UI = GetUIState();
         const bool bBonesVisible = NGon::HasSceneBones(&PreviewOwner.Get()) && (!UI || UI->BoneDrawMode != 3);
+        const auto ReleaseSelectedBone = [&]()
+        {
+            if (NGon::GetSelectedSceneBone(&PreviewOwner.Get()) != INDEX_NONE || NGon::IsBoneGizmoActive(&PreviewOwner.Get()))
+            {
+                NGon::SelectSceneBone(&PreviewOwner.Get(), INDEX_NONE, false);
+                if (UI && UI->OnViewportBonePicked)
+                {
+                    UI->OnViewportBonePicked(INDEX_NONE);
+                }
+            }
+        };
+
         if (!bMarqueeActive && bBonesVisible)
         {
-            const float PickRadius = NGon::IsBoneGizmoActive(&PreviewOwner.Get()) ? 22.0f : 14.0f;
+            // Keep a tight radius (11px) so clicking mesh components near a bone selects the mesh instead of stealing focus
+            const float PickRadius = NGon::IsBoneGizmoActive(&PreviewOwner.Get()) ? 14.0f : 10.0f;
             const int32 HitBone = NGon::PickSceneBone(&PreviewOwner.Get(), View, Mouse, PickRadius, true);
             if (HitBone != INDEX_NONE)
             {
+                PreviewOwner->ClearSelection();
                 if (Pinned->GetGizmoMode() == ENGonGizmoMode::None)
                 {
                     Pinned->SetGizmoMode(ENGonGizmoMode::Translate);
@@ -735,6 +806,9 @@ private:
                 return;
             }
         }
+
+        // Single click or marquee on mesh/empty space releases any selected joint in hierarchy
+        ReleaseSelectedBone();
 
         if (bMarqueeActive)
         {
@@ -961,11 +1035,13 @@ private:
             const int32 SelCount = PreviewOwner->GetSelectedIds().Num();
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Expand / Grow Selection"), TEXT("GROW"), TEXT("sel:grow")));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Shrink Selection"), TEXT("SHRK"), TEXT("sel:shrink")));
+            RootItems.Add(FNGonPieItem::Leaf(TEXT("Vertex Loop (2 Shared Edge)"), TEXT("LOOP"), TEXT("sel:vtx_loop"), SelCount >= 2));
+            RootItems.Add(FNGonPieItem::Leaf(TEXT("Shortest Path (2 Vtx)"), TEXT("PATH"), TEXT("sel:shortest_path"), SelCount >= 2));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Weld Vertices"), TEXT("WELD"), TEXT("mesh:weld"), SelCount >= 2));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Cut Face (2 Vtx)"), TEXT("CUT"), TEXT("mesh:cut_face"), SelCount >= 2));
-            RootItems.Add(FNGonPieItem::Leaf(TEXT("Fill Hole (3+ Vtx)"), TEXT("FILL"), TEXT("mesh:fill_hole"), SelCount >= 3));
-            RootItems.Add(FNGonPieItem::Leaf(TEXT("Smooth Vertices"), TEXT("SMTH"), TEXT("mesh:smooth")));
-            RootItems.Add(FNGonPieItem::Branch(TEXT("Select / Convert"), TEXT("SEL"), {
+            RootItems.Add(FNGonPieItem::Branch(TEXT("Select / Edit"), TEXT("SEL"), {
+                FNGonPieItem::Leaf(TEXT("Fill Hole (3+ Vtx)"), TEXT("FIL"), TEXT("mesh:fill_hole"), SelCount >= 3),
+                FNGonPieItem::Leaf(TEXT("Smooth Vertices"), TEXT("SMT"), TEXT("mesh:smooth")),
                 FNGonPieItem::Leaf(TEXT("Linked Shell"), TEXT("SHL"), TEXT("sel:linked")),
                 FNGonPieItem::Leaf(TEXT("Invert Selection"), TEXT("INV"), TEXT("sel:invert")),
                 FNGonPieItem::Leaf(TEXT("Convert -> Edges"), TEXT("EDG"), TEXT("sel:to_edge")),
@@ -993,6 +1069,7 @@ private:
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Collapse Edge"), TEXT("CLPS"), TEXT("mesh:collapse_edge")));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Bridge Edges (2)"), TEXT("BRDG"), TEXT("mesh:bridge"), SelCount >= 2));
             RootItems.Add(FNGonPieItem::Branch(TEXT("Expand / Select"), TEXT("SEL"), {
+                FNGonPieItem::Leaf(TEXT("Shortest Path (2 Edges)"), TEXT("PTH"), TEXT("sel:shortest_path"), SelCount >= 2),
                 FNGonPieItem::Leaf(TEXT("Expand / Grow Selection"), TEXT("GRW"), TEXT("sel:grow")),
                 FNGonPieItem::Leaf(TEXT("Shrink Selection"), TEXT("SHR"), TEXT("sel:shrink")),
                 FNGonPieItem::Leaf(TEXT("Boundary Edges"), TEXT("BND"), TEXT("sel:boundary")),
@@ -1030,10 +1107,12 @@ private:
                 FNGonPieItem::Leaf(TEXT("Smooth Region"), TEXT("SMT"), TEXT("mesh:smooth")),
                 FNGonPieItem::Leaf(TEXT("Noise Displace"), TEXT("NSE"), TEXT("mesh:noise"))
             }));
+            const int32 FaceSelCount = PreviewOwner->GetSelectedIds().Num();
             RootItems.Add(FNGonPieItem::Branch(TEXT("Expand / Select"), TEXT("SEL"), {
+                FNGonPieItem::Leaf(TEXT("Face Loop (2 Shared Edge)"), TEXT("FLP"), TEXT("sel:face_loop")),
+                FNGonPieItem::Leaf(TEXT("Shortest Path (2 Faces)"), TEXT("PTH"), TEXT("sel:shortest_path"), FaceSelCount >= 2),
                 FNGonPieItem::Leaf(TEXT("Expand / Grow Selection"), TEXT("GRW"), TEXT("sel:grow")),
                 FNGonPieItem::Leaf(TEXT("Shrink Selection"), TEXT("SHR"), TEXT("sel:shrink")),
-                FNGonPieItem::Leaf(TEXT("Face Loop"), TEXT("FLP"), TEXT("sel:face_loop")),
                 FNGonPieItem::Leaf(TEXT("Linked Shell"), TEXT("SHL"), TEXT("sel:linked")),
                 FNGonPieItem::Leaf(TEXT("Invert Selection"), TEXT("INV"), TEXT("sel:invert")),
                 FNGonPieItem::Leaf(TEXT("Convert -> Vertices"), TEXT("VTX"), TEXT("sel:to_vertex")),
@@ -1155,6 +1234,8 @@ private:
         else if (Cmd == TEXT("sel:shrink")) FNGonMeshAPI::ShrinkSelection(PreviewOwner.Get());
         else if (Cmd == TEXT("sel:invert")) FNGonMeshAPI::InvertSelection(PreviewOwner.Get());
         else if (Cmd == TEXT("sel:clear")) PreviewOwner->ClearSelection();
+        else if (Cmd == TEXT("sel:vtx_loop")) FNGonMeshAPI::SelectVertexLoop(PreviewOwner.Get());
+        else if (Cmd == TEXT("sel:shortest_path")) FNGonMeshAPI::SelectShortestPath(PreviewOwner.Get());
         else if (Cmd == TEXT("sel:edge_loop")) FNGonMeshAPI::SelectEdgeLoop(PreviewOwner.Get());
         else if (Cmd == TEXT("sel:edge_ring")) FNGonMeshAPI::SelectEdgeRing(PreviewOwner.Get());
         else if (Cmd == TEXT("sel:face_loop")) FNGonMeshAPI::SelectFaceLoop(PreviewOwner.Get());

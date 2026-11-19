@@ -104,13 +104,17 @@ void SNGonPreview::Construct(const FArguments& InArgs)
     InitUIState.ViewportPtr = Viewport.Get();
     InitUIState.OnViewportBonePicked = [this](int32 PickedBoneIdx)
     {
+        GetSkeletonTreeUIState(this).SelectedSocketIndex = INDEX_NONE;
         if (SkeletonBones.IsValidIndex(PickedBoneIdx))
         {
-            GetSkeletonTreeUIState(this).SelectedSocketIndex = INDEX_NONE;
             SelectedBoneIndex = PickedBoneIdx;
             ActiveLowerTab = ENGonRightLowerTab::Details;
-            RebuildSkeletonTreeList();
         }
+        else
+        {
+            SelectedBoneIndex = INDEX_NONE;
+        }
+        RebuildSkeletonTreeList();
     };
     InitUIState.OnViewportBoneTransformChanged = [this]()
     {
@@ -801,6 +805,12 @@ void SNGonPreview::SetSelectionMode(ENGonElement Element)
     if (Element == ENGonElement::Vertex)
     {
         bShowVertices = true;
+    }
+    if (SelectedBoneIndex != INDEX_NONE)
+    {
+        SelectedBoneIndex = INDEX_NONE;
+        NGon::SelectSceneBone(&Viewport->Preview(), INDEX_NONE, false);
+        RebuildSkeletonTreeList();
     }
     Viewport->SetSelectionMode(Element);
 }

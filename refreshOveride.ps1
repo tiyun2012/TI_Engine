@@ -1,0 +1,1 @@
+Get-ChildItem ".\Plugins\NGon\Source\NGon\Private\*" | ForEach-Object { $_.LastWriteTime = Get-Date }

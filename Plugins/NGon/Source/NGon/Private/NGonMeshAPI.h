@@ -241,6 +241,9 @@ public:
     static FNGonMeshOpResult SelectEdgeRing(FNGonPreviewScene& Scene, int32 StartEdgeId = INDEX_NONE, bool bAdd = false);
     static FNGonMeshOpResult SelectFaceLoop(FNGonPreviewScene& Scene, int32 StartEdgeId = INDEX_NONE, bool bAdd = false);
     static FNGonMeshOpResult SelectLinkedShell(FNGonPreviewScene& Scene);
+    static FNGonMeshOpResult SelectVertexLoop(FNGonPreviewScene& Scene, int32 AnchorVert = INDEX_NONE, int32 TargetVert = INDEX_NONE, bool bAdd = false);
+    static FNGonMeshOpResult SelectShortestPath(FNGonPreviewScene& Scene, int32 AnchorId = INDEX_NONE, int32 TargetId = INDEX_NONE, bool bAdd = false);
+    static FNGonMeshOpResult SelectDoubleClickGesture(FNGonPreviewScene& Scene, ENGonElement Element, int32 AnchorId, int32 TargetId, bool bAdd = false);
     static FNGonMeshOpResult ConvertSelection(FNGonPreviewScene& Scene, ENGonElement TargetElement);
 
     // --- Topology & Manifold Analysis ---

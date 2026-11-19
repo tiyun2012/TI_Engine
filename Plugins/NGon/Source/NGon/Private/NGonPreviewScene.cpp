@@ -2295,7 +2295,6 @@ void SetXRayEnabled(FNGonPreviewScene* Scene, bool bEnable)
 {
     if (!Scene) return;
     GetDisplayState(Scene).bXRayEnabled = bEnable;
-    Scene->SetHeatmapVisible(Scene->IsHeatmapVisible());
     // Force surface material refresh
     Scene->SetSoftSelection(Scene->GetSoftSelectionSettings());
 }

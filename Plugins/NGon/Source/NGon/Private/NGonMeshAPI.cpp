@@ -1,4 +1,5 @@
 #include "NGonMeshAPI.h"
+#include "Algo/Reverse.h"
 #include "NGonPreviewScene.h"
 #include "NGonSceneSkeleton.h"
 
@@ -2713,6 +2714,440 @@ FNGonMeshOpResult FNGonMeshAPI::SelectLinkedShell(FNGonPreviewScene& Scene)
     Res.SelectedIds.Sort();
     Res.Message = FString::Printf(TEXT("Selected linked shell (%d element(s))."), LinkedIds.Num());
     return Res;
+}
+
+namespace
+{
+int32 FindEdgeBetweenVertices(const FNGonTopology& Topo, int32 V0, int32 V1)
+{
+    if (V0 == V1 || V0 < 0 || V1 < 0) return INDEX_NONE;
+    for (int32 e = 0; e < Topo.Edges.Num(); ++e)
+    {
+        const FIntPoint& E = Topo.Edges[e];
+        if ((E.X == V0 && E.Y == V1) || (E.X == V1 && E.Y == V0))
+        {
+            return e;
+        }
+    }
+    return INDEX_NONE;
+}
+
+int32 FindSharedEdgeBetweenFaces(const FNGonTopology& Topo, int32 FaceA, int32 FaceB)
+{
+    const FNGonFace* FA = Topo.Faces.Find(FaceA);
+    const FNGonFace* FB = Topo.Faces.Find(FaceB);
+    if (!FA || !FB || FA->Perimeter.Num() < 3 || FB->Perimeter.Num() < 3) return INDEX_NONE;
+
+    TSet<uint64> EdgesA;
+    const int32 NA = FA->Perimeter.Num();
+    for (int32 i = 0; i < NA; ++i)
+    {
+        const int32 A = FA->Perimeter[i];
+        const int32 B = FA->Perimeter[(i + 1) % NA];
+        const uint64 Key = (static_cast<uint64>(FMath::Min(A, B)) << 32) | static_cast<uint32>(FMath::Max(A, B));
+        EdgesA.Add(Key);
+    }
+
+    const int32 NB = FB->Perimeter.Num();
+    for (int32 i = 0; i < NB; ++i)
+    {
+        const int32 A = FB->Perimeter[i];
+        const int32 B = FB->Perimeter[(i + 1) % NB];
+        const uint64 Key = (static_cast<uint64>(FMath::Min(A, B)) << 32) | static_cast<uint32>(FMath::Max(A, B));
+        if (EdgesA.Contains(Key))
+        {
+            return FindEdgeBetweenVertices(Topo, A, B);
+        }
+    }
+    return INDEX_NONE;
+}
+
+bool AreEdgesOppositeInQuad(const FNGonTopology& Topo, int32 EdgeA, int32 EdgeB)
+{
+    if (!Topo.Edges.IsValidIndex(EdgeA) || !Topo.Edges.IsValidIndex(EdgeB) || EdgeA == EdgeB) return false;
+    const FIntPoint EA = Topo.Edges[EdgeA];
+    const FIntPoint EB = Topo.Edges[EdgeB];
+    for (const TPair<int32, FNGonFace>& Pair : Topo.Faces)
+    {
+        const TArray<int32>& P = Pair.Value.Perimeter;
+        if (P.Num() != 4) continue;
+        int32 IdxA = INDEX_NONE, IdxB = INDEX_NONE;
+        for (int32 i = 0; i < 4; ++i)
+        {
+            const int32 U = P[i];
+            const int32 V = P[(i + 1) % 4];
+            if ((U == EA.X && V == EA.Y) || (U == EA.Y && V == EA.X)) IdxA = i;
+            if ((U == EB.X && V == EB.Y) || (U == EB.Y && V == EB.X)) IdxB = i;
+        }
+        if (IdxA != INDEX_NONE && IdxB != INDEX_NONE && ((IdxA + 2) % 4 == IdxB))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AreEdgesLoopAdjacent(const FNGonTopology& Topo, int32 EdgeA, int32 EdgeB)
+{
+    if (!Topo.Edges.IsValidIndex(EdgeA) || !Topo.Edges.IsValidIndex(EdgeB) || EdgeA == EdgeB) return false;
+    const FIntPoint EA = Topo.Edges[EdgeA];
+    const FIntPoint EB = Topo.Edges[EdgeB];
+    int32 SharedV = INDEX_NONE;
+    if (EA.X == EB.X || EA.X == EB.Y) SharedV = EA.X;
+    else if (EA.Y == EB.X || EA.Y == EB.Y) SharedV = EA.Y;
+    if (SharedV == INDEX_NONE) return false;
+
+    // Loop continuation edges share a vertex but do NOT share a face
+    for (const TPair<int32, FNGonFace>& Pair : Topo.Faces)
+    {
+        const TArray<int32>& P = Pair.Value.Perimeter;
+        bool bHasA = false, bHasB = false;
+        const int32 N = P.Num();
+        for (int32 i = 0; i < N; ++i)
+        {
+            const int32 U = P[i];
+            const int32 V = P[(i + 1) % N];
+            if ((U == EA.X && V == EA.Y) || (U == EA.Y && V == EA.X)) bHasA = true;
+            if ((U == EB.X && V == EB.Y) || (U == EB.Y && V == EB.X)) bHasB = true;
+        }
+        if (bHasA && bHasB)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+TArray<int32> RunDijkstraPath(int32 NodeCount, int32 StartNode, int32 EndNode, const TArray<TArray<TPair<int32, double>>>& Adj)
+{
+    TArray<int32> Path;
+    if (StartNode < 0 || StartNode >= NodeCount || EndNode < 0 || EndNode >= NodeCount) return Path;
+    if (StartNode == EndNode) { Path.Add(StartNode); return Path; }
+
+    TArray<double> Dist;
+    TArray<int32> Prev;
+    TArray<uint8> Visited;
+    Dist.Init(TNumericLimits<double>::Max(), NodeCount);
+    Prev.Init(INDEX_NONE, NodeCount);
+    Visited.Init(0, NodeCount);
+
+    struct FHeapEntry
+    {
+        double Cost;
+        int32 Node;
+        bool operator<(const FHeapEntry& Other) const { return Cost < Other.Cost; }
+    };
+    TArray<FHeapEntry> Heap;
+    Dist[StartNode] = 0.0;
+    Heap.HeapPush({ 0.0, StartNode });
+
+    while (!Heap.IsEmpty())
+    {
+        FHeapEntry Top;
+        Heap.HeapPop(Top, EAllowShrinking::No);
+        if (Visited[Top.Node]) continue;
+        Visited[Top.Node] = 1;
+        if (Top.Node == EndNode) break;
+
+        for (const TPair<int32, double>& Link : Adj[Top.Node])
+        {
+            const int32 Next = Link.Key;
+            if (Visited[Next]) continue;
+            const double Cand = Top.Cost + FMath::Max(Link.Value, 1.e-6);
+            if (Cand < Dist[Next])
+            {
+                Dist[Next] = Cand;
+                Prev[Next] = Top.Node;
+                Heap.HeapPush({ Cand, Next });
+            }
+        }
+    }
+
+    if (Prev[EndNode] == INDEX_NONE) return Path;
+    for (int32 Cur = EndNode; Cur != INDEX_NONE; Cur = Prev[Cur])
+    {
+        Path.Add(Cur);
+    }
+    Algo::Reverse(Path);
+    return Path;
+}
+} // anonymous namespace
+
+FNGonMeshOpResult FNGonMeshAPI::SelectVertexLoop(FNGonPreviewScene& Scene, int32 AnchorVert, int32 TargetVert, bool bAdd)
+{
+    FNGonMeshOpResult Res;
+    Res.Operation = TEXT("select_vertex_loop");
+    const FNGonTopology& Topo = Scene.GetTopology();
+
+    int32 StartEdge = FindEdgeBetweenVertices(Topo, AnchorVert, TargetVert);
+    if (StartEdge == INDEX_NONE && Scene.GetSelectedElement() == ENGonElement::Vertex)
+    {
+        const TArray<int32> SelArr = Scene.GetSelectedIds().Array();
+        const int32 Active = Scene.GetActiveSelectedId();
+        for (int32 i = 0; i < SelArr.Num() && StartEdge == INDEX_NONE; ++i)
+        {
+            if (Active != INDEX_NONE && SelArr[i] != Active)
+            {
+                StartEdge = FindEdgeBetweenVertices(Topo, Active, SelArr[i]);
+            }
+        }
+        for (int32 i = 0; i < SelArr.Num() && StartEdge == INDEX_NONE; ++i)
+        {
+            for (int32 j = i + 1; j < SelArr.Num() && StartEdge == INDEX_NONE; ++j)
+            {
+                StartEdge = FindEdgeBetweenVertices(Topo, SelArr[i], SelArr[j]);
+            }
+        }
+    }
+
+    if (StartEdge == INDEX_NONE)
+    {
+        Res.Message = TEXT("Select two vertices that share an edge to select a vertex loop.");
+        return Res;
+    }
+
+    const TSet<int32> PrevSel = bAdd && Scene.GetSelectedElement() == ENGonElement::Vertex ? Scene.GetSelectedIds() : TSet<int32>();
+    if (!Scene.SelectEdgeLoop(StartEdge, false))
+    {
+        Res.Message = TEXT("Could not trace a quad vertex loop from the selected edge.");
+        return Res;
+    }
+
+    TSet<int32> LoopVerts = PrevSel;
+    for (const int32 EdgeId : Scene.GetSelectedIds())
+    {
+        if (Topo.Edges.IsValidIndex(EdgeId))
+        {
+            LoopVerts.Add(Topo.Edges[EdgeId].X);
+            LoopVerts.Add(Topo.Edges[EdgeId].Y);
+        }
+    }
+    Scene.SetSelectionSet(ENGonElement::Vertex, LoopVerts, false);
+    Res.bOk = !LoopVerts.IsEmpty();
+    Res.Message = FString::Printf(TEXT("Selected vertex loop (%d vertices)."), LoopVerts.Num());
+    return Res;
+}
+
+FNGonMeshOpResult FNGonMeshAPI::SelectShortestPath(FNGonPreviewScene& Scene, int32 AnchorId, int32 TargetId, bool bAdd)
+{
+    FNGonMeshOpResult Res;
+    Res.Operation = TEXT("select_shortest_path");
+    const FNGonTopology& Topo = Scene.GetTopology();
+    const TArray<FVector>& Pos = Scene.GetPositions();
+    const ENGonElement Elem = Scene.GetSelectedElement();
+
+    if (AnchorId == INDEX_NONE || TargetId == INDEX_NONE)
+    {
+        const TArray<int32> SelArr = Scene.GetSelectedIds().Array();
+        if (SelArr.Num() < 2)
+        {
+            Res.Message = TEXT("Select at least 2 elements (start and end) for shortest path.");
+            return Res;
+        }
+        const int32 Active = Scene.GetActiveSelectedId();
+        TargetId = (Active != INDEX_NONE && Scene.GetSelectedIds().Contains(Active)) ? Active : SelArr.Last();
+        AnchorId = (SelArr[0] != TargetId) ? SelArr[0] : SelArr[1];
+    }
+
+    TSet<int32> PathSet;
+    if (bAdd)
+    {
+        PathSet = Scene.GetSelectedIds();
+    }
+
+    if (Elem == ENGonElement::Vertex)
+    {
+        const int32 N = Pos.Num();
+        TArray<TArray<TPair<int32, double>>> Adj;
+        Adj.SetNum(N);
+        for (const FIntPoint& E : Topo.Edges)
+        {
+            if (Pos.IsValidIndex(E.X) && Pos.IsValidIndex(E.Y))
+            {
+                const double Len = FVector::Distance(Pos[E.X], Pos[E.Y]);
+                Adj[E.X].Add({ E.Y, Len });
+                Adj[E.Y].Add({ E.X, Len });
+            }
+        }
+        const TArray<int32> Path = RunDijkstraPath(N, AnchorId, TargetId, Adj);
+        for (const int32 V : Path) PathSet.Add(V);
+    }
+    else if (Elem == ENGonElement::Edge)
+    {
+        const int32 NE = Topo.Edges.Num();
+        TArray<TArray<int32>> VertToEdges;
+        VertToEdges.SetNum(Pos.Num());
+        TArray<FVector> Midpoints;
+        Midpoints.SetNum(NE);
+        for (int32 e = 0; e < NE; ++e)
+        {
+            const FIntPoint& E = Topo.Edges[e];
+            if (Pos.IsValidIndex(E.X) && Pos.IsValidIndex(E.Y))
+            {
+                VertToEdges[E.X].Add(e);
+                VertToEdges[E.Y].Add(e);
+                Midpoints[e] = (Pos[E.X] + Pos[E.Y]) * 0.5;
+            }
+        }
+        TArray<TArray<TPair<int32, double>>> Adj;
+        Adj.SetNum(NE);
+        for (const TArray<int32>& Inc : VertToEdges)
+        {
+            for (int32 i = 0; i < Inc.Num(); ++i)
+            {
+                for (int32 j = i + 1; j < Inc.Num(); ++j)
+                {
+                    const int32 A = Inc[i], B = Inc[j];
+                    const double D = FVector::Distance(Midpoints[A], Midpoints[B]);
+                    Adj[A].Add({ B, D });
+                    Adj[B].Add({ A, D });
+                }
+            }
+        }
+        const TArray<int32> Path = RunDijkstraPath(NE, AnchorId, TargetId, Adj);
+        for (const int32 E : Path) PathSet.Add(E);
+    }
+    else
+    {
+        TArray<int32> FaceIds;
+        TMap<int32, int32> FaceToDense;
+        Topo.Faces.GetKeys(FaceIds);
+        const int32 NF = FaceIds.Num();
+        TArray<FVector> Centroids;
+        Centroids.SetNum(NF);
+        TMap<uint64, TArray<int32, TInlineAllocator<2>>> EdgeToFaces;
+        for (int32 i = 0; i < NF; ++i)
+        {
+            FaceToDense.Add(FaceIds[i], i);
+            const FNGonFace& F = Topo.Faces[FaceIds[i]];
+            FVector C = FVector::ZeroVector;
+            int32 Cnt = 0;
+            const int32 PNum = F.Perimeter.Num();
+            for (int32 k = 0; k < PNum; ++k)
+            {
+                const int32 A = F.Perimeter[k];
+                const int32 B = F.Perimeter[(k + 1) % PNum];
+                if (Pos.IsValidIndex(A)) { C += Pos[A]; ++Cnt; }
+                const uint64 Key = (static_cast<uint64>(FMath::Min(A, B)) << 32) | static_cast<uint32>(FMath::Max(A, B));
+                EdgeToFaces.FindOrAdd(Key).AddUnique(i);
+            }
+            Centroids[i] = Cnt > 0 ? (C / static_cast<double>(Cnt)) : FVector::ZeroVector;
+        }
+        const int32* StartDense = FaceToDense.Find(AnchorId);
+        const int32* EndDense = FaceToDense.Find(TargetId);
+        if (StartDense && EndDense)
+        {
+            TArray<TArray<TPair<int32, double>>> Adj;
+            Adj.SetNum(NF);
+            for (const auto& Pair : EdgeToFaces)
+            {
+                const auto& FList = Pair.Value;
+                for (int32 i = 0; i < FList.Num(); ++i)
+                {
+                    for (int32 j = i + 1; j < FList.Num(); ++j)
+                    {
+                        const int32 A = FList[i], B = FList[j];
+                        const double D = FVector::Distance(Centroids[A], Centroids[B]);
+                        Adj[A].Add({ B, D });
+                        Adj[B].Add({ A, D });
+                    }
+                }
+            }
+            const TArray<int32> DensePath = RunDijkstraPath(NF, *StartDense, *EndDense, Adj);
+            for (const int32 DIdx : DensePath) PathSet.Add(FaceIds[DIdx]);
+        }
+    }
+
+    if (PathSet.IsEmpty())
+    {
+        Res.Message = TEXT("No connected shortest path found between the two elements.");
+        return Res;
+    }
+
+    Scene.SetSelectionSet(Elem, PathSet, false);
+    Res.bOk = true;
+    Res.Message = FString::Printf(TEXT("Selected shortest path (%d items)."), PathSet.Num());
+    return Res;
+}
+
+FNGonMeshOpResult FNGonMeshAPI::SelectDoubleClickGesture(
+    FNGonPreviewScene& Scene, ENGonElement Element, int32 AnchorId, int32 TargetId, bool bAdd)
+{
+    FNGonMeshOpResult Res;
+    Res.Operation = TEXT("double_click_gesture");
+    const FNGonTopology& Topo = Scene.GetTopology();
+
+    if (TargetId == INDEX_NONE)
+    {
+        return Res;
+    }
+
+    if (Element == ENGonElement::Vertex)
+    {
+        if (AnchorId != INDEX_NONE && AnchorId != TargetId)
+        {
+            if (FindEdgeBetweenVertices(Topo, AnchorId, TargetId) != INDEX_NONE)
+            {
+                return SelectVertexLoop(Scene, AnchorId, TargetId, bAdd);
+            }
+            // Not sharing an edge -> shortest path of vertices!
+            TSet<int32> Init = bAdd ? Scene.GetSelectedIds() : TSet<int32>();
+            Init.Add(AnchorId);
+            Init.Add(TargetId);
+            Scene.SetSelectionSet(ENGonElement::Vertex, Init, false);
+            return SelectShortestPath(Scene, AnchorId, TargetId, bAdd);
+        }
+        // Single vertex double-click with no separate anchor: select vertex
+        TSet<int32> One;
+        One.Add(TargetId);
+        Scene.SetSelectionSet(ENGonElement::Vertex, One, bAdd);
+        Res.bOk = true;
+        return Res;
+    }
+
+    if (Element == ENGonElement::Edge)
+    {
+        if (AnchorId != INDEX_NONE && AnchorId != TargetId)
+        {
+            if (AreEdgesLoopAdjacent(Topo, AnchorId, TargetId))
+            {
+                return SelectEdgeLoop(Scene, TargetId, bAdd);
+            }
+            if (AreEdgesOppositeInQuad(Topo, AnchorId, TargetId))
+            {
+                return SelectEdgeRing(Scene, TargetId, bAdd);
+            }
+            // Non-adjacent edges -> shortest path of edges!
+            TSet<int32> Init = bAdd ? Scene.GetSelectedIds() : TSet<int32>();
+            Init.Add(AnchorId);
+            Init.Add(TargetId);
+            Scene.SetSelectionSet(ENGonElement::Edge, Init, false);
+            return SelectShortestPath(Scene, AnchorId, TargetId, bAdd);
+        }
+        // Classic Maya single-edge double-click -> Edge Loop
+        return SelectEdgeLoop(Scene, TargetId, bAdd);
+    }
+
+    // Face mode
+    if (AnchorId != INDEX_NONE && AnchorId != TargetId)
+    {
+        const int32 SharedEdge = FindSharedEdgeBetweenFaces(Topo, AnchorId, TargetId);
+        if (SharedEdge != INDEX_NONE)
+        {
+            return SelectFaceLoop(Scene, SharedEdge, bAdd);
+        }
+        // Non-adjacent faces -> shortest path of faces!
+        TSet<int32> Init = bAdd ? Scene.GetSelectedIds() : TSet<int32>();
+        Init.Add(AnchorId);
+        Init.Add(TargetId);
+        Scene.SetSelectionSet(ENGonElement::Face, Init, false);
+        return SelectShortestPath(Scene, AnchorId, TargetId, bAdd);
+    }
+    // Single face double-click -> Linked Shell
+    TSet<int32> OneFace;
+    OneFace.Add(TargetId);
+    Scene.SetSelectionSet(ENGonElement::Face, OneFace, bAdd);
+    return SelectLinkedShell(Scene);
 }
 
 FNGonMeshOpResult FNGonMeshAPI::ConvertSelection(FNGonPreviewScene& Scene, ENGonElement TargetElement)

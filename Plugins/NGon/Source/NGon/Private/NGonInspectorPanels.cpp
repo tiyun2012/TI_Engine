@@ -1733,6 +1733,24 @@ TSharedRef<SWidget> SNGonPreview::MakePreviewSettingsTab()
             [
                 SNew(STextBlock).Text(LOCTEXT("PrefShowVertices", "Show Logical Vertices Overlay"))
             ]
+        ]
+        + SVerticalBox::Slot()
+        .AutoHeight()
+        .Padding(0.0f, 3.0f)
+        [
+            SNew(SCheckBox)
+            .IsChecked_Lambda([this]
+            {
+                return GetSkeletonTreeUIState(this).bBackfaceSelect ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+            })
+            .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+            {
+                GetSkeletonTreeUIState(this).bBackfaceSelect = (State == ECheckBoxState::Checked);
+            })
+            [
+                SNew(STextBlock).Text(LOCTEXT("PrefBackfaceFilter", "Camera / Ray Backface Selection Filter"))
+            ]
+        ]
         + SVerticalBox::Slot()
         .AutoHeight()
         .Padding(0.0f, 4.0f, 0.0f, 2.0f)
@@ -1791,7 +1809,6 @@ TSharedRef<SWidget> SNGonPreview::MakePreviewSettingsTab()
                     return FText::FromString(FString::Printf(TEXT("%.2f"), Op));
                 })
             ]
-        ]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 3.0f)
         [
