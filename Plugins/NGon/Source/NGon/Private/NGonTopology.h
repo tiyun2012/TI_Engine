@@ -11,6 +11,18 @@ struct FNGonFace
     TArray<int32> Triangles;
 };
 
+struct FNGonSubMeshInfo
+{
+    int32 SubMeshIndex = 0;
+    FName Name = NAME_None;
+    FName ParentName = NAME_None;
+    int32 FirstFaceId = 0;
+    int32 FaceCount = 0;
+    int32 FirstVertexId = 0;
+    int32 VertexCount = 0;
+    bool bVisible = true;
+};
+
 // Logical vertices use dense indices. Source IDs remain available for inspection.
 // Vertex instances for UVs and normals can share one logical vertex.
 struct FNGonTopology
@@ -23,6 +35,8 @@ struct FNGonTopology
     FBox RestBounds{ForceInit};
     int32 TriangleCount = 0;
     int32 MaxFaceCorners = 0;
+    TArray<FNGonSubMeshInfo> SubMeshes;
+    TMap<int32, int32> FaceToSubMesh;
 };
 
 struct FNGonMeshData

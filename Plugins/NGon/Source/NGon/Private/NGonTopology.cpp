@@ -176,10 +176,25 @@ bool NGon::ConvertMeshDescription(const FMeshDescription& Source, FNGonMeshData&
 
     const auto Positions = FStaticMeshConstAttributes(Source).GetVertexPositions();
     TMap<int32, int32> SourceToLogical;
+    TMap<int32, int32> GroupToSubMesh;
     TSet<FIntPoint> UniqueEdges;
     for (const FPolygonID PolygonId : Source.Polygons().GetElementIDs())
     {
-        FNGonFace& Face = Topology.Faces.Add(PolygonId.GetValue());
+        const int32 FaceIdVal = PolygonId.GetValue();
+        FNGonFace& Face = Topology.Faces.Add(FaceIdVal);
+        const int32 GroupVal = Source.GetPolygonPolygonGroup(PolygonId).GetValue();
+        int32* SubIdxPtr = GroupToSubMesh.Find(GroupVal);
+        if (!SubIdxPtr)
+        {
+            const int32 NewSubIdx = Topology.SubMeshes.Num();
+            FNGonSubMeshInfo& Sub = Topology.SubMeshes.AddDefaulted_GetRef();
+            Sub.SubMeshIndex = NewSubIdx;
+            Sub.Name = FName(*FString::Printf(TEXT("MeshSection_%d"), NewSubIdx));
+            Sub.FirstFaceId = FaceIdVal;
+            SubIdxPtr = &GroupToSubMesh.Add(GroupVal, NewSubIdx);
+        }
+        ++Topology.SubMeshes[*SubIdxPtr].FaceCount;
+        Topology.FaceToSubMesh.Add(FaceIdVal, *SubIdxPtr);
         const auto Instances = Source.GetPolygonVertexInstances(PolygonId);
         for (const FVertexInstanceID Instance : Instances)
         {

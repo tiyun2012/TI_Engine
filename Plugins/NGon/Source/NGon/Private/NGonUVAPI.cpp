@@ -1,4 +1,5 @@
 #include "NGonUVAPI.h"
+#include "NGonUndoTree.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -17,7 +18,7 @@ struct FNGonUVSnapshot
 
 struct FNGonUVHistoryBuffer
 {
-    static constexpr int32 MaxHistory = 64;
+    static constexpr int32 MaxHistory = 20;
     TArray<FNGonUVSnapshot> UndoStack;
     TArray<FNGonUVSnapshot> RedoStack;
 };
@@ -184,12 +185,29 @@ void FNGonUVAPI::PushUndoSnapshot(const FNGonUVDocument& Doc)
 {
     if (Doc.IsEmpty()) return;
     FNGonUVHistoryBuffer& Hist = GUVHistoryMap.FindOrAdd(&Doc);
-    Hist.UndoStack.Add(CaptureUVSnapshot(Doc));
+    const FNGonUVSnapshot Snap = CaptureUVSnapshot(Doc);
+    Hist.UndoStack.Add(Snap);
     if (Hist.UndoStack.Num() > FNGonUVHistoryBuffer::MaxHistory)
     {
         Hist.UndoStack.RemoveAt(0);
     }
     Hist.RedoStack.Reset();
+
+    if (const TSharedPtr<FNGonUndoSession> Session = NGon::Undo::GetActiveSession(); Session.IsValid() && !Session->IsApplyingHistory())
+    {
+        FNGonUVDocument* DocPtr = const_cast<FNGonUVDocument*>(&Doc);
+        const SIZE_T ApproxBytes = static_cast<SIZE_T>(Snap.ElementUV.Num()) * sizeof(FVector2f);
+        TSharedPtr<INGonUndoPayload> Payload = MakeShared<FNGonLambdaUndoPayload>(
+            [DocPtr]() -> bool { return FNGonUVAPI::Undo(*DocPtr).bOk; },
+            [DocPtr]() -> bool { return FNGonUVAPI::Redo(*DocPtr).bOk; },
+            ApproxBytes);
+        Session->PushEdit(
+            ENGonUndoContextId::UV,
+            FString::Printf(TEXT("UV Edit (%d UVs)"), Snap.ElementUV.Num()),
+            ENGonUndoEditKind::Structural,
+            MoveTemp(Payload),
+            ApproxBytes);
+    }
 }
 
 bool FNGonUVAPI::CanUndo(const FNGonUVDocument* Doc)
@@ -807,20 +825,136 @@ FNGonUVOpResult FNGonUVAPI::RelaxSelected(FNGonUVDocument& Doc, int32 Iterations
         return Res;
     }
 
-    TMap<int32, TArray<int32>> Neighbors;
-    for (const FNGonUVDocument::FTriangle& Tri : Doc.GetTriangles())
+    const TArray<FNGonUVDocument::FTriangle>& Tris = Doc.GetTriangles();
+
+    // Build 3D Mean Value Coordinate (MVC) conformal weights per UV element.
+    // MVC weights are strictly positive for all non-degenerate 3D triangles and
+    // reproduce any linear/conformal UV map exactly (zero drift on good UVs,
+    // regardless of non-uniform quad aspect ratios or triangulation diagonals).
+    TMap<int32, TMap<int32, double>> MvcWeights;
+    TMap<int32, TArray<int32>> IncidentTris;
+
+    // Also track polygon edges (excluding internal quad/ngon triangulation diagonals)
+    // as a clean fallback if a triangle has degenerate/missing 3D positions.
+    struct FPolyEdgeInfo
     {
+        int32 A = INDEX_NONE;
+        int32 B = INDEX_NONE;
+        int32 FaceA = INDEX_NONE;
+        int32 FaceB = INDEX_NONE;
+        int32 Count = 0;
+    };
+    TMap<uint64, FPolyEdgeInfo> EdgeAccum;
+    EdgeAccum.Reserve(Tris.Num() * 2);
+
+    for (int32 TriIdx = 0; TriIdx < Tris.Num(); ++TriIdx)
+    {
+        const FNGonUVDocument::FTriangle& Tri = Tris[TriIdx];
         for (int32 c = 0; c < 3; ++c)
         {
-            const int32 A = Tri.Element[c];
-            const int32 B = Tri.Element[(c + 1) % 3];
-            if (A != INDEX_NONE && B != INDEX_NONE && A != B)
+            const int32 I = Tri.Element[c];
+            const int32 J = Tri.Element[(c + 1) % 3];
+            const int32 K = Tri.Element[(c + 2) % 3];
+            if (I == INDEX_NONE) continue;
+
+            IncidentTris.FindOrAdd(I).Add(TriIdx);
+
+            if (J != INDEX_NONE && I != J)
             {
-                Neighbors.FindOrAdd(A).AddUnique(B);
-                Neighbors.FindOrAdd(B).AddUnique(A);
+                const int32 MinE = FMath::Min(I, J);
+                const int32 MaxE = FMath::Max(I, J);
+                const uint64 Key = (static_cast<uint64>(static_cast<uint32>(MinE)) << 32)
+                    | static_cast<uint32>(MaxE);
+                FPolyEdgeInfo& Info = EdgeAccum.FindOrAdd(Key);
+                if (Info.Count == 0)
+                {
+                    Info.A = MinE;
+                    Info.B = MaxE;
+                    Info.FaceA = Tri.FaceId;
+                    Info.Count = 1;
+                }
+                else if (Info.Count == 1)
+                {
+                    Info.FaceB = Tri.FaceId;
+                    Info.Count = 2;
+                }
+                else
+                {
+                    ++Info.Count;
+                }
+            }
+
+            if (J == INDEX_NONE || K == INDEX_NONE || I == J || I == K || J == K) continue;
+
+            const FVector3d E1 = FVector3d(Tri.Pos3D[(c + 1) % 3] - Tri.Pos3D[c]);
+            const FVector3d E2 = FVector3d(Tri.Pos3D[(c + 2) % 3] - Tri.Pos3D[c]);
+            const double Len1 = E1.Length();
+            const double Len2 = E2.Length();
+            if (Len1 > 1e-6 && Len2 > 1e-6)
+            {
+                const double CosTheta = FMath::Clamp(FVector3d::DotProduct(E1, E2) / (Len1 * Len2), -0.999999, 0.999999);
+                const double TanHalf = FMath::Min(100.0, FMath::Sqrt(FMath::Max(0.0, (1.0 - CosTheta) / (1.0 + CosTheta))));
+                if (TanHalf > 1e-12)
+                {
+                    TMap<int32, double>& Row = MvcWeights.FindOrAdd(I);
+                    Row.FindOrAdd(J) += TanHalf / Len1;
+                    Row.FindOrAdd(K) += TanHalf / Len2;
+                }
             }
         }
     }
+
+    TMap<int32, TArray<int32>> PolyNeighbors;
+    for (const TPair<uint64, FPolyEdgeInfo>& Pair : EdgeAccum)
+    {
+        const FPolyEdgeInfo& Info = Pair.Value;
+        // Skip internal triangulation diagonals shared by the same polygon face
+        if (Info.Count == 2 && Info.FaceA != INDEX_NONE && Info.FaceA == Info.FaceB) continue;
+        PolyNeighbors.FindOrAdd(Info.A).AddUnique(Info.B);
+        PolyNeighbors.FindOrAdd(Info.B).AddUnique(Info.A);
+    }
+
+    // Pre-normalize weights into flat arrays for fast Gauss-Seidel iterations
+    TMap<int32, TArray<TPair<int32, float>>> NormalizedWeights;
+    NormalizedWeights.Reserve(Targets.Num());
+    for (const int32 ElemId : Targets)
+    {
+        TArray<TPair<int32, float>> Entry;
+        if (const TMap<int32, double>* Row = MvcWeights.Find(ElemId))
+        {
+            double SumW = 0.0;
+            for (const TPair<int32, double>& P : *Row) SumW += P.Value;
+            if (SumW > 1e-12)
+            {
+                Entry.Reserve(Row->Num());
+                for (const TPair<int32, double>& P : *Row)
+                {
+                    Entry.Emplace(P.Key, static_cast<float>(P.Value / SumW));
+                }
+            }
+        }
+        if (Entry.IsEmpty())
+        {
+            if (const TArray<int32>* Adj = PolyNeighbors.Find(ElemId))
+            {
+                if (!Adj->IsEmpty())
+                {
+                    const float InvN = 1.0f / static_cast<float>(Adj->Num());
+                    Entry.Reserve(Adj->Num());
+                    for (const int32 Nb : *Adj) Entry.Emplace(Nb, InvN);
+                }
+            }
+        }
+        if (!Entry.IsEmpty())
+        {
+            NormalizedWeights.Add(ElemId, MoveTemp(Entry));
+        }
+    }
+
+    auto TriSignedArea2D = [](const FVector2f& A, const FVector2f& B, const FVector2f& C) -> float
+    {
+        return (B.X - A.X) * (C.Y - A.Y) - (B.Y - A.Y) * (C.X - A.X);
+    };
 
     const TSet<int32> Border = bPinBorder ? FindBorderElements(Doc) : TSet<int32>();
     const int32 Iters = FMath::Clamp(Iterations, 1, 64);
@@ -828,26 +962,92 @@ FNGonUVOpResult FNGonUVAPI::RelaxSelected(FNGonUVDocument& Doc, int32 Iterations
 
     PushUndoSnapshot(Doc);
     TMap<int32, FVector2f> UVs = Doc.GetElementUVs();
+
+    // Gauss-Seidel iterations with per-vertex foldover protection
     for (int32 Iter = 0; Iter < Iters; ++Iter)
     {
-        TMap<int32, FVector2f> NextUVs = UVs;
         for (const int32 ElemId : Targets)
         {
             if (bPinBorder && Border.Contains(ElemId)) continue;
-            const TArray<int32>* Adj = Neighbors.Find(ElemId);
-            if (!Adj || Adj->IsEmpty()) continue;
-            FVector2f Avg = FVector2f::ZeroVector;
-            for (const int32 Nb : *Adj) Avg += UVs.FindRef(Nb);
-            Avg /= static_cast<float>(Adj->Num());
-            NextUVs[ElemId] = FMath::Lerp(UVs[ElemId], Avg, Alpha);
+            const TArray<TPair<int32, float>>* Weights = NormalizedWeights.Find(ElemId);
+            if (!Weights || Weights->IsEmpty()) continue;
+
+            const FVector2f CurUV = UVs.FindRef(ElemId);
+            FVector2f TargetUV = FVector2f::ZeroVector;
+            for (const TPair<int32, float>& W : *Weights)
+            {
+                TargetUV += UVs.FindRef(W.Key) * W.Value;
+            }
+            if ((TargetUV - CurUV).SizeSquared() <= 1e-12f) continue;
+
+            // Check if the vertex's 1-ring currently has consistent non-degenerate orientation
+            int32 ConsistentSign = 0;
+            bool bHasConsistentRing = false;
+            const TArray<int32>* RingTris = IncidentTris.Find(ElemId);
+            if (RingTris && !RingTris->IsEmpty())
+            {
+                bHasConsistentRing = true;
+                for (const int32 TriIdx : *RingTris)
+                {
+                    const FNGonUVDocument::FTriangle& Tri = Tris[TriIdx];
+                    const float Area = TriSignedArea2D(
+                        UVs.FindRef(Tri.Element[0]),
+                        UVs.FindRef(Tri.Element[1]),
+                        UVs.FindRef(Tri.Element[2]));
+                    if (FMath::Abs(Area) <= 1e-9f)
+                    {
+                        bHasConsistentRing = false;
+                        break;
+                    }
+                    const int32 Sign = (Area > 0.0f) ? 1 : -1;
+                    if (ConsistentSign == 0) ConsistentSign = Sign;
+                    else if (ConsistentSign != Sign)
+                    {
+                        bHasConsistentRing = false;
+                        break;
+                    }
+                }
+            }
+
+            if (!bHasConsistentRing || ConsistentSign == 0)
+            {
+                UVs[ElemId] = FMath::Lerp(CurUV, TargetUV, Alpha);
+                continue;
+            }
+
+            // Backtracking line search to prevent flipping any valid incident UV triangle
+            float StepAlpha = Alpha;
+            for (int32 Attempt = 0; Attempt < 5; ++Attempt)
+            {
+                const FVector2f CandidateUV = FMath::Lerp(CurUV, TargetUV, StepAlpha);
+                bool bValid = true;
+                for (const int32 TriIdx : *RingTris)
+                {
+                    const FNGonUVDocument::FTriangle& Tri = Tris[TriIdx];
+                    const FVector2f U0 = (Tri.Element[0] == ElemId) ? CandidateUV : UVs.FindRef(Tri.Element[0]);
+                    const FVector2f U1 = (Tri.Element[1] == ElemId) ? CandidateUV : UVs.FindRef(Tri.Element[1]);
+                    const FVector2f U2 = (Tri.Element[2] == ElemId) ? CandidateUV : UVs.FindRef(Tri.Element[2]);
+                    const float Area = TriSignedArea2D(U0, U1, U2);
+                    if (Area * static_cast<float>(ConsistentSign) <= 1e-9f)
+                    {
+                        bValid = false;
+                        break;
+                    }
+                }
+                if (bValid)
+                {
+                    UVs[ElemId] = CandidateUV;
+                    break;
+                }
+                StepAlpha *= 0.5f;
+            }
         }
-        UVs = MoveTemp(NextUVs);
     }
 
     Doc.SetAllElementUVs(UVs);
     Res.bOk = true;
     Res.ModifiedElements = Targets;
-    Res.Message = FString::Printf(TEXT("Relaxed %d UV corner(s) (%d iters, strength=%.2f, pin_border=%s)."),
+    Res.Message = FString::Printf(TEXT("Relaxed %d UV corner(s) via 3D conformal MVC (%d iters, strength=%.2f, pin_border=%s)."),
         Targets.Num(), Iters, Alpha, bPinBorder ? TEXT("true") : TEXT("false"));
     return Res;
 }

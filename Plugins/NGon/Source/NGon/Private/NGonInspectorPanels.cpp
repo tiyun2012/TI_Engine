@@ -1,6 +1,7 @@
 #include "SNGonPreview.h"
 #include "NGonSceneSkeleton.h"
 #include "NGonUIIcons.h"
+#include "NGonUVEditor.h"
 
 #include "EditorViewportClient.h"
 #include "Engine/SkeletalMesh.h"
@@ -8,7 +9,10 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "PropertyCustomizationHelpers.h"
+#include "NGonUndoTree.h"
+#include "Materials/MaterialInterface.h"
 #include "STiPaintEditor.h"
+#include "SNGonUndoTreePanel.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
@@ -29,6 +33,7 @@
 namespace NGon
 {
 void UpdateActiveViewportUVMeshFromTopology(const FNGonTopology& Topology);
+void RequestUVEditorSubMeshFilter(int32 SubMeshIndex);
 }
 
 using NGon::ENGonTreeIconKind;
@@ -221,6 +226,10 @@ TSharedRef<SWidget> SNGonPreview::MakeRightInspectorPanel()
                     [
                         MakeLowerTabButton(ENGonRightLowerTab::Painter, LOCTEXT("PainterTab", "Painter"))
                     ]
+                    + SWrapBox::Slot()
+                    [
+                        MakeLowerTabButton(ENGonRightLowerTab::History, LOCTEXT("HistoryTab", "History"))
+                    ]
                 ]
                 + SVerticalBox::Slot()
                 .FillHeight(1.0f)
@@ -282,6 +291,17 @@ TSharedRef<SWidget> SNGonPreview::MakeRightInspectorPanel()
                             })
                             [
                                 MakePainterTab()
+                            ]
+                        ]
+                        + SOverlay::Slot()
+                        [
+                            SNew(SBox)
+                            .Visibility_Lambda([this]
+                            {
+                                return ActiveLowerTab == ENGonRightLowerTab::History ? EVisibility::Visible : EVisibility::Collapsed;
+                            })
+                            [
+                                MakeHistoryTab()
                             ]
                         ]
                     ]
@@ -865,6 +885,104 @@ TSharedRef<SWidget> SNGonPreview::MakeTopologyTab()
             [
                 SNew(STextBlock)
                 .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+                .ColorAndOpacity(FLinearColor(0.32f, 0.88f, 1.0f))
+                .Text(LOCTEXT("SubMeshOutlinerTitle", "FBX Mesh Hierarchy / Sub-Meshes"))
+            ]
+            + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 8.0f)
+            [
+                SNew(SBorder)
+                .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+                .BorderBackgroundColor(FLinearColor(0.06f, 0.068f, 0.085f, 1.0f))
+                .Padding(FMargin(6.0f))
+                [
+                    SNew(SVerticalBox)
+                    + SVerticalBox::Slot().AutoHeight()
+                    [
+                        SNew(STextBlock)
+                        .AutoWrapText(true)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                        .Text_Lambda([this]
+                        {
+                            const TArray<FNGonSubMeshInfo>& Subs = Viewport->Preview().GetTopology().SubMeshes;
+                            if (Subs.IsEmpty())
+                            {
+                                return LOCTEXT("NoSubMeshesText", "Single combined mesh.");
+                            }
+                            FString OutStr;
+                            for (const FNGonSubMeshInfo& Sub : Subs)
+                            {
+                                if (Sub.ParentName != NAME_None)
+                                {
+                                    OutStr += FString::Printf(TEXT("%s / %s  (%d faces)\n"), *Sub.ParentName.ToString(), *Sub.Name.ToString(), Sub.FaceCount);
+                                }
+                                else
+                                {
+                                    OutStr += FString::Printf(TEXT("%s  (%d faces)\n"), *Sub.Name.ToString(), Sub.FaceCount);
+                                }
+                            }
+                            return FText::FromString(OutStr.TrimEnd());
+                        })
+                    ]
+                    + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 5.0f, 0.0f, 0.0f)
+                    [
+                        SNew(SComboButton)
+                        .ContentPadding(FMargin(6.0f, 3.0f))
+                        .ButtonContent()
+                        [
+                            SNew(STextBlock)
+                            .Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+                            .Text(LOCTEXT("SelectOrIsolateSubMeshBtn", "Select / Isolate Sub-Mesh in 3D & UV..."))
+                        ]
+                        .OnGetMenuContent_Lambda([this]()
+                        {
+                            FMenuBuilder Menu(true, nullptr);
+                            const TArray<FNGonSubMeshInfo>& Subs = Viewport->Preview().GetTopology().SubMeshes;
+                            Menu.BeginSection("SubMesh3D", LOCTEXT("SubMesh3DSec", "Select Sub-Mesh Faces in 3D"));
+                            for (int32 i = 0; i < Subs.Num(); ++i)
+                            {
+                                const FNGonSubMeshInfo& Sub = Subs[i];
+                                Menu.AddMenuEntry(
+                                    FText::FromString(FString::Printf(TEXT("Select 3D: %s (%d faces)"), *Sub.Name.ToString(), Sub.FaceCount)),
+                                    FText(),
+                                    FSlateIcon(),
+                                    FUIAction(FExecuteAction::CreateLambda([this, i]()
+                                    {
+                                        const FNGonTopology& Topo = Viewport->Preview().GetTopology();
+                                        TSet<int32> SubFaces;
+                                        for (const TPair<int32, int32>& Pair : Topo.FaceToSubMesh)
+                                        {
+                                            if (Pair.Value == i) SubFaces.Add(Pair.Key);
+                                        }
+                                        SetSelectionMode(ENGonElement::Face);
+                                        Viewport->Preview().SetSelectionSet(ENGonElement::Face, SubFaces, false);
+                                        Viewport->Invalidate();
+                                    })));
+                            }
+                            Menu.EndSection();
+                            Menu.BeginSection("SubMeshUV", LOCTEXT("SubMeshUVSec", "Isolate Sub-Mesh UDIM in UV Editor"));
+                            for (int32 i = 0; i < Subs.Num(); ++i)
+                            {
+                                const FNGonSubMeshInfo& Sub = Subs[i];
+                                Menu.AddMenuEntry(
+                                    FText::FromString(FString::Printf(TEXT("Isolate UV: %s"), *Sub.Name.ToString())),
+                                    FText(),
+                                    FSlateIcon(),
+                                    FUIAction(FExecuteAction::CreateLambda([this, i]()
+                                    {
+                                        FGlobalTabmanager::Get()->TryInvokeTab(FName(TEXT("NGonUVEditor")));
+                                        NGon::RequestUVEditorSubMeshFilter(i);
+                                    })));
+                            }
+                            Menu.EndSection();
+                            return Menu.MakeWidget();
+                        })
+                    ]
+                ]
+            ]
+            + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 6.0f)
+            [
+                SNew(STextBlock)
+                .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
                 .Text(LOCTEXT("TopoAuditTitle", "N-Gon Polygon Topology Audit"))
             ]
             + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 8.0f)
@@ -1004,6 +1122,197 @@ FReply SNGonPreview::SelectVerticesNearSelectedBone()
     return FReply::Handled();
 }
 
+void SNGonPreview::RebuildMaterialSlotsList()
+{
+    if (!MaterialSlotsListBox.IsValid() || !Viewport.IsValid())
+    {
+        return;
+    }
+    MaterialSlotsListBox->ClearChildren();
+
+    const TArray<FNGonMaterialSlotInfo> Slots = Viewport->Preview().GetMaterialSlots();
+    if (Slots.IsEmpty())
+    {
+        return;
+    }
+    ActiveMaterialSlotIndex = FMath::Clamp(ActiveMaterialSlotIndex, 0, Slots.Num() - 1);
+
+    auto PushMaterialUndo = [this](const FString& Label, FNGonMaterialSlotsSnapshot&& BeforeSnap)
+    {
+        if (!Viewport.IsValid() || !UndoSession.IsValid() || UndoSession->IsApplyingHistory()) return;
+        TSharedPtr<FNGonMaterialSlotsSnapshot> BeforePtr = MakeShared<FNGonMaterialSlotsSnapshot>(MoveTemp(BeforeSnap));
+        TSharedPtr<FNGonMaterialSlotsSnapshot> AfterPtr = MakeShared<FNGonMaterialSlotsSnapshot>(Viewport->Preview().CaptureMaterialSlotsSnapshot());
+        TWeakPtr<SNGonViewport> WeakVP = Viewport;
+        TWeakPtr<SNGonPreview> WeakSelf = StaticCastSharedRef<SNGonPreview>(AsShared());
+        TSharedPtr<INGonUndoPayload> Payload = MakeShared<FNGonLambdaUndoPayload>(
+            [WeakVP, WeakSelf, BeforePtr]() -> bool
+            {
+                if (TSharedPtr<SNGonViewport> VP = WeakVP.Pin())
+                {
+                    VP->Preview().RestoreMaterialSlotsSnapshot(*BeforePtr);
+                    VP->Invalidate();
+                    if (TSharedPtr<SNGonPreview> Self = WeakSelf.Pin()) Self->RebuildMaterialSlotsList();
+                    return true;
+                }
+                return false;
+            },
+            [WeakVP, WeakSelf, AfterPtr]() -> bool
+            {
+                if (TSharedPtr<SNGonViewport> VP = WeakVP.Pin())
+                {
+                    VP->Preview().RestoreMaterialSlotsSnapshot(*AfterPtr);
+                    VP->Invalidate();
+                    if (TSharedPtr<SNGonPreview> Self = WeakSelf.Pin()) Self->RebuildMaterialSlotsList();
+                    return true;
+                }
+                return false;
+            },
+            static_cast<SIZE_T>(BeforePtr->TriangleMaterialIDs.Num() * sizeof(int32) * 2 + 256));
+        UndoSession->PushEdit(ENGonUndoContextId::Mesh, Label, ENGonUndoEditKind::Value, MoveTemp(Payload));
+    };
+
+    const bool bCanRemove = Slots.Num() > 1;
+    for (int32 SlotIdx = 0; SlotIdx < Slots.Num(); ++SlotIdx)
+    {
+        const FNGonMaterialSlotInfo& Info = Slots[SlotIdx];
+        const FString CachedPath = Info.AssetPath;
+        const FLinearColor SwatchCol = Info.PreviewColor;
+
+        MaterialSlotsListBox->AddSlot()
+            .AutoHeight()
+            .Padding(0.0f, 2.0f)
+            [
+                SNew(SBorder)
+                .Padding(FMargin(5.0f, 4.0f))
+                .BorderBackgroundColor_Lambda([this, SlotIdx]()
+                {
+                    return (ActiveMaterialSlotIndex == SlotIdx)
+                        ? FLinearColor(0.14f, 0.20f, 0.28f, 1.0f)
+                        : FLinearColor(0.10f, 0.11f, 0.14f, 1.0f);
+                })
+                [
+                    SNew(SVerticalBox)
+                    // Row 1: Swatch + [idx] Name (N tris) + Assign + Select + Remove
+                    + SVerticalBox::Slot().AutoHeight()
+                    [
+                        SNew(SHorizontalBox)
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0.0f, 0.0f, 5.0f, 0.0f)
+                        [
+                            SNew(SBox).WidthOverride(10.0f).HeightOverride(10.0f)
+                            [
+                                SNew(SBorder)
+                                .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+                                .BorderBackgroundColor(SwatchCol)
+                            ]
+                        ]
+                        + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                        [
+                            SNew(STextBlock)
+                            .Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+                            .ColorAndOpacity(FLinearColor(0.88f, 0.91f, 0.96f))
+                            .Text(FText::FromString(FString::Printf(TEXT("[%d] %s (%d tris)"), SlotIdx, *Info.Name, Info.TriangleCount)))
+                        ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+                        [
+                            SNew(SButton)
+                            .ContentPadding(FMargin(5.0f, 1.0f))
+                            .ToolTipText(LOCTEXT("AssignSlotTip", "Assign currently selected faces to this material slot"))
+                            .OnClicked_Lambda([this, SlotIdx, PushMaterialUndo]()
+                            {
+                                if (!Viewport.IsValid()) return FReply::Handled();
+                                ActiveMaterialSlotIndex = SlotIdx;
+                                FNGonMaterialSlotsSnapshot Before = Viewport->Preview().CaptureMaterialSlotsSnapshot();
+                                if (Viewport->Preview().AssignSelectedFacesToMaterialSlot(SlotIdx))
+                                {
+                                    PushMaterialUndo(FString::Printf(TEXT("Assign Faces to Slot %d"), SlotIdx), MoveTemp(Before));
+                                    RebuildMaterialSlotsList();
+                                    Viewport->Invalidate();
+                                }
+                                return FReply::Handled();
+                            })
+                            [
+                                SNew(STextBlock)
+                                .Text(LOCTEXT("AssignSlotBtn", "Assign"))
+                                .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                            ]
+                        ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+                        [
+                            SNew(SButton)
+                            .ContentPadding(FMargin(5.0f, 1.0f))
+                            .ToolTipText(LOCTEXT("SelectSlotTip", "Select all faces assigned to this material slot"))
+                            .OnClicked_Lambda([this, SlotIdx]()
+                            {
+                                if (!Viewport.IsValid()) return FReply::Handled();
+                                ActiveMaterialSlotIndex = SlotIdx;
+                                Viewport->Preview().SelectFacesByMaterialSlot(SlotIdx, false);
+                                Viewport->Invalidate();
+                                return FReply::Handled();
+                            })
+                            [
+                                SNew(STextBlock)
+                                .Text(LOCTEXT("SelectSlotBtn", "Select"))
+                                .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                            ]
+                        ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+                        [
+                            SNew(SButton)
+                            .ContentPadding(FMargin(5.0f, 1.0f))
+                            .IsEnabled(bCanRemove)
+                            .ToolTipText(LOCTEXT("RemoveSlotTip", "Remove this material slot and safely remap its faces"))
+                            .OnClicked_Lambda([this, SlotIdx, PushMaterialUndo]()
+                            {
+                                if (!Viewport.IsValid()) return FReply::Handled();
+                                FNGonMaterialSlotsSnapshot Before = Viewport->Preview().CaptureMaterialSlotsSnapshot();
+                                if (Viewport->Preview().RemoveMaterialSlot(SlotIdx))
+                                {
+                                    PushMaterialUndo(FString::Printf(TEXT("Remove Material Slot %d"), SlotIdx), MoveTemp(Before));
+                                    RebuildMaterialSlotsList();
+                                    Viewport->Invalidate();
+                                }
+                                return FReply::Handled();
+                            })
+                            [
+                                SNew(STextBlock)
+                                .Text(LOCTEXT("RemoveSlotBtn", "×"))
+                                .Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+                                .ColorAndOpacity(bCanRemove ? FLinearColor(0.95f, 0.45f, 0.45f) : FLinearColor(0.45f, 0.45f, 0.48f))
+                            ]
+                        ]
+                    ]
+                    // Row 2: UE Material Asset Picker (Content Browser drop/browse/clear)
+                    + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 3.0f, 0.0f, 0.0f)
+                    [
+                        SNew(SObjectPropertyEntryBox)
+                        .AllowedClass(UMaterialInterface::StaticClass())
+                        .ObjectPath_Lambda([CachedPath]() { return CachedPath; })
+                        .OnObjectChanged_Lambda([this, SlotIdx, PushMaterialUndo](const FAssetData& AssetData)
+                        {
+                            if (!Viewport.IsValid()) return;
+                            ActiveMaterialSlotIndex = SlotIdx;
+                            UMaterialInterface* NewMat = Cast<UMaterialInterface>(AssetData.GetAsset());
+                            FNGonMaterialSlotsSnapshot Before = Viewport->Preview().CaptureMaterialSlotsSnapshot();
+                            if (Viewport->Preview().SetMaterialSlotAsset(SlotIdx, NewMat))
+                            {
+                                PushMaterialUndo(
+                                    NewMat ? FString::Printf(TEXT("Set Slot %d Material: %s"), SlotIdx, *NewMat->GetName())
+                                           : FString::Printf(TEXT("Reset Slot %d to Studio"), SlotIdx),
+                                    MoveTemp(Before));
+                                RebuildMaterialSlotsList();
+                                Viewport->Invalidate();
+                            }
+                        })
+                        .DisplayThumbnail(true)
+                        .DisplayUseSelected(true)
+                        .AllowClear(true)
+                        .AllowCreate(false)
+                    ]
+                ]
+            ];
+    }
+}
+
 TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
 {
     auto MakeBoneAxisSpinBox = [this](
@@ -1056,7 +1365,103 @@ TSharedRef<SWidget> SNGonPreview::MakeDetailsTab()
         Viewport->Invalidate();
     };
 
+    auto PushMaterialUndo = [this](const FString& Label, FNGonMaterialSlotsSnapshot&& BeforeSnap)
+    {
+        if (!Viewport.IsValid() || !UndoSession.IsValid() || UndoSession->IsApplyingHistory()) return;
+        TSharedPtr<FNGonMaterialSlotsSnapshot> BeforePtr = MakeShared<FNGonMaterialSlotsSnapshot>(MoveTemp(BeforeSnap));
+        TSharedPtr<FNGonMaterialSlotsSnapshot> AfterPtr = MakeShared<FNGonMaterialSlotsSnapshot>(Viewport->Preview().CaptureMaterialSlotsSnapshot());
+        TWeakPtr<SNGonViewport> WeakVP = Viewport;
+        TWeakPtr<SNGonPreview> WeakSelf = StaticCastSharedRef<SNGonPreview>(AsShared());
+        TSharedPtr<INGonUndoPayload> Payload = MakeShared<FNGonLambdaUndoPayload>(
+            [WeakVP, WeakSelf, BeforePtr]() -> bool
+            {
+                if (TSharedPtr<SNGonViewport> VP = WeakVP.Pin())
+                {
+                    VP->Preview().RestoreMaterialSlotsSnapshot(*BeforePtr);
+                    VP->Invalidate();
+                    if (TSharedPtr<SNGonPreview> Self = WeakSelf.Pin()) Self->RebuildMaterialSlotsList();
+                    return true;
+                }
+                return false;
+            },
+            [WeakVP, WeakSelf, AfterPtr]() -> bool
+            {
+                if (TSharedPtr<SNGonViewport> VP = WeakVP.Pin())
+                {
+                    VP->Preview().RestoreMaterialSlotsSnapshot(*AfterPtr);
+                    VP->Invalidate();
+                    if (TSharedPtr<SNGonPreview> Self = WeakSelf.Pin()) Self->RebuildMaterialSlotsList();
+                    return true;
+                }
+                return false;
+            },
+            static_cast<SIZE_T>(BeforePtr->TriangleMaterialIDs.Num() * sizeof(int32) * 2 + 256));
+        UndoSession->PushEdit(ENGonUndoContextId::Mesh, Label, ENGonUndoEditKind::Value, MoveTemp(Payload));
+    };
+
+    TSharedRef<SWidget> MaterialSlotsCard = SNew(SBorder)
+        .Padding(FMargin(6.0f))
+        .BorderBackgroundColor(FLinearColor(0.08f, 0.09f, 0.11f, 1.0f))
+        [
+            SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight()
+            [
+                SNew(SBorder)
+                .Padding(FMargin(4.0f, 3.0f))
+                .BorderBackgroundColor(FLinearColor(0.14f, 0.15f, 0.18f, 1.0f))
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+                        .ColorAndOpacity(FLinearColor(0.88f, 0.90f, 0.94f))
+                        .Text_Lambda([this]()
+                        {
+                            const int32 Cnt = Viewport.IsValid() ? Viewport->Preview().GetMaterialSlotCount() : 0;
+                            return FText::FromString(FString::Printf(TEXT("▼  Material Slots (%d)"), Cnt));
+                        })
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f)
+                    [
+                        SNew(SButton)
+                        .ContentPadding(FMargin(6.0f, 2.0f))
+                        .ToolTipText(LOCTEXT("AddMatSlotTip", "Add a new Material Slot to this mesh"))
+                        .OnClicked_Lambda([this, PushMaterialUndo]()
+                        {
+                            if (!Viewport.IsValid()) return FReply::Handled();
+                            FNGonMaterialSlotsSnapshot Before = Viewport->Preview().CaptureMaterialSlotsSnapshot();
+                            const int32 NewIdx = Viewport->Preview().AddMaterialSlot();
+                            ActiveMaterialSlotIndex = NewIdx;
+                            PushMaterialUndo(FString::Printf(TEXT("Add Material Slot %d"), NewIdx), MoveTemp(Before));
+                            RebuildMaterialSlotsList();
+                            Viewport->Invalidate();
+                            return FReply::Handled();
+                        })
+                        [
+                            SNew(STextBlock)
+                            .Text(LOCTEXT("AddMatSlotBtn", "+ Add Slot"))
+                            .Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+                        ]
+                    ]
+                ]
+            ]
+            + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f, 0.0f, 0.0f)
+            [
+                SAssignNew(MaterialSlotsListBox, SVerticalBox)
+            ]
+        ];
+
+    RebuildMaterialSlotsList();
+
     return SNew(SVerticalBox)
+        // 0. Material Slots Manager (always visible)
+        + SVerticalBox::Slot()
+        .AutoHeight()
+        .Padding(0.0f, 0.0f, 0.0f, 8.0f)
+        [
+            MaterialSlotsCard
+        ]
         // 1. Selected Bone & Transforms Inspector (matching UE 5.8 SkeletalMesh Editor Details panel in image_3b0306.jpg / image_3b02c7.jpg / image_3b001c.jpg)
         + SVerticalBox::Slot()
         .AutoHeight()
@@ -1846,6 +2251,19 @@ TSharedRef<SWidget> SNGonPreview::MakePreviewSettingsTab()
                 SNew(STextBlock).Text(LOCTEXT("PrefShowHotkeysHud", "Show Top-Right Hotkeys Legend"))
             ]
         ];
+}
+
+TSharedRef<SWidget> SNGonPreview::MakeHistoryTab()
+{
+    if (UndoTreePanel.IsValid())
+    {
+        return SNew(SBox)
+            .MinDesiredHeight(380.0f)
+            [
+                UndoTreePanel.ToSharedRef()
+            ];
+    }
+    return SNew(STextBlock).Text(LOCTEXT("NoHistoryPanel", "Undo History panel unavailable."));
 }
 
 TSharedRef<SWidget> SNGonPreview::MakePainterTab()

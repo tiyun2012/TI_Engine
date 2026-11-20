@@ -4,6 +4,7 @@
 #include "Input/Reply.h"
 #include "Widgets/SLeafWidget.h"
 #include "Widgets/SCompoundWidget.h"
+#include "NGonTopology.h"
 
 struct FNGonMeshData;
 
@@ -44,9 +45,11 @@ public:
     struct FTriangle
     {
         FVector2f UV[3];
+        FVector3f Pos3D[3] = { FVector3f::ZeroVector, FVector3f::ZeroVector, FVector3f::ZeroVector };
         int32 Element[3] = { INDEX_NONE, INDEX_NONE, INDEX_NONE };
         int32 FaceId = INDEX_NONE;
         int32 Island = INDEX_NONE;
+        int32 SubMeshIndex = 0;
     };
 
     ~FNGonUVDocument();
@@ -81,6 +84,11 @@ public:
     void FlipSelected(bool bHorizontal);
     void NormalizeSelected();
     FText Describe() const;
+    const TArray<FNGonSubMeshInfo>& GetSubMeshes() const { return SubMeshes; }
+    int32 GetActiveSubMeshFilter() const { return ActiveSubMeshFilter; }
+    void SetActiveSubMeshFilter(int32 SubMeshIndex);
+    bool IsSubMeshVisible(int32 SubMeshIndex) const { return ActiveSubMeshFilter == INDEX_NONE || ActiveSubMeshFilter == SubMeshIndex; }
+    bool IsElementInActiveSubMesh(int32 ElementId) const;
 
 private:
     void RebuildBounds();
@@ -99,6 +107,8 @@ private:
     FBox2D Bounds;
     ENGonUVSelectionMode SelectionMode = ENGonUVSelectionMode::Corner;
     int32 IslandCount = 0;
+    TArray<FNGonSubMeshInfo> SubMeshes;
+    int32 ActiveSubMeshFilter = INDEX_NONE;
 };
 
 class SNGonUVCanvas final : public SLeafWidget
@@ -189,3 +199,8 @@ private:
     float PackPadding = 0.02f;
     float SnapStep = 0.0625f;
 };
+
+namespace NGon
+{
+    void RequestUVEditorSubMeshFilter(int32 SubMeshIndex);
+}

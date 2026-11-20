@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "NGonPicking.h"
 #include "NGonTopology.h"
+#include "NGonBevel.h"
 
 class FNGonPreviewScene;
 
@@ -128,6 +129,26 @@ public:
         const TArray<int32>& FaceIds,
         double Ratio = 0.18,
         double Height = 8.0);
+
+    // --- Joint VMesh Bevel Operations (Edge / Vertex / Face Boundary) ---
+    static FNGonMeshOpResult BevelEdges(
+        FNGonPreviewScene& Scene,
+        const TArray<int32>& EdgeIds,
+        const FNGonBevelOptions& Options = FNGonBevelOptions());
+
+    static FNGonMeshOpResult BevelVertices(
+        FNGonPreviewScene& Scene,
+        const TArray<int32>& VertexIds,
+        const FNGonBevelOptions& Options = FNGonBevelOptions());
+
+    static FNGonMeshOpResult BevelFacesBoundary(
+        FNGonPreviewScene& Scene,
+        const TArray<int32>& FaceIds,
+        const FNGonBevelOptions& Options = FNGonBevelOptions());
+
+    static FNGonMeshOpResult BevelSelection(
+        FNGonPreviewScene& Scene,
+        const FNGonBevelOptions& Options = FNGonBevelOptions());
 
     static FNGonMeshOpResult SubdivideFaces(
         FNGonPreviewScene& Scene,

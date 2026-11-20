@@ -15,6 +15,8 @@
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SComboButton.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Layout/SBorder.h"
@@ -84,6 +86,7 @@ struct FUVDocumentAccel
 
         for (const FNGonUVDocument::FTriangle& Tri : Tris)
         {
+            if (!Doc.IsSubMeshVisible(Tri.SubMeshIndex)) continue;
             for (int32 Corner = 0; Corner < 3; ++Corner)
             {
                 const int32 E0 = Tri.Element[Corner];
@@ -183,6 +186,8 @@ struct FActiveViewportUVState
     FText SourceLabel;
     bool bHasActiveMesh = false;
     FSimpleMulticastDelegate OnActiveMeshChanged;
+    int32 RequestedSubMeshFilter = INDEX_NONE;
+    TMulticastDelegate<void(int32)> OnSubMeshFilterRequested;
 };
 
 FActiveViewportUVState& GetActiveViewportUVState()
@@ -340,12 +345,17 @@ bool FNGonUVDocument::Load(const FNGonMeshData& Data, FText& Error)
     {
         if (!UVs->IsSetTriangle(TriangleId)) continue;
         const FIndex3i Elements = UVs->GetTriangle(TriangleId);
+        const FIndex3i TriVerts = Mesh.GetTriangle(TriangleId);
         const int32 TriIdx = Triangles.AddDefaulted();
         FTriangle& Out = Triangles[TriIdx];
         Out.Element[0] = Elements.A;
         Out.Element[1] = Elements.B;
         Out.Element[2] = Elements.C;
+        Out.Pos3D[0] = FVector3f(Mesh.GetVertex(TriVerts.A));
+        Out.Pos3D[1] = FVector3f(Mesh.GetVertex(TriVerts.B));
+        Out.Pos3D[2] = FVector3f(Mesh.GetVertex(TriVerts.C));
         Out.FaceId = Mesh.GetTriangleGroup(TriangleId);
+        if (const int32* FoundSub = Data.Topology.FaceToSubMesh.Find(Out.FaceId)) { Out.SubMeshIndex = *FoundSub; }
         for (int32 Corner = 0; Corner < 3; ++Corner)
         {
             const int32 ElementId = Out.Element[Corner];
@@ -360,6 +370,9 @@ bool FNGonUVDocument::Load(const FNGonMeshData& Data, FText& Error)
         Error = LOCTEXT("NoTriangleUVs", "The mesh primary UV channel contains no triangle data.");
         return false;
     }
+    SubMeshes = Data.Topology.SubMeshes;
+    ActiveSubMeshFilter = (SubMeshes.Num() > 1) ? 0 : INDEX_NONE;
+    RebuildBounds();
     RebuildIslands();
     GUVDocAccelMap.FindOrAdd(this).BuildFromDocument(*this);
     Error = FText::GetEmpty();
@@ -378,6 +391,34 @@ void FNGonUVDocument::Clear()
     SelectedIslands.Reset();
     Bounds = FBox2D(ForceInit);
     IslandCount = 0;
+    SubMeshes.Reset();
+    ActiveSubMeshFilter = INDEX_NONE;
+}
+
+bool FNGonUVDocument::IsElementInActiveSubMesh(int32 ElementId) const
+{
+    if (ActiveSubMeshFilter == INDEX_NONE) return true;
+    if (const TArray<int32>* TriList = ElementTriangles.Find(ElementId))
+    {
+        for (const int32 TriIdx : *TriList)
+        {
+            if (Triangles.IsValidIndex(TriIdx) && Triangles[TriIdx].SubMeshIndex == ActiveSubMeshFilter)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void FNGonUVDocument::SetActiveSubMeshFilter(int32 SubMeshIndex)
+{
+    const int32 Clamped = SubMeshes.IsValidIndex(SubMeshIndex) ? SubMeshIndex : INDEX_NONE;
+    if (ActiveSubMeshFilter == Clamped) return;
+    ActiveSubMeshFilter = Clamped;
+    ClearSelection();
+    RebuildBounds();
+    GUVDocAccelMap.FindOrAdd(this).BuildFromDocument(*this);
 }
 
 FVector2f FNGonUVDocument::GetElementUV(int32 ElementId) const
@@ -407,9 +448,16 @@ bool FNGonUVDocument::GetSelectionCentroidUV(FVector2f& OutCenter) const
 void FNGonUVDocument::RebuildBounds()
 {
     Bounds = FBox2D(ForceInit);
-    for (const TPair<int32, FVector2f>& Pair : ElementUV)
+    for (const FTriangle& Tri : Triangles)
     {
-        Bounds += FVector2D(Pair.Value);
+        if (!IsSubMeshVisible(Tri.SubMeshIndex)) continue;
+        Bounds += FVector2D(Tri.UV[0]);
+        Bounds += FVector2D(Tri.UV[1]);
+        Bounds += FVector2D(Tri.UV[2]);
+    }
+    if (!Bounds.bIsValid)
+    {
+        Bounds = FBox2D(FVector2D(0.0, 0.0), FVector2D(1.0, 1.0));
     }
 }
 
@@ -583,6 +631,7 @@ void FNGonUVDocument::SelectAtUV(const FVector2f& UV, bool bAdd, float Radius)
         float BestDistSq = RadiusSq;
         for (const TPair<int32, FVector2f>& Pair : ElementUV)
         {
+            if (!IsElementInActiveSubMesh(Pair.Key)) continue;
             const float D = DistSq(UV, Pair.Value);
             if (D <= BestDistSq) { BestDistSq = D; BestElement = Pair.Key; }
         }
@@ -614,6 +663,7 @@ void FNGonUVDocument::SelectAtUV(const FVector2f& UV, bool bAdd, float Radius)
         for (int32 I = 0; I < Triangles.Num(); ++I)
         {
             const FTriangle& T = Triangles[I];
+            if (!IsSubMeshVisible(T.SubMeshIndex)) continue;
             if (IsPointInUVTriangle(UV, T.UV[0], T.UV[1], T.UV[2])) { HitTri = I; break; }
         }
         if (HitTri == INDEX_NONE)
@@ -622,6 +672,7 @@ void FNGonUVDocument::SelectAtUV(const FVector2f& UV, bool bAdd, float Radius)
             for (int32 I = 0; I < Triangles.Num(); ++I)
             {
                 const FTriangle& T = Triangles[I];
+                if (!IsSubMeshVisible(T.SubMeshIndex)) continue;
                 const FVector2f C = (T.UV[0] + T.UV[1] + T.UV[2]) / 3.0f;
                 const float D = DistSq(UV, C);
                 if (D <= BestCentroidDistSq) { BestCentroidDistSq = D; HitTri = I; }
@@ -647,6 +698,7 @@ void FNGonUVDocument::SelectRect(const FBox2D& Rect, bool bAdd)
 
     for (const TPair<int32, FVector2f>& Pair : ElementUV)
     {
+        if (!IsElementInActiveSubMesh(Pair.Key)) continue;
         if (NormalizedRect.IsInside(FVector2D(Pair.Value))) SelectedElements.Add(Pair.Key);
     }
     RebuildSelectionMetadata();
@@ -1178,7 +1230,7 @@ int32 SNGonUVCanvas::OnPaint(
     {
         for (const TPair<int32, FVector2f>& Pair : Document->GetElementUVs())
         {
-            if (SelectedElems.Contains(Pair.Key)) continue;
+            if (SelectedElems.Contains(Pair.Key) || !Document->IsElementInActiveSubMesh(Pair.Key)) continue;
             const FVector2D P = UVToScreen(Geo, Pair.Value);
             if (P.X < -4.0 || P.X > Size.X + 4.0 || P.Y < -4.0 || P.Y > Size.Y + 4.0) continue;
             FSlateDrawElement::MakeBox(Out, Layer + 4, Geo.ToPaintGeometry(FVector2D(5.0, 5.0), FSlateLayoutTransform(P - FVector2D(2.5, 2.5))),
@@ -1553,6 +1605,75 @@ TSharedRef<SWidget> SNGonUVEditor::MakeToolbar()
             .InnerSlotPadding(FVector2D(5.0f, 4.0f))
             + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("UVReload", "Reload"), LOCTEXT("UVReloadTip", "Reload UV mesh from active viewport"), FOnClicked::CreateSP(this, &SNGonUVEditor::Reload))]
             + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("UVFit", "Fit (F)"), LOCTEXT("UVFitTip", "Fit UV canvas to bounds"), FOnClicked::CreateLambda([this]() { Canvas->FitToCanvas(); return FReply::Handled(); }))]
+            + SWrapBox::Slot()
+            [
+                SNew(SComboButton)
+                .ContentPadding(FMargin(7.0f, 3.0f))
+                .ToolTipText(LOCTEXT("UVSubMeshFilterTip", "Isolate an individual FBX sub-mesh / section UDIM to avoid overlapping UVs"))
+                .OnGetMenuContent_Lambda([this]()
+                {
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.BeginSection("UVSubMeshSec", LOCTEXT("UVSubMeshSecTitle", "FBX Sub-Mesh / UDIM Isolate"));
+                    Menu.AddMenuEntry(
+                        LOCTEXT("UVSubMeshAll", "All Meshes (Combined)"),
+                        FText(),
+                        FSlateIcon(),
+                        FUIAction(
+                            FExecuteAction::CreateLambda([this]()
+                            {
+                                Document->SetActiveSubMeshFilter(INDEX_NONE);
+                                Canvas->FitToCanvas();
+                                Canvas->Refresh();
+                            }),
+                            FCanExecuteAction(),
+                            FIsActionChecked::CreateLambda([this]() { return Document->GetActiveSubMeshFilter() == INDEX_NONE; })),
+                        NAME_None,
+                        EUserInterfaceActionType::RadioButton);
+                    const TArray<FNGonSubMeshInfo>& Subs = Document->GetSubMeshes();
+                    for (int32 i = 0; i < Subs.Num(); ++i)
+                    {
+                        const FNGonSubMeshInfo& Sub = Subs[i];
+                        const FString LabelStr = Sub.ParentName != NAME_None
+                            ? FString::Printf(TEXT("%s / %s (%d faces)"), *Sub.ParentName.ToString(), *Sub.Name.ToString(), Sub.FaceCount)
+                            : FString::Printf(TEXT("%s (%d faces)"), *Sub.Name.ToString(), Sub.FaceCount);
+                        Menu.AddMenuEntry(
+                            FText::FromString(LabelStr),
+                            FText(),
+                            FSlateIcon(),
+                            FUIAction(
+                                FExecuteAction::CreateLambda([this, i]()
+                                {
+                                    Document->SetActiveSubMeshFilter(i);
+                                    Canvas->FitToCanvas();
+                                    Canvas->Refresh();
+                                }),
+                                FCanExecuteAction(),
+                                FIsActionChecked::CreateLambda([this, i]() { return Document->GetActiveSubMeshFilter() == i; })),
+                            NAME_None,
+                            EUserInterfaceActionType::RadioButton);
+                    }
+                    Menu.EndSection();
+                    return Menu.MakeWidget();
+                })
+                .ButtonContent()
+                [
+                    SNew(STextBlock)
+                    .Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+                    .ColorAndOpacity(FLinearColor(0.32f, 0.88f, 1.0f))
+                    .Text_Lambda([this]()
+                    {
+                        const int32 Active = Document->GetActiveSubMeshFilter();
+                        const TArray<FNGonSubMeshInfo>& Subs = Document->GetSubMeshes();
+                        if (Subs.IsValidIndex(Active))
+                        {
+                            return FText::FromString(FString::Printf(TEXT("Mesh: %s"), *Subs[Active].Name.ToString()));
+                        }
+                        return Subs.Num() > 1
+                            ? FText::FromString(FString::Printf(TEXT("Mesh: All (%d)"), Subs.Num()))
+                            : LOCTEXT("UVSubMeshSingle", "Mesh: All");
+                    })
+                ]
+            ]
             + SWrapBox::Slot()[MakeModeButton(ENGonUVSelectionMode::Corner, LOCTEXT("UVCorner", "Corner"))]
             + SWrapBox::Slot()[MakeModeButton(ENGonUVSelectionMode::Edge, LOCTEXT("UVEdge", "Edge"))]
             + SWrapBox::Slot()[MakeModeButton(ENGonUVSelectionMode::Face, LOCTEXT("UVFace", "Face"))]
@@ -1665,7 +1786,7 @@ TSharedRef<SWidget> SNGonUVEditor::MakeUVStudioPanel()
                     .InnerSlotPadding(FVector2D(4.0f, 4.0f))
                     + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("PackBtn", "Pack Islands"), LOCTEXT("PackTip", "Shelf-pack all UV islands cleanly into [0,1]"), FOnClicked::CreateLambda([this, RunUVOp]() { return RunUVOp(FNGonUVAPI::PackIslands(*Document, PackPadding, true), true); }))]
                     + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("NormBtn", "Normalize 0-1"), LOCTEXT("NormTip", "Normalize selection into [0,1] preserving aspect"), FOnClicked::CreateLambda([this, RunUVOp]() { return RunUVOp(FNGonUVAPI::NormalizeSelected(*Document, true, PackPadding), true); }))]
-                    + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("RelaxBtn", "Relax UVs"), LOCTEXT("RelaxTip", "Laplacian UV relaxation with pinned seam borders"), FOnClicked::CreateLambda([this, RunUVOp]() { return RunUVOp(FNGonUVAPI::RelaxSelected(*Document, 4, 0.45f, true)); }))]
+                    + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("RelaxBtn", "Relax UVs"), LOCTEXT("RelaxTip", "3D-aware conformal (Mean Value) UV relaxation with foldover protection and pinned seam borders"), FOnClicked::CreateLambda([this, RunUVOp]() { return RunUVOp(FNGonUVAPI::RelaxSelected(*Document, 4, 0.45f, true)); }))]
                     + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("StackBtn", "Stack"), LOCTEXT("StackTip", "Stack selected UV islands onto the same center"), FOnClicked::CreateLambda([this, RunUVOp]() { return RunUVOp(FNGonUVAPI::StackSelectedIslands(*Document)); }))]
                     + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("DistUBtn", "Distribute U"), LOCTEXT("DistUTip", "Distribute selected islands horizontally"), FOnClicked::CreateLambda([this, RunUVOp]() { return RunUVOp(FNGonUVAPI::DistributeSelectedIslands(*Document, true, PackPadding)); }))]
                     + SWrapBox::Slot()[MakeUVActionChip(LOCTEXT("UDIMNext", "-> UDIM 1002"), LOCTEXT("UDIMTip", "Move selection to UDIM tile (1, 0)"), FOnClicked::CreateLambda([this, RunUVOp]() { return RunUVOp(FNGonUVAPI::MoveToUDIMTile(*Document, 1, 0, false), true); }))]
@@ -1834,6 +1955,13 @@ TSharedRef<SWidget> SNGonUVEditor::MakeStatus()
 void SNGonUVEditor::ShowError(const FText& Error)
 {
     ErrorText = Error;
+}
+
+void NGon::RequestUVEditorSubMeshFilter(int32 SubMeshIndex)
+{
+    FActiveViewportUVState& State = GetActiveViewportUVState();
+    State.RequestedSubMeshFilter = SubMeshIndex;
+    State.OnSubMeshFilterRequested.Broadcast(SubMeshIndex);
 }
 
 #undef LOCTEXT_NAMESPACE

@@ -25,6 +25,28 @@ enum class ENGonGizmoFramePolicy : uint8
     ActiveElement
 };
 
+struct FNGonMaterialSlotInfo
+{
+    FString Name;
+    FString AssetPath;
+    FLinearColor PreviewColor = FLinearColor(0.55f, 0.58f, 0.64f, 1.0f);
+    int32 TriangleCount = 0;
+    bool bIsCustomAsset = false;
+};
+
+struct FNGonMaterialSlotsSnapshot
+{
+    struct FSlotData
+    {
+        FString Name;
+        FLinearColor PreviewColor = FLinearColor(0.55f, 0.58f, 0.64f, 1.0f);
+        TStrongObjectPtr<UMaterialInterface> Material;
+        bool bIsCustomAsset = false;
+    };
+    TArray<FSlotData> Slots;
+    TMap<int32, int32> TriangleMaterialIDs;
+};
+
 class FNGonPreviewScene
 {
 public:
@@ -46,6 +68,17 @@ public:
     void SetPaintTexture(const TArray<FColor>& Pixels, int32 Width, int32 Height);
     void ClearPaintTexture();
     void RefreshPaintMaterial();
+
+    // --- Material Slots Management (GC-safe, MaterialID remapping, Undo snapshot) ---
+    int32 GetMaterialSlotCount() const { return MaterialSlots.Num(); }
+    TArray<FNGonMaterialSlotInfo> GetMaterialSlots() const;
+    int32 AddMaterialSlot(const FString& SlotName = FString(), UMaterialInterface* InMaterial = nullptr);
+    bool RemoveMaterialSlot(int32 SlotIndex);
+    bool SetMaterialSlotAsset(int32 SlotIndex, UMaterialInterface* NewMaterial);
+    bool AssignSelectedFacesToMaterialSlot(int32 SlotIndex);
+    int32 SelectFacesByMaterialSlot(int32 SlotIndex, bool bAdd = false);
+    FNGonMaterialSlotsSnapshot CaptureMaterialSlotsSnapshot() const;
+    void RestoreMaterialSlotsSnapshot(const FNGonMaterialSlotsSnapshot& Snapshot);
     void SetHeatBias(float Value);
     void SetBend(float Value);
     void RefreshBoneDeformation();
@@ -55,10 +88,11 @@ public:
     ENGonSoftTransformMode GetSoftTransformMode() const { return SoftTransformMode; }
     const FNGonSoftSelectionSettings& GetSoftSelectionSettings() const { return SoftSettings; }
     const TArray<FNGonVertexInfluence>& GetSoftSelectionInfluences() const { return SoftInfluences; }
-    bool HasSoftSelectionInfluence() const { return SoftSettings.bEnabled && !SelectedIds.IsEmpty() && !SoftInfluences.IsEmpty(); }
+    bool HasSoftSelectionInfluence() const { return SoftSettings.bEnabled && HasAnySelection() && !SoftInfluences.IsEmpty(); }
     bool BeginSoftTransform(const FTransform& GizmoTransform, ENGonSoftTransformMode Mode);
     bool ApplyGizmoTransform(const FTransform& GizmoTransform);
     void EndSoftTransform();
+    void ApplyVertexPositionsDelta(const TArray<TPair<int32, FVector>>& VertexUpdates);
     void CancelSoftTransform();
     bool IsSoftTransformActive() const { return SoftSession.IsActive(); }
     FTransform GetSelectionGizmoTransform() const;
@@ -69,8 +103,11 @@ public:
     ENGonGizmoMode GetGizmoMode() const { return GizmoMode; }
     bool HasGizmoTarget() const;
     int32 Pick(ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd);
+    int32 PickMulti(ENGonSelectionMask Mask, const FSceneView& View, const FVector2D& Cursor, bool bAdd, ENGonElement* OutPickedElement = nullptr);
     int32 PickHoverVertex(const FSceneView& View, const FVector2D& Cursor, bool bAllowThroughMesh) const;
+    FNGonSurfaceHit PickSurfaceHit(const FSceneView& View, const FVector2D& Cursor) const;
     void BoxSelect(ENGonElement Element, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
+    void BoxSelectMulti(ENGonSelectionMask Mask, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
     void ClearSelection();
     bool DeleteSelectedFaces();
@@ -82,6 +119,10 @@ public:
     const TArray<FVector>& GetPositions() const { return Positions; }
     ENGonElement GetSelectedElement() const { return SelectedElement; }
     const TSet<int32>& GetSelectedIds() const { return SelectedIds; }
+    const TSet<int32>& GetSelectedVertexIds() const { return SelectedVertexIds; }
+    const TSet<int32>& GetSelectedEdgeIds() const { return SelectedEdgeIds; }
+    const TSet<int32>& GetSelectedFaceIds() const { return SelectedFaceIds; }
+    bool HasAnySelection() const { return !SelectedVertexIds.IsEmpty() || !SelectedEdgeIds.IsEmpty() || !SelectedFaceIds.IsEmpty(); }
     int32 GetActiveSelectedId() const { return ActiveSelectedId; }
     void SetSelectionSet(ENGonElement Element, const TSet<int32>& Ids, bool bAdd = false) { ApplySelectionSet(Element, Ids, bAdd); }
     bool ReplacePolygonMesh(const TArray<FVector>& NewPositions, const TArray<TArray<int32>>& NewFaces, FText& OutError);
@@ -128,6 +169,9 @@ private:
     TStrongObjectPtr<UMaterialInterface> StudioMaterial;
     TStrongObjectPtr<UMaterialInterface> ColorMaterial;
     TStrongObjectPtr<UMaterialInstanceDynamic> PaintMaterial;
+    TArray<FNGonMaterialSlotsSnapshot::FSlotData> MaterialSlots;
+    void ApplyMaterialSlotsToSurface();
+    UMaterialInterface* MakeTintedStudioSlotMaterial(const FLinearColor& Color);
     UDynamicMeshComponent* Surface = nullptr;
     ULineSetComponent* EdgeLines = nullptr;
     UPointSetComponent* VertexPoints = nullptr;
@@ -139,6 +183,9 @@ private:
     FNGonPicker Picker;
     ENGonElement SelectedElement = ENGonElement::Face;
     TSet<int32> SelectedIds;
+    TSet<int32> SelectedVertexIds;
+    TSet<int32> SelectedEdgeIds;
+    TSet<int32> SelectedFaceIds;
     int32 ActiveSelectedId = INDEX_NONE;
     TArray<FVector> Positions;
     TMap<int32, TArray<int32>> GizmoVertexFaces;

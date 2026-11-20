@@ -3,6 +3,7 @@
 #include "NGonUIIcons.h"
 #include "NGonViewportGizmo.h"
 #include "NGonMeshAPI.h"
+#include "NGonUndoTree.h"
 #include "NGonPieMenu.h"
 #include "Framework/Docking/TabManager.h"
 
@@ -117,6 +118,10 @@ public:
         {
             UpdateGizmoDrag(PendingGizmoMouse);
         }
+        if (bPendingPaint3DMove && Viewport)
+        {
+            UpdatePaint3DDrag(Viewport, PendingPaint3DMouse);
+        }
     }
 
     bool InputKey(const FInputKeyEventArgs& EventArgs) override
@@ -167,6 +172,39 @@ public:
                 return true;
             }
             return true;
+        }
+
+        if (bPressed && IsCtrlPressed() && !IsAltPressed() && PointerAction == EPointerAction::None)
+        {
+            if (Key == EKeys::Z)
+            {
+                const bool bRedo = IsShiftPressed();
+                if (const TSharedPtr<FNGonUndoSession> Session = NGon::Undo::FindSession(&PreviewOwner.Get()); Session.IsValid())
+                {
+                    if (bRedo) Session->RedoChecked();
+                    else Session->UndoChecked();
+                }
+                else
+                {
+                    if (bRedo) FNGonMeshAPI::Redo(PreviewOwner.Get());
+                    else FNGonMeshAPI::Undo(PreviewOwner.Get());
+                }
+                PostInvalidation();
+                return true;
+            }
+            if (Key == EKeys::Y)
+            {
+                if (const TSharedPtr<FNGonUndoSession> Session = NGon::Undo::FindSession(&PreviewOwner.Get()); Session.IsValid())
+                {
+                    Session->RedoChecked();
+                }
+                else
+                {
+                    FNGonMeshAPI::Redo(PreviewOwner.Get());
+                }
+                PostInvalidation();
+                return true;
+            }
         }
 
         if (Key == EKeys::RightMouseButton && InViewport && !IsAltPressed() && PointerAction == EPointerAction::None)
@@ -480,6 +518,33 @@ public:
             Canvas->DrawItem(Box);
         }
 
+        if (const TSharedPtr<SNGonViewport> PinnedPaint = ViewportWidget.Pin();
+            PinnedPaint && PinnedPaint->IsPaint3DMode() && HoverPixel.IsSet() && Canvas && !Canvas->IsHitTesting())
+        {
+            const double DPIScale = FMath::Max(static_cast<double>(Canvas->GetDPIScale()), 0.01);
+            const FVector2D Center = HoverPixel.GetValue() / DPIScale;
+            const double RingPx = 14.0;
+            const FLinearColor BrushCol(0.18f, 0.90f, 0.72f, 0.92f);
+            constexpr int32 Segs = 28;
+            FVector2D Prev = Center + FVector2D(RingPx, 0.0);
+            for (int32 s = 1; s <= Segs; ++s)
+            {
+                const double Ang = (2.0 * PI * s) / Segs;
+                const FVector2D Curr = Center + FVector2D(FMath::Cos(Ang) * RingPx, FMath::Sin(Ang) * RingPx);
+                FCanvasLineItem SegLine(Prev, Curr);
+                SegLine.SetColor(BrushCol);
+                SegLine.LineThickness = 1.8f;
+                Canvas->DrawItem(SegLine);
+                Prev = Curr;
+            }
+            if (GEngine && GEngine->GetSmallFont())
+            {
+                FCanvasTextItem TextItem(Center + FVector2D(16.0, -18.0), FText::FromString(TEXT("3D Paint")), GEngine->GetSmallFont(), BrushCol);
+                TextItem.EnableShadow(FLinearColor::Black);
+                Canvas->DrawItem(TextItem);
+            }
+        }
+
         if (PieMenu.IsOpen() && InViewport && Canvas && !Canvas->IsHitTesting())
         {
             const double DPIScale = FMath::Max(static_cast<double>(Canvas->GetDPIScale()), 0.01);
@@ -490,7 +555,7 @@ public:
     }
 
 private:
-    enum class EPointerAction : uint8 { None, Select, EdgeLoop, Gizmo, SoftRadius };
+    enum class EPointerAction : uint8 { None, Select, EdgeLoop, Gizmo, SoftRadius, Paint3D };
 
     void PostInvalidation() { Invalidate(false, false); }
 
@@ -536,8 +601,8 @@ private:
         }
         else if (Key == EKeys::One || Key == EKeys::Two || Key == EKeys::Three)
         {
-            PreviewViewport.SetSelectionMode(Key == EKeys::One ? ENGonElement::Vertex
-                : Key == EKeys::Two ? ENGonElement::Edge : ENGonElement::Face);
+            PreviewViewport.ToggleSelectionFlag(Key == EKeys::One ? ENGonSelectionMask::Vertex
+                : Key == EKeys::Two ? ENGonSelectionMask::Edge : ENGonSelectionMask::Face);
         }
         else if (Key == EKeys::Four)
         {
@@ -619,6 +684,25 @@ private:
 
     void BeginPointerAction(FViewport* InViewport, const FIntPoint& Mouse)
     {
+        // Direct 3D Viewport Painting takes priority over selection & marquee when active
+        if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin(); Pinned && Pinned->IsPaint3DMode())
+        {
+            FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
+            if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+            {
+                const FNGonSurfaceHit Hit = PreviewOwner->PickSurfaceHit(*View, FVector2D(Mouse.X, Mouse.Y));
+                if (Hit.bHit)
+                {
+                    PointerAction = EPointerAction::Paint3D;
+                    LastPaint3DMouse = Mouse;
+                    Pinned->DispatchPaint3DPoint(Hit, true);
+                    PostInvalidation();
+                    return;
+                }
+            }
+            return;
+        }
+
         // Gizmo has highest interaction priority: when the cursor is inside any gizmo handle or rotation area,
         // consume the pointer action for the gizmo and never fall through to mesh/bone picking or marquee selection.
         if (PreviewOwner->HasGizmoTarget())
@@ -658,6 +742,12 @@ private:
             UpdateSoftRadiusDrag(Mouse);
             return true;
         }
+        if (PointerAction == EPointerAction::Paint3D)
+        {
+            PendingPaint3DMouse = Mouse;
+            bPendingPaint3DMove = true;
+            return true;
+        }
         if (PointerAction == EPointerAction::Gizmo)
         {
             PendingGizmoMouse = Mouse;
@@ -666,7 +756,8 @@ private:
         }
         if (PointerAction == EPointerAction::Select)
         {
-            if (!NGon::IsBoneGizmoActive(&PreviewOwner.Get()))
+            const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
+            if (!NGon::IsBoneGizmoActive(&PreviewOwner.Get()) && (!Pinned || !Pinned->IsSelectionFrozen()))
             {
                 MarqueeEnd = FVector2D(Mouse.X, Mouse.Y);
                 bMarqueeActive = bMarqueeActive || FVector2D::DistSquared(MarqueeStart, MarqueeEnd) > 25.0;
@@ -678,6 +769,26 @@ private:
             return true;
         }
         return PointerAction == EPointerAction::EdgeLoop;
+    }
+
+    void UpdatePaint3DDrag(FViewport* InViewport, const FIntPoint& Mouse)
+    {
+        bPendingPaint3DMove = false;
+        if (!InViewport || Mouse == LastPaint3DMouse) return;
+        const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
+        if (!Pinned || !Pinned->IsPaint3DMode()) return;
+
+        FSceneViewFamilyContext ViewFamily(MakeViewFamily(InViewport));
+        if (const FSceneView* View = BuildSceneView(InViewport, ViewFamily))
+        {
+            const FNGonSurfaceHit Hit = PreviewOwner->PickSurfaceHit(*View, FVector2D(Mouse.X, Mouse.Y));
+            if (Hit.bHit)
+            {
+                Pinned->DispatchPaint3DPoint(Hit, false);
+            }
+        }
+        LastPaint3DMouse = Mouse;
+        PostInvalidation();
     }
 
     void UpdateGizmoDrag(const FIntPoint& Mouse)
@@ -698,7 +809,16 @@ private:
 
     void FinishPointerAction(FViewport* InViewport, const FIntPoint& Mouse)
     {
-        if (PointerAction == EPointerAction::SoftRadius)
+        if (PointerAction == EPointerAction::Paint3D)
+        {
+            UpdatePaint3DDrag(InViewport, Mouse);
+            if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
+            {
+                Pinned->DispatchPaint3DEnd();
+            }
+            bPendingPaint3DMove = false;
+        }
+        else if (PointerAction == EPointerAction::SoftRadius)
         {
             UpdateSoftRadiusDrag(Mouse);
         }
@@ -737,20 +857,24 @@ private:
             return false;
         }
 
+        if (Pinned->IsSelectionFrozen())
+        {
+            return false;
+        }
         const FVector2D Cursor(Mouse.X, Mouse.Y);
-        const ENGonElement Mode = Pinned->GetSelectionMode();
-        const int32 PrevAnchor = (PreviewOwner->GetSelectedElement() == Mode && !PreviewOwner->GetSelectedIds().IsEmpty())
-            ? (PreviewOwner->GetActiveSelectedId() != INDEX_NONE ? PreviewOwner->GetActiveSelectedId() : *PreviewOwner->GetSelectedIds().CreateConstIterator())
-            : INDEX_NONE;
-
         const TSet<int32> SavedSel = PreviewOwner->GetSelectedIds();
         const ENGonElement SavedElem = PreviewOwner->GetSelectedElement();
+        const int32 SavedActiveId = PreviewOwner->GetActiveSelectedId();
 
-        const int32 TargetId = Pinned->Pick(*View, Cursor, IsShiftPressed());
+        ENGonElement Mode = Pinned->GetSelectionMode();
+        const int32 TargetId = Pinned->Pick(*View, Cursor, IsShiftPressed(), &Mode);
         if (TargetId == INDEX_NONE)
         {
             return false;
         }
+        const int32 PrevAnchor = (SavedElem == Mode && !SavedSel.IsEmpty())
+            ? (SavedActiveId != INDEX_NONE ? SavedActiveId : *SavedSel.CreateConstIterator())
+            : INDEX_NONE;
         int32 EffectiveAnchor = PrevAnchor;
         if ((EffectiveAnchor == INDEX_NONE || EffectiveAnchor == TargetId)
             && PreviousSelectionAnchorElement == Mode
@@ -824,6 +948,12 @@ private:
             }
         }
 
+        // If all component selection toggles are OFF, selection is frozen (e.g. for painting)
+        if (Pinned->IsSelectionFrozen())
+        {
+            return;
+        }
+
         // Single click or marquee on mesh/empty space releases any selected joint in hierarchy
         ReleaseSelectedBone();
 
@@ -834,17 +964,18 @@ private:
         else
         {
             const bool bAdd = IsShiftPressed();
-            const ENGonElement CurMode = Pinned->GetSelectionMode();
-            const int32 PreClickAnchor = (PreviewOwner->GetSelectedElement() == CurMode && !PreviewOwner->GetSelectedIds().IsEmpty())
+            const ENGonElement PrevElem = PreviewOwner->GetSelectedElement();
+            const int32 PrevActive = (!PreviewOwner->GetSelectedIds().IsEmpty())
                 ? (PreviewOwner->GetActiveSelectedId() != INDEX_NONE ? PreviewOwner->GetActiveSelectedId() : *PreviewOwner->GetSelectedIds().CreateConstIterator())
                 : INDEX_NONE;
-            const int32 Hit = Pinned->Pick(View, Mouse, bAdd);
-            if (Hit != INDEX_NONE && PreClickAnchor != INDEX_NONE && PreClickAnchor != Hit)
+            ENGonElement PickedMode = Pinned->GetSelectionMode();
+            const int32 Hit = Pinned->Pick(View, Mouse, bAdd, &PickedMode);
+            if (Hit != INDEX_NONE && PrevElem == PickedMode && PrevActive != INDEX_NONE && PrevActive != Hit)
             {
-                PreviousSelectionAnchor = PreClickAnchor;
-                PreviousSelectionAnchorElement = CurMode;
+                PreviousSelectionAnchor = PrevActive;
+                PreviousSelectionAnchorElement = PickedMode;
             }
-            if (PointerAction == EPointerAction::EdgeLoop && CurMode == ENGonElement::Edge && Hit != INDEX_NONE)
+            if (PointerAction == EPointerAction::EdgeLoop && PickedMode == ENGonElement::Edge && Hit != INDEX_NONE)
             {
                 FNGonMeshAPI::SelectEdgeLoop(PreviewOwner.Get(), Hit, bAdd);
             }
@@ -869,14 +1000,27 @@ private:
         }
         bBKeyHeld = false;
         bBKeyDragged = false;
+        if (PointerAction == EPointerAction::Paint3D)
+        {
+            if (const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin())
+            {
+                Pinned->DispatchPaint3DEnd();
+            }
+        }
         PointerAction = EPointerAction::None;
         bPendingGizmoMove = false;
+        bPendingPaint3DMove = false;
         bMarqueeActive = false;
         PostInvalidation();
     }
 
     void DrawHoveredVertex(const FSceneView& View, FCanvas& Canvas, const FVector2D& CursorPx) const
     {
+        const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
+        if (Pinned && !Pinned->IsSelectionFlagEnabled(ENGonSelectionMask::Vertex))
+        {
+            return;
+        }
         const TArray<FVector>& Positions = PreviewOwner->GetPositions();
         if (Positions.IsEmpty() || Positions.Num() > 60000)
         {
@@ -896,8 +1040,7 @@ private:
         const double DPIScale = FMath::Max(static_cast<double>(Canvas.GetDPIScale()), 0.01);
 
         const FVector2D Center = BestPx / DPIScale;
-        const bool bAlreadySelected = PreviewOwner->GetSelectedElement() == ENGonElement::Vertex
-            && PreviewOwner->GetSelectedIds().Contains(BestVert);
+        const bool bAlreadySelected = PreviewOwner->GetSelectedVertexIds().Contains(BestVert);
         const FLinearColor DotColor = bAlreadySelected
             ? FLinearColor(1.0f, 0.94f, 0.25f, 1.0f)
             : FLinearColor(0.98f, 0.86f, 0.22f, 1.0f);
@@ -1010,6 +1153,9 @@ private:
     }
 
     bool bPendingGizmoMove = false;
+    bool bPendingPaint3DMove = false;
+    FIntPoint PendingPaint3DMouse = FIntPoint::ZeroValue;
+    FIntPoint LastPaint3DMouse = FIntPoint::ZeroValue;
     bool bMarqueeActive = false;
     bool bBKeyHeld = false;
     bool bBKeyDragged = false;
@@ -1037,8 +1183,9 @@ private:
         const bool bBoneActive = NGon::IsBoneGizmoActive(&PreviewOwner.Get());
         const bool bHasSelection = !PreviewOwner->GetSelectedIds().IsEmpty();
         const ENGonElement Elem = PreviewOwner->GetSelectedElement();
-        const bool bCanUndo = FNGonMeshAPI::CanUndo(&PreviewOwner.Get());
-        const bool bCanRedo = FNGonMeshAPI::CanRedo(&PreviewOwner.Get());
+        const TSharedPtr<FNGonUndoSession> PieUndoSession = NGon::Undo::FindSession(&PreviewOwner.Get());
+        const bool bCanUndo = (PieUndoSession.IsValid() && PieUndoSession->CanUndoChecked()) || FNGonMeshAPI::CanUndo(&PreviewOwner.Get());
+        const bool bCanRedo = (PieUndoSession.IsValid() && PieUndoSession->CanRedoChecked()) || FNGonMeshAPI::CanRedo(&PreviewOwner.Get());
 
         TArray<FNGonPieItem> RootItems;
 
@@ -1070,6 +1217,7 @@ private:
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Weld Vertices"), TEXT("WELD"), TEXT("mesh:weld"), SelCount >= 2));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Cut Face (2 Vtx)"), TEXT("CUT"), TEXT("mesh:cut_face"), SelCount >= 2));
             RootItems.Add(FNGonPieItem::Branch(TEXT("Select / Edit"), TEXT("SEL"), {
+                FNGonPieItem::Leaf(TEXT("Bevel Vertices"), TEXT("BVL"), TEXT("mesh:bevel_vertices")),
                 FNGonPieItem::Leaf(TEXT("Fill Hole (3+ Vtx)"), TEXT("FIL"), TEXT("mesh:fill_hole"), SelCount >= 3),
                 FNGonPieItem::Leaf(TEXT("Smooth Vertices"), TEXT("SMT"), TEXT("mesh:smooth")),
                 FNGonPieItem::Leaf(TEXT("Linked Shell"), TEXT("SHL"), TEXT("sel:linked")),
@@ -1095,6 +1243,7 @@ private:
             const int32 SelCount = PreviewOwner->GetSelectedIds().Num();
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Edge Loop"), TEXT("LOOP"), TEXT("sel:edge_loop")));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Edge Ring"), TEXT("RING"), TEXT("sel:edge_ring")));
+            RootItems.Add(FNGonPieItem::Leaf(TEXT("Bevel Edges"), TEXT("BEVL"), TEXT("mesh:bevel_edges")));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Split Edge"), TEXT("SPLT"), TEXT("mesh:split_edge")));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Collapse Edge"), TEXT("CLPS"), TEXT("mesh:collapse_edge")));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Bridge Edges (2)"), TEXT("BRDG"), TEXT("mesh:bridge"), SelCount >= 2));
@@ -1132,6 +1281,7 @@ private:
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Subdivide Faces"), TEXT("SUBD"), TEXT("mesh:subdivide")));
             RootItems.Add(FNGonPieItem::Leaf(TEXT("Delete Faces"), TEXT("DEL"), TEXT("mesh:delete")));
             RootItems.Add(FNGonPieItem::Branch(TEXT("Face Actions"), TEXT("FACE"), {
+                FNGonPieItem::Leaf(TEXT("Bevel Border (Rounded)"), TEXT("BVR"), TEXT("mesh:bevel_face_boundary")),
                 FNGonPieItem::Leaf(TEXT("Flip Normals"), TEXT("FLP"), TEXT("mesh:flip")),
                 FNGonPieItem::Leaf(TEXT("Triangulate"), TEXT("TRI"), TEXT("mesh:triangulate")),
                 FNGonPieItem::Leaf(TEXT("Smooth Region"), TEXT("SMT"), TEXT("mesh:smooth")),
@@ -1215,9 +1365,9 @@ private:
     void ExecutePieCommand(const FString& Cmd)
     {
         const TSharedPtr<SNGonViewport> Pinned = ViewportWidget.Pin();
-        if (Cmd == TEXT("mode:vertex") && Pinned) Pinned->SetSelectionMode(ENGonElement::Vertex);
-        else if (Cmd == TEXT("mode:edge") && Pinned) Pinned->SetSelectionMode(ENGonElement::Edge);
-        else if (Cmd == TEXT("mode:face") && Pinned) Pinned->SetSelectionMode(ENGonElement::Face);
+        if (Cmd == TEXT("mode:vertex") && Pinned) Pinned->ToggleSelectionFlag(ENGonSelectionMask::Vertex);
+        else if (Cmd == TEXT("mode:edge") && Pinned) Pinned->ToggleSelectionFlag(ENGonSelectionMask::Edge);
+        else if (Cmd == TEXT("mode:face") && Pinned) Pinned->ToggleSelectionFlag(ENGonSelectionMask::Face);
         else if (Cmd == TEXT("gizmo:translate") && Pinned) Pinned->SetGizmoMode(ENGonGizmoMode::Translate);
         else if (Cmd == TEXT("gizmo:rotate") && Pinned) Pinned->SetGizmoMode(ENGonGizmoMode::Rotate);
         else if (Cmd == TEXT("gizmo:scale") && Pinned) Pinned->SetGizmoMode(ENGonGizmoMode::Scale);
@@ -1243,6 +1393,9 @@ private:
         else if (Cmd == TEXT("mesh:extrude")) FNGonMeshAPI::ExtrudeFaces(PreviewOwner.Get(), {}, 25.0, 1.0);
         else if (Cmd == TEXT("mesh:inset")) FNGonMeshAPI::InsetFaces(PreviewOwner.Get(), {}, 0.25, 0.0);
         else if (Cmd == TEXT("mesh:bevel")) FNGonMeshAPI::BevelFaces(PreviewOwner.Get(), {}, 0.18, 8.0);
+        else if (Cmd == TEXT("mesh:bevel_edges")) { FNGonBevelOptions Opts; Opts.Width = 6.0; Opts.Segments = 2; Opts.Profile = 0.5; FNGonMeshAPI::BevelEdges(PreviewOwner.Get(), {}, Opts); }
+        else if (Cmd == TEXT("mesh:bevel_vertices")) { FNGonBevelOptions Opts; Opts.Width = 6.0; Opts.Segments = 1; Opts.Profile = 0.5; FNGonMeshAPI::BevelVertices(PreviewOwner.Get(), {}, Opts); }
+        else if (Cmd == TEXT("mesh:bevel_face_boundary")) { FNGonBevelOptions Opts; Opts.Width = 6.0; Opts.Segments = 2; Opts.Profile = 0.5; FNGonMeshAPI::BevelFacesBoundary(PreviewOwner.Get(), {}, Opts); }
         else if (Cmd == TEXT("mesh:subdivide")) FNGonMeshAPI::SubdivideFaces(PreviewOwner.Get(), {});
         else if (Cmd == TEXT("mesh:triangulate")) FNGonMeshAPI::TriangulateFaces(PreviewOwner.Get(), {});
         else if (Cmd == TEXT("mesh:flip")) FNGonMeshAPI::FlipFaces(PreviewOwner.Get(), {});
@@ -1258,8 +1411,16 @@ private:
         else if (Cmd == TEXT("mesh:taper")) FNGonMeshAPI::ApplyTaper(PreviewOwner.Get(), EAxis::Z, 0.35);
         else if (Cmd == TEXT("mesh:twist")) FNGonMeshAPI::ApplyTwist(PreviewOwner.Get(), EAxis::Z, 45.0);
         else if (Cmd == TEXT("mesh:noise")) FNGonMeshAPI::ApplyNoise(PreviewOwner.Get(), {}, 6.0, 0.05, 1337);
-        else if (Cmd == TEXT("mesh:undo")) FNGonMeshAPI::Undo(PreviewOwner.Get());
-        else if (Cmd == TEXT("mesh:redo")) FNGonMeshAPI::Redo(PreviewOwner.Get());
+        else if (Cmd == TEXT("mesh:undo"))
+        {
+            if (const TSharedPtr<FNGonUndoSession> Sess = NGon::Undo::FindSession(&PreviewOwner.Get()); Sess.IsValid() && Sess->CanUndoChecked()) Sess->UndoChecked();
+            else FNGonMeshAPI::Undo(PreviewOwner.Get());
+        }
+        else if (Cmd == TEXT("mesh:redo"))
+        {
+            if (const TSharedPtr<FNGonUndoSession> Sess = NGon::Undo::FindSession(&PreviewOwner.Get()); Sess.IsValid() && Sess->CanRedoChecked()) Sess->RedoChecked();
+            else FNGonMeshAPI::Redo(PreviewOwner.Get());
+        }
         else if (Cmd == TEXT("sel:grow")) FNGonMeshAPI::GrowSelection(PreviewOwner.Get());
         else if (Cmd == TEXT("sel:shrink")) FNGonMeshAPI::ShrinkSelection(PreviewOwner.Get());
         else if (Cmd == TEXT("sel:invert")) FNGonMeshAPI::InvertSelection(PreviewOwner.Get());
@@ -1350,15 +1511,71 @@ void SNGonViewport::OnFocusViewportToSelection()
 void SNGonViewport::SetSelectionMode(ENGonElement Element)
 {
     NGon::SetBoneGizmoActive(PreviewScene.Get(), false);
-    if (SelectionMode != Element)
+    const ENGonSelectionMask NewMask = NGonElementToMask(Element);
+    if (SelectionMode != Element || SelectionMask != NewMask)
     {
         SelectionMode = Element;
+        SelectionMask = NewMask;
         PreviewScene->ClearSelection();
         SetHeatmapVisible(false);
     }
     if (Element == ENGonElement::Vertex)
     {
         PreviewScene->SetShowVertices(true);
+    }
+    Invalidate();
+}
+
+void SNGonViewport::SetSelectionMask(ENGonSelectionMask Mask)
+{
+    SelectionMask = Mask;
+    if (Mask != ENGonSelectionMask::None)
+    {
+        NGon::SetBoneGizmoActive(PreviewScene.Get(), false);
+        if (EnumHasAnyFlags(Mask, ENGonSelectionMask::Vertex))
+        {
+            PreviewScene->SetShowVertices(true);
+            SelectionMode = ENGonElement::Vertex;
+        }
+        else if (EnumHasAnyFlags(Mask, ENGonSelectionMask::Edge))
+        {
+            SelectionMode = ENGonElement::Edge;
+        }
+        else if (EnumHasAnyFlags(Mask, ENGonSelectionMask::Face))
+        {
+            SelectionMode = ENGonElement::Face;
+        }
+    }
+    Invalidate();
+}
+
+void SNGonViewport::ToggleSelectionFlag(ENGonSelectionMask Flag)
+{
+    const bool bWasOn = EnumHasAnyFlags(SelectionMask, Flag);
+    if (bWasOn)
+    {
+        SelectionMask &= ~Flag;
+        if (EnumHasAnyFlags(SelectionMask, ENGonSelectionMask::Vertex)) SelectionMode = ENGonElement::Vertex;
+        else if (EnumHasAnyFlags(SelectionMask, ENGonSelectionMask::Edge)) SelectionMode = ENGonElement::Edge;
+        else if (EnumHasAnyFlags(SelectionMask, ENGonSelectionMask::Face)) SelectionMode = ENGonElement::Face;
+    }
+    else
+    {
+        SelectionMask |= Flag;
+        NGon::SetBoneGizmoActive(PreviewScene.Get(), false);
+        if (Flag == ENGonSelectionMask::Vertex)
+        {
+            SelectionMode = ENGonElement::Vertex;
+            PreviewScene->SetShowVertices(true);
+        }
+        else if (Flag == ENGonSelectionMask::Edge)
+        {
+            SelectionMode = ENGonElement::Edge;
+        }
+        else if (Flag == ENGonSelectionMask::Face)
+        {
+            SelectionMode = ENGonElement::Face;
+        }
     }
     Invalidate();
 }
@@ -1372,6 +1589,35 @@ void SNGonViewport::SetGizmoMode(ENGonGizmoMode Mode)
 ENGonGizmoMode SNGonViewport::GetGizmoMode() const
 {
     return PreviewScene->GetGizmoMode();
+}
+
+void SNGonViewport::SetPaint3DMode(bool bEnabled)
+{
+    bPaint3DMode = bEnabled;
+    Invalidate();
+}
+
+void SNGonViewport::SetPaint3DCallbacks(
+    TFunction<void(const FNGonSurfaceHit&, bool)> InOnPoint, TFunction<void()> InOnEnd)
+{
+    OnPaint3DPoint = MoveTemp(InOnPoint);
+    OnPaint3DEnd = MoveTemp(InOnEnd);
+}
+
+void SNGonViewport::DispatchPaint3DPoint(const FNGonSurfaceHit& Hit, bool bFirstPoint)
+{
+    if (OnPaint3DPoint)
+    {
+        OnPaint3DPoint(Hit, bFirstPoint);
+    }
+}
+
+void SNGonViewport::DispatchPaint3DEnd()
+{
+    if (OnPaint3DEnd)
+    {
+        OnPaint3DEnd();
+    }
 }
 
 void SNGonViewport::SetGridVisible(bool bVisible)
@@ -1409,9 +1655,22 @@ void SNGonViewport::SetHeatmapVisible(bool bVisible)
     Invalidate();
 }
 
-int32 SNGonViewport::Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd)
+int32 SNGonViewport::Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd, ENGonElement* OutPickedElement)
 {
-    const int32 Id = PreviewScene->Pick(SelectionMode, View, Cursor, bAdd);
+    if (SelectionMask == ENGonSelectionMask::None)
+    {
+        return INDEX_NONE;
+    }
+    ENGonElement PickedElem = SelectionMode;
+    const int32 Id = PreviewScene->PickMulti(SelectionMask, View, Cursor, bAdd, &PickedElem);
+    if (Id != INDEX_NONE)
+    {
+        SelectionMode = PickedElem;
+    }
+    if (OutPickedElement)
+    {
+        *OutPickedElement = PickedElem;
+    }
     if (!PreviewScene->HasSoftSelectionInfluence())
     {
         SetHeatmapVisible(false);
@@ -1422,7 +1681,11 @@ int32 SNGonViewport::Pick(const FSceneView& View, const FVector2D& Cursor, bool 
 
 void SNGonViewport::BoxSelect(const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained)
 {
-    PreviewScene->BoxSelect(SelectionMode, View, ScreenRect, bAdd, bFullyContained);
+    if (SelectionMask == ENGonSelectionMask::None)
+    {
+        return;
+    }
+    PreviewScene->BoxSelectMulti(SelectionMask, View, ScreenRect, bAdd, bFullyContained);
     if (!PreviewScene->HasSoftSelectionInfluence())
     {
         SetHeatmapVisible(false);

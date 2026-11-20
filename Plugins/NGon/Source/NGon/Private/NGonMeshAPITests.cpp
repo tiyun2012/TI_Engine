@@ -63,5 +63,86 @@ bool FNGonMeshAPIWorkflowTest::RunTest(const FString& Parameters)
     return true;
 }
 
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FNGonBevelKernelTest, "NGon.MeshAPI.BevelKernel",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FNGonBevelKernelTest::RunTest(const FString& Parameters)
+{
+    FNGonPreviewScene Scene;
+
+    // 1. Single-edge bevel (1 segment & 3 segments)
+    TestTrue(TEXT("CreateBox for single-edge bevel"), FNGonMeshAPI::CreateBox(Scene, 100.0, 100.0, 100.0).bOk);
+    {
+        FNGonBevelOptions Opts;
+        Opts.Width = 10.0;
+        Opts.Segments = 3;
+        Opts.Profile = 0.5;
+        Opts.bClampOverlap = true;
+        const FNGonMeshOpResult Res = FNGonMeshAPI::BevelEdges(Scene, { 0 }, Opts);
+        TestTrue(TEXT("Single-edge 3-seg bevel succeeds"), Res.bOk);
+        TestTrue(TEXT("Single-edge 3-seg bevel remains oriented manifold"), FNGonMeshAPI::CheckManifold(Scene, true).IsOk());
+    }
+
+    // 2. 3-edge cube corner bevel with ADJ quad grid (Segments = 3)
+    TestTrue(TEXT("CreateBox for 3-edge corner bevel"), FNGonMeshAPI::CreateBox(Scene, 100.0, 100.0, 100.0).bOk);
+    {
+        TArray<int32> CornerEdges;
+        const FNGonTopology& Topo = Scene.GetTopology();
+        for (int32 e = 0; e < Topo.Edges.Num(); ++e)
+        {
+            if (Topo.Edges[e].X == 0 || Topo.Edges[e].Y == 0)
+            {
+                CornerEdges.Add(e);
+            }
+        }
+        TestEqual(TEXT("Cube corner has 3 incident edges"), CornerEdges.Num(), 3);
+
+        FNGonBevelOptions Opts;
+        Opts.Width = 12.0;
+        Opts.Segments = 3;
+        Opts.Profile = 0.5;
+        Opts.bClampOverlap = true;
+        const FNGonMeshOpResult Res = FNGonMeshAPI::BevelEdges(Scene, CornerEdges, Opts);
+        TestTrue(TEXT("3-edge corner ADJ bevel succeeds"), Res.bOk);
+        TestTrue(TEXT("3-edge corner ADJ bevel remains oriented manifold"), FNGonMeshAPI::CheckManifold(Scene, true).IsOk());
+    }
+
+    // 3. Clamp Overlap safety on oversized width (Width = 500 on 100x100x100 cube)
+    TestTrue(TEXT("CreateBox for clamp-overlap test"), FNGonMeshAPI::CreateBox(Scene, 100.0, 100.0, 100.0).bOk);
+    {
+        TArray<int32> AllEdges;
+        for (int32 e = 0; e < Scene.GetTopology().Edges.Num(); ++e) AllEdges.Add(e);
+
+        FNGonBevelOptions Opts;
+        Opts.Width = 500.0;
+        Opts.Segments = 2;
+        Opts.Profile = 0.5;
+        Opts.bClampOverlap = true;
+        const FNGonMeshOpResult Res = FNGonMeshAPI::BevelEdges(Scene, AllEdges, Opts);
+        TestTrue(TEXT("Oversized all-edge bevel clamps and succeeds"), Res.bOk);
+        TestTrue(TEXT("Payload reports was_clamped=true"), Res.PayloadJson.Contains(TEXT("\"was_clamped\":true")));
+        TestTrue(TEXT("Clamped all-edge bevel remains oriented manifold"), FNGonMeshAPI::CheckManifold(Scene, true).IsOk());
+    }
+
+    // 4. Vertex bevel (1 segment & 2 segments) + Undo/Redo
+    TestTrue(TEXT("CreateBox for vertex bevel"), FNGonMeshAPI::CreateBox(Scene, 100.0, 100.0, 100.0).bOk);
+    {
+        FNGonBevelOptions Opts;
+        Opts.Width = 15.0;
+        Opts.Segments = 2;
+        Opts.Profile = 0.5;
+        Opts.bClampOverlap = true;
+        const FNGonMeshOpResult Res = FNGonMeshAPI::BevelVertices(Scene, { 0, 1 }, Opts);
+        TestTrue(TEXT("Multi-vertex 2-seg bevel succeeds"), Res.bOk);
+        TestTrue(TEXT("Vertex bevel remains oriented manifold"), FNGonMeshAPI::CheckManifold(Scene, true).IsOk());
+        TestTrue(TEXT("Undo restores 6-face box"), FNGonMeshAPI::Undo(Scene).bOk && Scene.GetTopology().Faces.Num() == 6);
+        TestTrue(TEXT("Redo restores vertex bevel"), FNGonMeshAPI::Redo(Scene).bOk && Scene.GetTopology().Faces.Num() > 6);
+    }
+
+    return true;
+}
+
 #endif
 // NGon Unified ABI Sync v5.8.2

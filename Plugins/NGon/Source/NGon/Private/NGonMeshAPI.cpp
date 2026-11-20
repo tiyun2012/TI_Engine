@@ -1,6 +1,7 @@
 #include "NGonMeshAPI.h"
 #include "Algo/Reverse.h"
 #include "NGonPreviewScene.h"
+#include "NGonUndoTree.h"
 #include "NGonSceneSkeleton.h"
 
 #include "Components/DynamicMeshComponent.h"
@@ -28,7 +29,7 @@ struct FNGonMeshSnapshot
 
 struct FNGonHistoryBuffer
 {
-    static constexpr int32 MaxHistory = 64;
+    static constexpr int32 MaxHistory = 20;
     TArray<FNGonMeshSnapshot> UndoStack;
     TArray<FNGonMeshSnapshot> RedoStack;
 };
@@ -267,14 +268,17 @@ bool CommitPolygonMesh(
     bool bRecordUndo,
     FText& OutError)
 {
-    if (bRecordUndo && !Scene.GetPositions().IsEmpty() && !Scene.GetTopology().Faces.IsEmpty())
+    const bool bHasBefore = !Scene.GetPositions().IsEmpty() && !Scene.GetTopology().Faces.IsEmpty();
+    FNGonMeshSnapshot BeforeSnap;
+    if (bRecordUndo && bHasBefore)
     {
+        BeforeSnap = CaptureSnapshot(Scene);
         PushUndoSnapshot(Scene);
     }
 
     if (!Scene.ReplacePolygonMesh(Positions, Faces, OutError))
     {
-        if (bRecordUndo)
+        if (bRecordUndo && bHasBefore)
         {
             if (FNGonHistoryBuffer* Hist = GMeshHistoryMap.Find(&Scene); Hist && !Hist->UndoStack.IsEmpty())
             {
@@ -285,6 +289,43 @@ bool CommitPolygonMesh(
     }
 
     NGon::UpdateActiveViewportUVMeshFromTopology(Scene.GetTopology());
+
+    if (bRecordUndo && bHasBefore)
+    {
+        if (const TSharedPtr<FNGonUndoSession> Session = NGon::Undo::FindSession(&Scene); Session.IsValid() && !Session->IsApplyingHistory())
+        {
+            const FNGonMeshSnapshot AfterSnap = CaptureSnapshot(Scene);
+            const bool bStructural = (BeforeSnap.Positions.Num() != AfterSnap.Positions.Num() || BeforeSnap.Faces.Num() != AfterSnap.Faces.Num());
+            const FString Label = bStructural
+                ? FString::Printf(TEXT("Mesh Edit (%d -> %d faces)"), BeforeSnap.Faces.Num(), AfterSnap.Faces.Num())
+                : FString::Printf(TEXT("Mesh Deform (%d verts)"), AfterSnap.Positions.Num());
+            const SIZE_T ApproxBytes = static_cast<SIZE_T>(BeforeSnap.Positions.Num() + AfterSnap.Positions.Num()) * sizeof(FVector)
+                                     + static_cast<SIZE_T>(BeforeSnap.Faces.Num() + AfterSnap.Faces.Num()) * 32ull;
+            FNGonPreviewScene* ScenePtr = &Scene;
+            TSharedPtr<INGonUndoPayload> Payload = MakeShared<FNGonLambdaUndoPayload>(
+                [ScenePtr, BeforeSnap]() -> bool
+                {
+                    FText Err;
+                    if (!CommitPolygonMesh(*ScenePtr, BeforeSnap.Positions, BeforeSnap.Faces, false, Err)) return false;
+                    ScenePtr->SetSelectionSet(BeforeSnap.SelectedElement, BeforeSnap.SelectedIds, false);
+                    return true;
+                },
+                [ScenePtr, AfterSnap]() -> bool
+                {
+                    FText Err;
+                    if (!CommitPolygonMesh(*ScenePtr, AfterSnap.Positions, AfterSnap.Faces, false, Err)) return false;
+                    ScenePtr->SetSelectionSet(AfterSnap.SelectedElement, AfterSnap.SelectedIds, false);
+                    return true;
+                },
+                ApproxBytes);
+            Session->PushEdit(
+                ENGonUndoContextId::Mesh,
+                Label,
+                bStructural ? ENGonUndoEditKind::Structural : ENGonUndoEditKind::Value,
+                MoveTemp(Payload),
+                ApproxBytes);
+        }
+    }
     return true;
 }
 
@@ -978,6 +1019,208 @@ FNGonMeshOpResult FNGonMeshAPI::BevelFaces(
         Res.Message = FString::Printf(TEXT("Beveled %d face(s) (inset %.2f, height %.2f)."),
             Res.SelectedIds.Num(), FMath::Clamp(Ratio, 0.05, 0.95), Height);
     }
+    return Res;
+}
+
+namespace
+{
+void ExtractOrderedFacesForBevel(
+    const FNGonTopology& Topo,
+    TArray<TArray<int32>>& OutFaces,
+    TMap<int32, int32>& OutFaceIdToIndex)
+{
+    TArray<int32> FaceKeys;
+    Topo.Faces.GetKeys(FaceKeys);
+    FaceKeys.Sort();
+    OutFaces.Reserve(FaceKeys.Num());
+    for (const int32 FaceId : FaceKeys)
+    {
+        if (const FNGonFace* Face = Topo.Faces.Find(FaceId))
+        {
+            if (Face->Perimeter.Num() >= 3)
+            {
+                const int32 Idx = OutFaces.Add(Face->Perimeter);
+                OutFaceIdToIndex.Add(FaceId, Idx);
+            }
+        }
+    }
+}
+
+FNGonMeshOpResult FinalizeBevelCommit(
+    FNGonPreviewScene& Scene,
+    const FString& OpName,
+    const FNGonBevelOutput& Out,
+    const FNGonBevelOptions& Options)
+{
+    FNGonMeshOpResult Res;
+    Res.Operation = OpName;
+    if (!Out.bOk)
+    {
+        Res.Message = Out.Message;
+        return Res;
+    }
+
+    FText Error;
+    if (!CommitPolygonMesh(Scene, Out.Positions, Out.Faces, true, Error))
+    {
+        Res.Message = Error.ToString();
+        return Res;
+    }
+
+    TArray<int32> NewFaceIds;
+    NewFaceIds.Reserve(Out.BevelFaceIndices.Num() + Out.CornerFaceIndices.Num());
+    for (const int32 FIdx : Out.BevelFaceIndices) NewFaceIds.AddUnique(FIdx);
+    for (const int32 FIdx : Out.CornerFaceIndices) NewFaceIds.AddUnique(FIdx);
+    NewFaceIds.Sort();
+
+    if (Options.bSelectResultFaces && !NewFaceIds.IsEmpty())
+    {
+        TSet<int32> SelSet(NewFaceIds);
+        Scene.SetSelectionSet(ENGonElement::Face, SelSet, false);
+    }
+
+    Res.bOk = true;
+    Res.Message = Out.Message;
+    Res.CreatedVertices = Out.CreatedVertices;
+    Res.CreatedFaces = NewFaceIds;
+    Res.SelectedIds = NewFaceIds;
+    Res.PayloadJson = FString::Printf(
+        TEXT("{\"requested_width\":%.4f,\"applied_width\":%.4f,\"was_clamped\":%s,\"segments\":%d,\"profile\":%.4f,\"bevel_face_count\":%d,\"corner_face_count\":%d,\"skipped_edges\":%d,\"skipped_vertices\":%d}"),
+        Out.RequestedWidth,
+        Out.AppliedWidth,
+        Out.bWasClamped ? TEXT("true") : TEXT("false"),
+        FMath::Clamp(Options.Segments, 1, 32),
+        FMath::Clamp(Options.Profile, 0.05, 0.9999),
+        Out.BevelFaceIndices.Num(),
+        Out.CornerFaceIndices.Num(),
+        Out.SkippedEdges,
+        Out.SkippedVertices);
+    return Res;
+}
+} // namespace
+
+FNGonMeshOpResult FNGonMeshAPI::BevelEdges(
+    FNGonPreviewScene& Scene,
+    const TArray<int32>& EdgeIds,
+    const FNGonBevelOptions& Options)
+{
+    FNGonMeshOpResult Res;
+    Res.Operation = TEXT("bevel_edges");
+
+    const FNGonTopology& Topo = Scene.GetTopology();
+    TArray<int32> Targets;
+    if (!EdgeIds.IsEmpty())
+    {
+        for (const int32 EId : EdgeIds)
+        {
+            if (Topo.Edges.IsValidIndex(EId)) Targets.AddUnique(EId);
+        }
+    }
+    else if (Scene.GetSelectedElement() == ENGonElement::Edge)
+    {
+        for (const int32 EId : Scene.GetSelectedIds())
+        {
+            if (Topo.Edges.IsValidIndex(EId)) Targets.AddUnique(EId);
+        }
+    }
+    Targets.Sort();
+
+    if (Targets.IsEmpty())
+    {
+        Res.Message = TEXT("No edges selected to bevel.");
+        return Res;
+    }
+
+    TArray<FIntPoint> SelectedEdges;
+    SelectedEdges.Reserve(Targets.Num());
+    for (const int32 EId : Targets)
+    {
+        SelectedEdges.Add(Topo.Edges[EId]);
+    }
+
+    TArray<TArray<int32>> OrderedFaces;
+    TMap<int32, int32> FaceIdToIndex;
+    ExtractOrderedFacesForBevel(Topo, OrderedFaces, FaceIdToIndex);
+
+    const FNGonBevelOutput Out = NGon::Bevel::BevelEdges(Scene.GetPositions(), OrderedFaces, SelectedEdges, Options);
+    return FinalizeBevelCommit(Scene, TEXT("bevel_edges"), Out, Options);
+}
+
+FNGonMeshOpResult FNGonMeshAPI::BevelVertices(
+    FNGonPreviewScene& Scene,
+    const TArray<int32>& VertexIds,
+    const FNGonBevelOptions& Options)
+{
+    FNGonMeshOpResult Res;
+    Res.Operation = TEXT("bevel_vertices");
+
+    TArray<int32> Targets = ResolveTargetVertices(Scene, VertexIds);
+    if (Targets.IsEmpty())
+    {
+        Res.Message = TEXT("No vertices selected to bevel.");
+        return Res;
+    }
+
+    TArray<TArray<int32>> OrderedFaces;
+    TMap<int32, int32> FaceIdToIndex;
+    ExtractOrderedFacesForBevel(Scene.GetTopology(), OrderedFaces, FaceIdToIndex);
+
+    const FNGonBevelOutput Out = NGon::Bevel::BevelVertices(Scene.GetPositions(), OrderedFaces, Targets, Options);
+    return FinalizeBevelCommit(Scene, TEXT("bevel_vertices"), Out, Options);
+}
+
+FNGonMeshOpResult FNGonMeshAPI::BevelFacesBoundary(
+    FNGonPreviewScene& Scene,
+    const TArray<int32>& FaceIds,
+    const FNGonBevelOptions& Options)
+{
+    FNGonMeshOpResult Res;
+    Res.Operation = TEXT("bevel_faces_boundary");
+
+    TArray<int32> Targets = ResolveTargetFaces(Scene, FaceIds);
+    if (Targets.IsEmpty())
+    {
+        Res.Message = TEXT("No faces selected to bevel.");
+        return Res;
+    }
+
+    TArray<TArray<int32>> OrderedFaces;
+    TMap<int32, int32> FaceIdToIndex;
+    ExtractOrderedFacesForBevel(Scene.GetTopology(), OrderedFaces, FaceIdToIndex);
+
+    TSet<int32> TargetFaceIndices;
+    for (const int32 FaceId : Targets)
+    {
+        if (const int32* Idx = FaceIdToIndex.Find(FaceId))
+        {
+            TargetFaceIndices.Add(*Idx);
+        }
+    }
+
+    const FNGonBevelOutput Out = NGon::Bevel::BevelFaceBoundaries(Scene.GetPositions(), OrderedFaces, TargetFaceIndices, Options);
+    return FinalizeBevelCommit(Scene, TEXT("bevel_faces_boundary"), Out, Options);
+}
+
+FNGonMeshOpResult FNGonMeshAPI::BevelSelection(
+    FNGonPreviewScene& Scene,
+    const FNGonBevelOptions& Options)
+{
+    const ENGonElement Elem = Scene.GetSelectedElement();
+    if (Elem == ENGonElement::Edge)
+    {
+        return BevelEdges(Scene, {}, Options);
+    }
+    if (Elem == ENGonElement::Vertex)
+    {
+        return BevelVertices(Scene, {}, Options);
+    }
+    if (Elem == ENGonElement::Face)
+    {
+        return BevelFacesBoundary(Scene, {}, Options);
+    }
+    FNGonMeshOpResult Res;
+    Res.Operation = TEXT("bevel_selection");
+    Res.Message = TEXT("Select at least one edge, vertex, or face to bevel.");
     return Res;
 }
 
@@ -3477,6 +3720,9 @@ FString FNGonMeshAPI::GetApiSchemaJson()
         "    {\"op\": \"extrude_faces\", \"params\": {\"face_ids\": [], \"distance\": 25, \"scale\": 1.0}},\n"
         "    {\"op\": \"inset_faces\", \"params\": {\"face_ids\": [], \"ratio\": 0.25, \"depth\": 0.0}},\n"
         "    {\"op\": \"bevel_faces\", \"params\": {\"face_ids\": [], \"ratio\": 0.18, \"height\": 8.0}},\n"
+        "    {\"op\": \"bevel_edges\", \"params\": {\"edge_ids\": [], \"width\": 5.0, \"segments\": 1, \"profile\": 0.5, \"clamp_overlap\": true}},\n"
+        "    {\"op\": \"bevel_vertices\", \"params\": {\"vertex_ids\": [], \"width\": 5.0, \"segments\": 1, \"profile\": 0.5, \"clamp_overlap\": true}},\n"
+        "    {\"op\": \"bevel_selection\", \"params\": {\"width\": 5.0, \"segments\": 1, \"profile\": 0.5, \"clamp_overlap\": true}},\n"
         "    {\"op\": \"subdivide_faces\", \"params\": {\"face_ids\": []}},\n"
         "    {\"op\": \"triangulate_faces\", \"params\": {\"face_ids\": []}},\n"
         "    {\"op\": \"flip_faces\", \"params\": {\"face_ids\": []}},\n"
@@ -3596,8 +3842,56 @@ FNGonMeshOpResult ExecuteSingleJsonObject(FNGonPreviewScene& Scene, const TShare
         return FNGonMeshAPI::InsetFaces(Scene, ReadIntArrayFromJson(Obj, TEXT("face_ids")),
             GetNum(TEXT("ratio"), 0.25), GetNum(TEXT("depth"), 0.0));
     }
-    if (Op == TEXT("bevel_faces") || Op == TEXT("bevel"))
+    auto ReadBevelOptions = [&]() -> FNGonBevelOptions
     {
+        FNGonBevelOptions Opts;
+        Opts.Width = GetNum(TEXT("width"), 5.0);
+        Opts.Segments = FMath::Clamp(GetInt(TEXT("segments"), 1), 1, 32);
+        Opts.Profile = FMath::Clamp(GetNum(TEXT("profile"), 0.5), 0.05, 0.9999);
+        Opts.bClampOverlap = GetBool(TEXT("clamp_overlap"), true);
+        Opts.bSkipNonManifoldEdges = GetBool(TEXT("skip_non_manifold"), true);
+        Opts.bSelectResultFaces = GetBool(TEXT("select_result"), true);
+        return Opts;
+    };
+    if (Op == TEXT("bevel_edges"))
+    {
+        return FNGonMeshAPI::BevelEdges(Scene, ReadIntArrayFromJson(Obj, TEXT("edge_ids")), ReadBevelOptions());
+    }
+    if (Op == TEXT("bevel_vertices"))
+    {
+        return FNGonMeshAPI::BevelVertices(Scene, ReadIntArrayFromJson(Obj, TEXT("vertex_ids")), ReadBevelOptions());
+    }
+    if (Op == TEXT("bevel_faces_boundary"))
+    {
+        return FNGonMeshAPI::BevelFacesBoundary(Scene, ReadIntArrayFromJson(Obj, TEXT("face_ids")), ReadBevelOptions());
+    }
+    if (Op == TEXT("bevel_selection"))
+    {
+        return FNGonMeshAPI::BevelSelection(Scene, ReadBevelOptions());
+    }
+    if (Op == TEXT("bevel_faces"))
+    {
+        if (Obj->HasField(TEXT("width")) || Obj->HasField(TEXT("segments")))
+        {
+            return FNGonMeshAPI::BevelFacesBoundary(Scene, ReadIntArrayFromJson(Obj, TEXT("face_ids")), ReadBevelOptions());
+        }
+        return FNGonMeshAPI::BevelFaces(Scene, ReadIntArrayFromJson(Obj, TEXT("face_ids")),
+            GetNum(TEXT("ratio"), 0.18), GetNum(TEXT("height"), 8.0));
+    }
+    if (Op == TEXT("bevel"))
+    {
+        if (Obj->HasField(TEXT("edge_ids")))
+        {
+            return FNGonMeshAPI::BevelEdges(Scene, ReadIntArrayFromJson(Obj, TEXT("edge_ids")), ReadBevelOptions());
+        }
+        if (Obj->HasField(TEXT("vertex_ids")))
+        {
+            return FNGonMeshAPI::BevelVertices(Scene, ReadIntArrayFromJson(Obj, TEXT("vertex_ids")), ReadBevelOptions());
+        }
+        if (Obj->HasField(TEXT("width")) || Obj->HasField(TEXT("segments")))
+        {
+            return FNGonMeshAPI::BevelSelection(Scene, ReadBevelOptions());
+        }
         return FNGonMeshAPI::BevelFaces(Scene, ReadIntArrayFromJson(Obj, TEXT("face_ids")),
             GetNum(TEXT("ratio"), 0.18), GetNum(TEXT("height"), 8.0));
     }

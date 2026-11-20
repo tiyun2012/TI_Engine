@@ -907,6 +907,7 @@ bool LoadFbxInternal(
     TArray<TArray<int32>> Faces;
     TArray<TArray<FFbxCornerUV>> FaceUVs;
     TArray<float> RedSamples;
+    TArray<FNGonSubMeshInfo> FbxSubMeshes;
     int32 UVKeyOffset = 0;
     TArray<FbxNode*> Pending;
     if (FbxNode* Root = Scene->GetRootNode())
@@ -919,10 +920,34 @@ bool LoadFbxInternal(
         if (FbxMesh* Mesh = Node->GetMesh(); Mesh && Mesh->GetPolygonCount() > 0)
         {
             const int32 BaseVertex = Positions.Num();
+            const int32 BaseFace = Faces.Num();
             const int32 PointCount = Mesh->GetControlPointsCount();
             if (!AppendMesh(*Node, *Mesh, ToCentimeters, UVKeyOffset, Positions, Faces, FaceUVs, RedSamples, Error))
             {
                 return false;
+            }
+            const int32 AddedFaces = Faces.Num() - BaseFace;
+            if (AddedFaces > 0)
+            {
+                FNGonSubMeshInfo& Sub = FbxSubMeshes.AddDefaulted_GetRef();
+                Sub.SubMeshIndex = FbxSubMeshes.Num() - 1;
+                const char* RawNodeName = Node->GetName();
+                Sub.Name = (RawNodeName && RawNodeName[0] != '\0')
+                    ? FName(UTF8_TO_TCHAR(RawNodeName))
+                    : FName(*FString::Printf(TEXT("Mesh_%d"), Sub.SubMeshIndex));
+                if (FbxNode* ParentNode = Node->GetParent(); ParentNode && ParentNode != Scene->GetRootNode())
+                {
+                    const char* RawParent = ParentNode->GetName();
+                    if (RawParent && RawParent[0] != '\0')
+                    {
+                        Sub.ParentName = FName(UTF8_TO_TCHAR(RawParent));
+                    }
+                }
+                Sub.FirstFaceId = BaseFace;
+                Sub.FaceCount = AddedFaces;
+                Sub.FirstVertexId = BaseVertex;
+                Sub.VertexCount = PointCount;
+                Sub.bVisible = true;
             }
             if (OutSkeleton)
             {
@@ -989,6 +1014,23 @@ bool LoadFbxInternal(
                     {
                         BW.Weight /= Sum;
                     }
+                }
+            }
+        }
+    }
+
+    if (!FbxSubMeshes.IsEmpty())
+    {
+        Result.Topology.SubMeshes = MoveTemp(FbxSubMeshes);
+        Result.Topology.FaceToSubMesh.Reset();
+        Result.Topology.FaceToSubMesh.Reserve(Result.Topology.Faces.Num());
+        for (const FNGonSubMeshInfo& Sub : Result.Topology.SubMeshes)
+        {
+            for (int32 f = Sub.FirstFaceId; f < Sub.FirstFaceId + Sub.FaceCount; ++f)
+            {
+                if (Result.Topology.Faces.Contains(f))
+                {
+                    Result.Topology.FaceToSubMesh.Add(f, Sub.SubMeshIndex);
                 }
             }
         }

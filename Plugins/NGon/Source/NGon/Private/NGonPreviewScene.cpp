@@ -1,4 +1,5 @@
 #include "NGonPreviewScene.h"
+#include "NGonUndoTree.h"
 #include "NGonSceneSkeleton.h"
 #include "NGonMeshAPI.h"
 
@@ -320,8 +321,8 @@ FNGonPreviewScene::~FNGonPreviewScene()
 bool FNGonPreviewScene::HasGizmoTarget() const
 {
     const FNGonSceneAccel& Accel = GetSceneAccel(this);
-    const bool bHasBone = Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || SelectedIds.IsEmpty());
-    return GizmoMode != ENGonGizmoMode::None && (bHasBone || !SelectedIds.IsEmpty());
+    const bool bHasBone = Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || !HasAnySelection());
+    return GizmoMode != ENGonGizmoMode::None && (bHasBone || HasAnySelection());
 }
 
 void FNGonPreviewScene::RefreshBoneDeformation()
@@ -417,19 +418,19 @@ FBox FNGonPreviewScene::GetSelectionOrMeshBounds() const
         const double MinExtent = FMath::Max(Topology.RestBounds.GetSize().GetMax() * 0.12, 15.0);
         return BoneBounds.ExpandBy(MinExtent);
     }
-    if (SelectedIds.IsEmpty())
+    if (!HasAnySelection())
     {
         return GetMeshBounds();
     }
 
     FBox Bounds(ForceInit);
-    for (const int32 Id : SelectedIds)
+    for (const int32 Id : SelectedVertexIds)
     {
-        if (SelectedElement == ENGonElement::Vertex && Positions.IsValidIndex(Id))
-        {
-            Bounds += Positions[Id];
-        }
-        else if (SelectedElement == ENGonElement::Edge && Topology.Edges.IsValidIndex(Id))
+        if (Positions.IsValidIndex(Id)) Bounds += Positions[Id];
+    }
+    for (const int32 Id : SelectedEdgeIds)
+    {
+        if (Topology.Edges.IsValidIndex(Id))
         {
             const FIntPoint Edge = Topology.Edges[Id];
             if (Positions.IsValidIndex(Edge.X) && Positions.IsValidIndex(Edge.Y))
@@ -438,17 +439,14 @@ FBox FNGonPreviewScene::GetSelectionOrMeshBounds() const
                 Bounds += Positions[Edge.Y];
             }
         }
-        else if (SelectedElement == ENGonElement::Face)
+    }
+    for (const int32 Id : SelectedFaceIds)
+    {
+        if (const FNGonFace* Face = Topology.Faces.Find(Id))
         {
-            if (const FNGonFace* Face = Topology.Faces.Find(Id))
+            for (const int32 Vertex : Face->Perimeter)
             {
-                for (const int32 Vertex : Face->Perimeter)
-                {
-                    if (Positions.IsValidIndex(Vertex))
-                    {
-                        Bounds += Positions[Vertex];
-                    }
-                }
+                if (Positions.IsValidIndex(Vertex)) Bounds += Positions[Vertex];
             }
         }
     }
@@ -483,7 +481,7 @@ void FNGonPreviewScene::SetPreviewMaterials(UInteractiveToolManager* ToolManager
         Surface->SetSecondaryRenderMaterial(HighlightRef.Get());
         Surface->EnableSecondaryTriangleBuffers([this](const FDynamicMesh3* Mesh, int32 TriangleId)
         {
-            return SelectedElement == ENGonElement::Face && SelectedIds.Contains(Mesh->GetTriangleGroup(TriangleId));
+            return SelectedFaceIds.Contains(Mesh->GetTriangleGroup(TriangleId));
         });
         bSecondaryFaceHighlight = true;
     }
@@ -506,6 +504,9 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data, TArray<UMaterialInterface*
     Picker.SetMesh(nullptr);
     SelectedElement = ENGonElement::Face;
     SelectedIds.Reset();
+    SelectedVertexIds.Reset();
+    SelectedEdgeIds.Reset();
+    SelectedFaceIds.Reset();
     ActiveSelectedId = INDEX_NONE;
     SoftSettings = FNGonSoftSelectionSettings{};
     SoftTransformMode = ENGonSoftTransformMode::Fixed;
@@ -564,18 +565,32 @@ void FNGonPreviewScene::SetMesh(FNGonMeshData&& Data, TArray<UMaterialInterface*
     Surface->SetTwoSided(Materials.IsEmpty());
     Surface->SetMesh(MoveTemp(Data.Mesh));
     UMaterialInterface* Neutral = StudioMaterial.IsValid() ? StudioMaterial.Get() : UMaterial::GetDefaultMaterial(MD_Surface);
+    MaterialSlots.Reset();
     if (Materials.IsEmpty())
     {
-        Materials.Add(Neutral);
+        FNGonMaterialSlotsSnapshot::FSlotData DefaultSlot;
+        DefaultSlot.Name = TEXT("Slot 0 (Studio)");
+        DefaultSlot.PreviewColor = StudioColor;
+        DefaultSlot.Material.Reset(Neutral);
+        DefaultSlot.bIsCustomAsset = false;
+        MaterialSlots.Add(MoveTemp(DefaultSlot));
     }
-    for (UMaterialInterface*& Material : Materials)
+    else
     {
-        if (!Material || Material == UMaterial::GetDefaultMaterial(MD_Surface))
+        MaterialSlots.Reserve(Materials.Num());
+        for (int32 i = 0; i < Materials.Num(); ++i)
         {
-            Material = Neutral;
+            UMaterialInterface* Mat = Materials[i];
+            const bool bCustom = (Mat != nullptr && Mat != UMaterial::GetDefaultMaterial(MD_Surface) && Mat != Neutral);
+            FNGonMaterialSlotsSnapshot::FSlotData Slot;
+            Slot.Name = bCustom ? Mat->GetName() : FString::Printf(TEXT("Slot %d (Studio)"), i);
+            Slot.PreviewColor = StudioColor;
+            Slot.Material.Reset(bCustom ? Mat : Neutral);
+            Slot.bIsCustomAsset = bCustom;
+            MaterialSlots.Add(MoveTemp(Slot));
         }
     }
-    Surface->ConfigureMaterialSet(Materials, true);
+    ApplyMaterialSlotsToSurface();
     Picker.SetMesh(Surface->GetDynamicMesh()->GetMeshPtr());
     RebuildOverlays();
     ++TopologyUpdates;
@@ -750,6 +765,290 @@ void FNGonPreviewScene::RefreshPaintMaterial()
     }
 }
 
+UMaterialInterface* FNGonPreviewScene::MakeTintedStudioSlotMaterial(const FLinearColor& Color)
+{
+    if (StudioMaterial.IsValid())
+    {
+        if (UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(StudioMaterial.Get(), GetTransientPackage()))
+        {
+            MID->SetVectorParameterValue(TEXT("BaseAlbedo"), Color);
+            return MID;
+        }
+        return StudioMaterial.Get();
+    }
+    return UMaterial::GetDefaultMaterial(MD_Surface);
+}
+
+void FNGonPreviewScene::ApplyMaterialSlotsToSurface()
+{
+    if (!Surface) return;
+    UMaterialInterface* Neutral = StudioMaterial.IsValid() ? StudioMaterial.Get() : UMaterial::GetDefaultMaterial(MD_Surface);
+    if (MaterialSlots.IsEmpty())
+    {
+        FNGonMaterialSlotsSnapshot::FSlotData DefaultSlot;
+        DefaultSlot.Name = TEXT("Slot 0 (Studio)");
+        DefaultSlot.PreviewColor = StudioColor;
+        DefaultSlot.Material.Reset(Neutral);
+        DefaultSlot.bIsCustomAsset = false;
+        MaterialSlots.Add(MoveTemp(DefaultSlot));
+    }
+
+    TArray<UMaterialInterface*> RawMaterials;
+    RawMaterials.Reserve(MaterialSlots.Num());
+    for (FNGonMaterialSlotsSnapshot::FSlotData& Slot : MaterialSlots)
+    {
+        UMaterialInterface* Mat = Slot.Material.IsValid() ? Slot.Material.Get() : Neutral;
+        if (!Mat) Mat = UMaterial::GetDefaultMaterial(MD_Surface);
+        RawMaterials.Add(Mat);
+    }
+    Surface->ConfigureMaterialSet(RawMaterials, true);
+    UpdateSurfaceDisplay(false);
+}
+
+TArray<FNGonMaterialSlotInfo> FNGonPreviewScene::GetMaterialSlots() const
+{
+    TArray<FNGonMaterialSlotInfo> Out;
+    Out.Reserve(MaterialSlots.Num());
+    TArray<int32> TriCounts;
+    TriCounts.Init(0, MaterialSlots.Num());
+
+    if (Surface && Surface->GetDynamicMesh())
+    {
+        const FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
+        const FDynamicMeshMaterialAttribute* MatAttr = (Mesh.HasAttributes() && Mesh.Attributes()->HasMaterialID())
+            ? Mesh.Attributes()->GetMaterialID() : nullptr;
+        for (const int32 TriId : Mesh.TriangleIndicesItr())
+        {
+            const int32 MatId = MatAttr ? MatAttr->GetValue(TriId) : 0;
+            if (TriCounts.IsValidIndex(MatId))
+            {
+                ++TriCounts[MatId];
+            }
+            else if (TriCounts.Num() > 0)
+            {
+                ++TriCounts[0];
+            }
+        }
+    }
+
+    for (int32 i = 0; i < MaterialSlots.Num(); ++i)
+    {
+        const FNGonMaterialSlotsSnapshot::FSlotData& Slot = MaterialSlots[i];
+        FNGonMaterialSlotInfo Info;
+        Info.Name = Slot.Name;
+        Info.PreviewColor = Slot.PreviewColor;
+        Info.TriangleCount = TriCounts.IsValidIndex(i) ? TriCounts[i] : 0;
+        Info.bIsCustomAsset = Slot.bIsCustomAsset;
+        if (Slot.bIsCustomAsset && Slot.Material.IsValid())
+        {
+            Info.AssetPath = Slot.Material->GetPathName();
+        }
+        Out.Add(MoveTemp(Info));
+    }
+    return Out;
+}
+
+int32 FNGonPreviewScene::AddMaterialSlot(const FString& SlotName, UMaterialInterface* InMaterial)
+{
+    static const FLinearColor Palette[] = {
+        FLinearColor(0.55f, 0.58f, 0.64f, 1.0f),
+        FLinearColor(0.32f, 0.62f, 0.85f, 1.0f),
+        FLinearColor(0.84f, 0.44f, 0.34f, 1.0f),
+        FLinearColor(0.36f, 0.74f, 0.52f, 1.0f),
+        FLinearColor(0.82f, 0.68f, 0.28f, 1.0f),
+        FLinearColor(0.68f, 0.45f, 0.84f, 1.0f),
+        FLinearColor(0.84f, 0.50f, 0.68f, 1.0f),
+        FLinearColor(0.35f, 0.76f, 0.78f, 1.0f)
+    };
+    const int32 NewIdx = MaterialSlots.Num();
+    const FLinearColor Tint = Palette[NewIdx % UE_ARRAY_COUNT(Palette)];
+
+    FNGonMaterialSlotsSnapshot::FSlotData Slot;
+    Slot.PreviewColor = Tint;
+    if (InMaterial)
+    {
+        Slot.Material.Reset(InMaterial);
+        Slot.bIsCustomAsset = true;
+        Slot.Name = SlotName.IsEmpty() ? InMaterial->GetName() : SlotName;
+    }
+    else
+    {
+        Slot.Material.Reset(MakeTintedStudioSlotMaterial(Tint));
+        Slot.bIsCustomAsset = false;
+        Slot.Name = SlotName.IsEmpty() ? FString::Printf(TEXT("Material Slot %d"), NewIdx) : SlotName;
+    }
+    MaterialSlots.Add(MoveTemp(Slot));
+    ApplyMaterialSlotsToSurface();
+    return NewIdx;
+}
+
+bool FNGonPreviewScene::RemoveMaterialSlot(int32 SlotIndex)
+{
+    if (MaterialSlots.Num() <= 1 || !MaterialSlots.IsValidIndex(SlotIndex))
+    {
+        return false;
+    }
+
+    const int32 FallbackSlot = FMath::Max(0, SlotIndex - 1);
+    if (Surface && Surface->GetDynamicMesh())
+    {
+        FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
+        if (Mesh.HasAttributes() && Mesh.Attributes()->HasMaterialID())
+        {
+            FDynamicMeshMaterialAttribute* MatAttr = Mesh.Attributes()->GetMaterialID();
+            for (const int32 TriId : Mesh.TriangleIndicesItr())
+            {
+                const int32 Cur = MatAttr->GetValue(TriId);
+                if (Cur == SlotIndex)
+                {
+                    MatAttr->SetValue(TriId, FallbackSlot);
+                }
+                else if (Cur > SlotIndex)
+                {
+                    MatAttr->SetValue(TriId, Cur - 1);
+                }
+            }
+            Surface->NotifyMeshUpdated();
+        }
+    }
+
+    MaterialSlots.RemoveAt(SlotIndex);
+    ApplyMaterialSlotsToSurface();
+    return true;
+}
+
+bool FNGonPreviewScene::SetMaterialSlotAsset(int32 SlotIndex, UMaterialInterface* NewMaterial)
+{
+    if (!MaterialSlots.IsValidIndex(SlotIndex))
+    {
+        return false;
+    }
+    FNGonMaterialSlotsSnapshot::FSlotData& Slot = MaterialSlots[SlotIndex];
+    if (NewMaterial)
+    {
+        Slot.Material.Reset(NewMaterial);
+        Slot.bIsCustomAsset = true;
+        Slot.Name = NewMaterial->GetName();
+    }
+    else
+    {
+        Slot.Material.Reset(MakeTintedStudioSlotMaterial(Slot.PreviewColor));
+        Slot.bIsCustomAsset = false;
+        Slot.Name = FString::Printf(TEXT("Material Slot %d"), SlotIndex);
+    }
+    ApplyMaterialSlotsToSurface();
+    return true;
+}
+
+bool FNGonPreviewScene::AssignSelectedFacesToMaterialSlot(int32 SlotIndex)
+{
+    if (!MaterialSlots.IsValidIndex(SlotIndex) || SelectedFaceIds.IsEmpty() || !Surface || !Surface->GetDynamicMesh())
+    {
+        return false;
+    }
+
+    FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
+    if (!Mesh.HasAttributes())
+    {
+        Mesh.EnableAttributes();
+    }
+    if (!Mesh.Attributes()->HasMaterialID())
+    {
+        Mesh.Attributes()->EnableMaterialID();
+        FDynamicMeshMaterialAttribute* InitAttr = Mesh.Attributes()->GetMaterialID();
+        for (const int32 TriId : Mesh.TriangleIndicesItr())
+        {
+            InitAttr->SetValue(TriId, 0);
+        }
+    }
+
+    FDynamicMeshMaterialAttribute* MatAttr = Mesh.Attributes()->GetMaterialID();
+    int32 AssignedTris = 0;
+    for (const int32 TriId : Mesh.TriangleIndicesItr())
+    {
+        const int32 FaceId = Mesh.GetTriangleGroup(TriId);
+        if (SelectedFaceIds.Contains(FaceId))
+        {
+            MatAttr->SetValue(TriId, SlotIndex);
+            ++AssignedTris;
+        }
+    }
+
+    if (AssignedTris > 0)
+    {
+        Surface->NotifyMeshUpdated();
+        ApplyMaterialSlotsToSurface();
+        UpdateFaceHighlight();
+        return true;
+    }
+    return false;
+}
+
+int32 FNGonPreviewScene::SelectFacesByMaterialSlot(int32 SlotIndex, bool bAdd)
+{
+    if (!MaterialSlots.IsValidIndex(SlotIndex) || !Surface || !Surface->GetDynamicMesh())
+    {
+        return 0;
+    }
+
+    const FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
+    const FDynamicMeshMaterialAttribute* MatAttr = (Mesh.HasAttributes() && Mesh.Attributes()->HasMaterialID())
+        ? Mesh.Attributes()->GetMaterialID() : nullptr;
+
+    TSet<int32> MatchingFaces;
+    for (const int32 TriId : Mesh.TriangleIndicesItr())
+    {
+        const int32 MatId = MatAttr ? MatAttr->GetValue(TriId) : 0;
+        if (MatId == SlotIndex)
+        {
+            MatchingFaces.Add(Mesh.GetTriangleGroup(TriId));
+        }
+    }
+    ApplySelectionSet(ENGonElement::Face, MatchingFaces, bAdd);
+    return MatchingFaces.Num();
+}
+
+FNGonMaterialSlotsSnapshot FNGonPreviewScene::CaptureMaterialSlotsSnapshot() const
+{
+    FNGonMaterialSlotsSnapshot Snap;
+    Snap.Slots = MaterialSlots;
+    if (Surface && Surface->GetDynamicMesh())
+    {
+        const FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
+        if (Mesh.HasAttributes() && Mesh.Attributes()->HasMaterialID())
+        {
+            const FDynamicMeshMaterialAttribute* MatAttr = Mesh.Attributes()->GetMaterialID();
+            for (const int32 TriId : Mesh.TriangleIndicesItr())
+            {
+                Snap.TriangleMaterialIDs.Add(TriId, MatAttr->GetValue(TriId));
+            }
+        }
+    }
+    return Snap;
+}
+
+void FNGonPreviewScene::RestoreMaterialSlotsSnapshot(const FNGonMaterialSlotsSnapshot& Snapshot)
+{
+    MaterialSlots = Snapshot.Slots;
+    if (Surface && Surface->GetDynamicMesh() && !Snapshot.TriangleMaterialIDs.IsEmpty())
+    {
+        FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
+        if (!Mesh.HasAttributes()) Mesh.EnableAttributes();
+        if (!Mesh.Attributes()->HasMaterialID()) Mesh.Attributes()->EnableMaterialID();
+        FDynamicMeshMaterialAttribute* MatAttr = Mesh.Attributes()->GetMaterialID();
+        for (const int32 TriId : Mesh.TriangleIndicesItr())
+        {
+            if (const int32* Found = Snapshot.TriangleMaterialIDs.Find(TriId))
+            {
+                MatAttr->SetValue(TriId, FMath::Clamp(*Found, 0, FMath::Max(0, MaterialSlots.Num() - 1)));
+            }
+        }
+        Surface->NotifyMeshUpdated();
+    }
+    ApplyMaterialSlotsToSurface();
+    UpdateFaceHighlight();
+}
+
 void FNGonPreviewScene::UpdateFaceHighlight()
 {
     if (bSecondaryFaceHighlight)
@@ -858,7 +1157,7 @@ void FNGonPreviewScene::UpdateCameraVertexScales(const FVector& CameraOrigin, co
         }
     }
 
-    if (SelectedElement == ENGonElement::Vertex && !SelectedIds.IsEmpty())
+    if (!SelectedVertexIds.IsEmpty())
     {
         Accel.CachedSelectedVertexCount = 0;
         DrawSelection();
@@ -1122,7 +1421,7 @@ void FNGonPreviewScene::SetBend(float Value)
     Picker.PositionsChanged();
     GetSceneAccel(this).RecomputeAllVertexNormals(Positions);
     UpdateOverlayPositions();
-    if (!SelectedIds.IsEmpty())
+    if (HasAnySelection())
     {
         GetSceneAccel(this).bBoneGizmoActive = false;
     }
@@ -1139,19 +1438,24 @@ void FNGonPreviewScene::SetSoftSelection(const FNGonSoftSelectionSettings& Setti
 void FNGonPreviewScene::RebuildSoftSelection()
 {
     TArray<int32> Seeds;
-    if (SelectedElement == ENGonElement::Vertex)
+    for (const int32 Id : SelectedVertexIds)
     {
-        for (const int32 Id : SelectedIds) if (Positions.IsValidIndex(Id)) Seeds.Add(Id);
+        if (Positions.IsValidIndex(Id)) Seeds.AddUnique(Id);
     }
-    else if (SelectedElement == ENGonElement::Edge)
+    for (const int32 Id : SelectedEdgeIds)
     {
-        for (const int32 Id : SelectedIds) if (Topology.Edges.IsValidIndex(Id))
-        { Seeds.AddUnique(Topology.Edges[Id].X); Seeds.AddUnique(Topology.Edges[Id].Y); }
+        if (Topology.Edges.IsValidIndex(Id))
+        {
+            Seeds.AddUnique(Topology.Edges[Id].X);
+            Seeds.AddUnique(Topology.Edges[Id].Y);
+        }
     }
-    else
+    for (const int32 Id : SelectedFaceIds)
     {
-        for (const int32 Id : SelectedIds) if (const FNGonFace* Face = Topology.Faces.Find(Id))
+        if (const FNGonFace* Face = Topology.Faces.Find(Id))
+        {
             for (const int32 Vertex : Face->Perimeter) Seeds.AddUnique(Vertex);
+        }
     }
     SoftInfluences = SoftSolver.Solve(Topology, Positions, Seeds, FTransform::Identity, SoftSettings);
     RebuildSoftHeatSamples();
@@ -1162,7 +1466,7 @@ void FNGonPreviewScene::RebuildSoftSelection()
 FTransform FNGonPreviewScene::GetSelectionGizmoTransform() const
 {
     const FNGonSceneAccel& Accel = GetSceneAccel(this);
-    if (Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || SelectedIds.IsEmpty()))
+    if (Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || !HasAnySelection()))
     {
         const FTransform& BoneComp = Accel.Bones[Accel.SelectedBoneIndex].CurrentComponentTransform;
         const FQuat GizmoRot = Accel.bUseWorldCoordinateSystem ? FQuat::Identity : BoneComp.GetRotation();
@@ -1242,13 +1546,21 @@ FTransform FNGonPreviewScene::BuildComponentGizmoTransform() const
         return Normal.GetSafeNormal(1.e-12);
     };
 
+    TArray<TPair<ENGonElement, int32>> AllSelected;
+    AllSelected.Reserve(SelectedVertexIds.Num() + SelectedEdgeIds.Num() + SelectedFaceIds.Num());
+    for (const int32 Id : SelectedVertexIds) AllSelected.Emplace(ENGonElement::Vertex, Id);
+    for (const int32 Id : SelectedEdgeIds)   AllSelected.Emplace(ENGonElement::Edge, Id);
+    for (const int32 Id : SelectedFaceIds)   AllSelected.Emplace(ENGonElement::Face, Id);
+
     TArray<FSample> Samples;
-    Samples.Reserve(SelectedIds.Num());
-    for (const int32 Id : SelectedIds)
+    Samples.Reserve(AllSelected.Num());
+    for (const TPair<ENGonElement, int32>& Pair : AllSelected)
     {
+        const ENGonElement ElemType = Pair.Key;
+        const int32 Id = Pair.Value;
         FSample Sample;
-        Sample.bActive = Id == ActiveSelectedId;
-        if (SelectedElement == ENGonElement::Vertex)
+        Sample.bActive = (ElemType == SelectedElement && Id == ActiveSelectedId);
+        if (ElemType == ENGonElement::Vertex)
         {
             if (!Positions.IsValidIndex(Id)) continue;
             const FNGonSceneAccel& Accel = GetSceneAccel(this);
@@ -1280,7 +1592,7 @@ FTransform FNGonPreviewScene::BuildComponentGizmoTransform() const
             }
             Sample.Weight = 1.0;
         }
-        else if (SelectedElement == ENGonElement::Edge)
+        else if (ElemType == ENGonElement::Edge)
         {
             if (!Topology.Edges.IsValidIndex(Id)) continue;
             const FIntPoint Edge = Topology.Edges[Id];
@@ -1388,7 +1700,7 @@ bool FNGonPreviewScene::BeginSoftTransform(const FTransform& GizmoTransform, ENG
 {
     FNGonSceneAccel& Accel = GetSceneAccel(this);
     Accel.DragStartGizmoTransform = GizmoTransform;
-    if (Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || SelectedIds.IsEmpty()))
+    if (Accel.Bones.IsValidIndex(Accel.SelectedBoneIndex) && (Accel.bBoneGizmoActive || !HasAnySelection()))
     {
         Accel.bBoneGizmoActive = true;
     }
@@ -1407,38 +1719,23 @@ bool FNGonPreviewScene::BeginSoftTransform(const FTransform& GizmoTransform, ENG
     }
 
     TArray<int32> Seeds;
-    if (SelectedElement == ENGonElement::Vertex)
+    for (const int32 Id : SelectedVertexIds)
     {
-        for (const int32 Id : SelectedIds)
+        if (Positions.IsValidIndex(Id)) Seeds.AddUnique(Id);
+    }
+    for (const int32 EdgeId : SelectedEdgeIds)
+    {
+        if (Topology.Edges.IsValidIndex(EdgeId))
         {
-            if (Positions.IsValidIndex(Id))
-            {
-                Seeds.AddUnique(Id);
-            }
+            Seeds.AddUnique(Topology.Edges[EdgeId].X);
+            Seeds.AddUnique(Topology.Edges[EdgeId].Y);
         }
     }
-    else if (SelectedElement == ENGonElement::Edge)
+    for (const int32 FaceId : SelectedFaceIds)
     {
-        for (const int32 EdgeId : SelectedIds)
+        if (const FNGonFace* Face = Topology.Faces.Find(FaceId))
         {
-            if (Topology.Edges.IsValidIndex(EdgeId))
-            {
-                Seeds.AddUnique(Topology.Edges[EdgeId].X);
-                Seeds.AddUnique(Topology.Edges[EdgeId].Y);
-            }
-        }
-    }
-    else
-    {
-        for (const int32 FaceId : SelectedIds)
-        {
-            if (const FNGonFace* Face = Topology.Faces.Find(FaceId))
-            {
-                for (const int32 Vertex : Face->Perimeter)
-                {
-                    Seeds.AddUnique(Vertex);
-                }
-            }
+            for (const int32 Vertex : Face->Perimeter) Seeds.AddUnique(Vertex);
         }
     }
 
@@ -1788,14 +2085,122 @@ bool FNGonPreviewScene::ApplyGizmoTransform(const FTransform& GizmoTransform)
     return true;
 }
 
+void FNGonPreviewScene::ApplyVertexPositionsDelta(const TArray<TPair<int32, FVector>>& VertexUpdates)
+{
+    if (!Surface || VertexUpdates.IsEmpty())
+    {
+        return;
+    }
+    for (const TPair<int32, FVector>& Pair : VertexUpdates)
+    {
+        if (Positions.IsValidIndex(Pair.Key))
+        {
+            Positions[Pair.Key] = Pair.Value;
+        }
+    }
+    FDynamicMesh3& Mesh = Surface->GetDynamicMesh()->GetMeshRef();
+    for (const int32 Vertex : Mesh.VertexIndicesItr())
+    {
+        const int32 LogicalId = Topology.DynamicToLogicalVertex.IsValidIndex(Vertex) ? Topology.DynamicToLogicalVertex[Vertex] : INDEX_NONE;
+        if (Positions.IsValidIndex(LogicalId))
+        {
+            Mesh.SetVertex(Vertex, Positions[LogicalId]);
+        }
+    }
+    NotifySurfacePositionsChanged(Mesh);
+    Picker.PositionsChanged();
+    GetSceneAccel(this).RecomputeAllVertexNormals(Positions);
+    UpdateOverlayPositions();
+    RebuildSoftSelection();
+    ActiveGizmoTransform = GetSelectionGizmoTransform();
+}
+
 void FNGonPreviewScene::EndSoftTransform()
 {
     FNGonSceneAccel& Accel = GetSceneAccel(this);
     if (Accel.bBoneDragActive)
     {
         Accel.bBoneDragActive = false;
+        const int32 BoneIdx = Accel.SelectedBoneIndex;
+        if (Accel.Bones.IsValidIndex(BoneIdx))
+        {
+            const FTransform BeforeXform = Accel.DragStartBoneLocalTransform;
+            const FTransform AfterXform = Accel.Bones[BoneIdx].CurrentLocalTransform;
+            if (!BeforeXform.Equals(AfterXform, 1e-4))
+            {
+                if (const TSharedPtr<FNGonUndoSession> Session = NGon::Undo::FindSession(this); Session.IsValid() && !Session->IsApplyingHistory())
+                {
+                    FNGonPreviewScene* ScenePtr = this;
+                    const FString BoneName = Accel.Bones[BoneIdx].Name.ToString();
+                    TSharedPtr<INGonUndoPayload> Payload = MakeShared<FNGonLambdaUndoPayload>(
+                        [ScenePtr, BoneIdx, BeforeXform]() -> bool
+                        {
+                            NGon::SetSceneBoneLocalTransform(ScenePtr, BoneIdx, BeforeXform);
+                            return true;
+                        },
+                        [ScenePtr, BoneIdx, AfterXform]() -> bool
+                        {
+                            NGon::SetSceneBoneLocalTransform(ScenePtr, BoneIdx, AfterXform);
+                            return true;
+                        },
+                        sizeof(FTransform) * 2ull);
+                    Session->PushEdit(
+                        ENGonUndoContextId::Skeleton,
+                        FString::Printf(TEXT("Bone Transform: %s"), *BoneName),
+                        ENGonUndoEditKind::Value,
+                        MoveTemp(Payload),
+                        sizeof(FTransform) * 2ull);
+                }
+            }
+        }
         return;
     }
+
+    if (SoftSession.IsActive())
+    {
+        const TArray<FVector>& OrigPos = SoftSession.OriginalPositions();
+        if (OrigPos.Num() == Positions.Num())
+        {
+            TArray<TPair<int32, FVector>> BeforeDiff;
+            TArray<TPair<int32, FVector>> AfterDiff;
+            for (int32 i = 0; i < Positions.Num(); ++i)
+            {
+                if (FVector::DistSquared(OrigPos[i], Positions[i]) > 1e-8)
+                {
+                    BeforeDiff.Emplace(i, OrigPos[i]);
+                    AfterDiff.Emplace(i, Positions[i]);
+                }
+            }
+            if (!BeforeDiff.IsEmpty())
+            {
+                if (const TSharedPtr<FNGonUndoSession> Session = NGon::Undo::FindSession(this); Session.IsValid() && !Session->IsApplyingHistory())
+                {
+                    FNGonPreviewScene* ScenePtr = this;
+                    const SIZE_T ApproxBytes = static_cast<SIZE_T>(BeforeDiff.Num()) * 2ull * sizeof(TPair<int32, FVector>);
+                    const int32 MovedCount = BeforeDiff.Num();
+                    TSharedPtr<INGonUndoPayload> Payload = MakeShared<FNGonLambdaUndoPayload>(
+                        [ScenePtr, BeforeDiff = MoveTemp(BeforeDiff)]() -> bool
+                        {
+                            ScenePtr->ApplyVertexPositionsDelta(BeforeDiff);
+                            return true;
+                        },
+                        [ScenePtr, AfterDiff = MoveTemp(AfterDiff)]() -> bool
+                        {
+                            ScenePtr->ApplyVertexPositionsDelta(AfterDiff);
+                            return true;
+                        },
+                        ApproxBytes);
+                    Session->PushEdit(
+                        ENGonUndoContextId::Mesh,
+                        FString::Printf(TEXT("Gizmo Transform (%d vert%s)"), MovedCount, MovedCount == 1 ? TEXT("") : TEXT("s")),
+                        ENGonUndoEditKind::Value,
+                        MoveTemp(Payload),
+                        ApproxBytes);
+                }
+            }
+        }
+    }
+
     SoftSession.End();
     if (!SelectedIds.IsEmpty())
     {
@@ -1883,12 +2288,84 @@ int32 FNGonPreviewScene::PickHoverVertex(const FSceneView& View, const FVector2D
     return BestVert;
 }
 
+FNGonSurfaceHit FNGonPreviewScene::PickSurfaceHit(const FSceneView& View, const FVector2D& Cursor) const
+{
+    return Picker.PickSurfaceHit(View, Cursor, Topology);
+}
+
 int32 FNGonPreviewScene::Pick(
     ENGonElement Element, const FSceneView& View, const FVector2D& Cursor, bool bAdd)
 {
     const int32 Id = Picker.Pick(Element, View, Cursor, Topology, Positions);
     UpdateSelection(Element, Id, bAdd);
     return Id;
+}
+
+int32 FNGonPreviewScene::PickMulti(
+    ENGonSelectionMask Mask, const FSceneView& View, const FVector2D& Cursor, bool bAdd, ENGonElement* OutPickedElement)
+{
+    if (Mask == ENGonSelectionMask::None)
+    {
+        return INDEX_NONE;
+    }
+
+    int32 HitId = INDEX_NONE;
+    ENGonElement HitElem = SelectedElement;
+    if (EnumHasAnyFlags(Mask, ENGonSelectionMask::Vertex))
+    {
+        HitId = Picker.Pick(ENGonElement::Vertex, View, Cursor, Topology, Positions);
+        if (HitId != INDEX_NONE) HitElem = ENGonElement::Vertex;
+    }
+    if (HitId == INDEX_NONE && EnumHasAnyFlags(Mask, ENGonSelectionMask::Edge))
+    {
+        HitId = Picker.Pick(ENGonElement::Edge, View, Cursor, Topology, Positions);
+        if (HitId != INDEX_NONE) HitElem = ENGonElement::Edge;
+    }
+    if (HitId == INDEX_NONE && EnumHasAnyFlags(Mask, ENGonSelectionMask::Face))
+    {
+        HitId = Picker.Pick(ENGonElement::Face, View, Cursor, Topology, Positions);
+        if (HitId != INDEX_NONE) HitElem = ENGonElement::Face;
+    }
+
+    if (OutPickedElement)
+    {
+        *OutPickedElement = HitElem;
+    }
+
+    if (HitId == INDEX_NONE)
+    {
+        if (!bAdd && HasAnySelection())
+        {
+            ClearSelection();
+        }
+        return INDEX_NONE;
+    }
+
+    const bool bHadFaces = !SelectedFaceIds.IsEmpty();
+    if (!bAdd)
+    {
+        SelectedVertexIds.Reset();
+        SelectedEdgeIds.Reset();
+        SelectedFaceIds.Reset();
+    }
+
+    if (HitElem == ENGonElement::Vertex) SelectedVertexIds.Add(HitId);
+    else if (HitElem == ENGonElement::Edge) SelectedEdgeIds.Add(HitId);
+    else SelectedFaceIds.Add(HitId);
+
+    SelectedElement = HitElem;
+    SelectedIds = (HitElem == ENGonElement::Vertex) ? SelectedVertexIds
+        : (HitElem == ENGonElement::Edge) ? SelectedEdgeIds : SelectedFaceIds;
+    ActiveSelectedId = HitId;
+
+    GetSceneAccel(this).bBoneGizmoActive = false;
+    RebuildSoftSelection();
+    if (bHadFaces || !SelectedFaceIds.IsEmpty())
+    {
+        UpdateFaceHighlight();
+    }
+    DrawSelection();
+    return HitId;
 }
 
 void FNGonPreviewScene::BoxSelect(
@@ -1899,20 +2376,90 @@ void FNGonPreviewScene::BoxSelect(
     ApplySelectionSet(Element, BoxIds, bAdd);
 }
 
+void FNGonPreviewScene::BoxSelectMulti(
+    ENGonSelectionMask Mask, const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained)
+{
+    if (Mask == ENGonSelectionMask::None)
+    {
+        return;
+    }
+
+    const bool bHadFaces = !SelectedFaceIds.IsEmpty();
+    if (!bAdd)
+    {
+        SelectedVertexIds.Reset();
+        SelectedEdgeIds.Reset();
+        SelectedFaceIds.Reset();
+    }
+
+    bool bPickedAny = false;
+    ENGonElement LastElem = SelectedElement;
+    int32 LastId = INDEX_NONE;
+
+    if (EnumHasAnyFlags(Mask, ENGonSelectionMask::Face))
+    {
+        TSet<int32> FaceBox;
+        Picker.BoxPick(ENGonElement::Face, View, ScreenRect, Topology, Positions, FaceBox, bFullyContained);
+        for (const int32 Id : FaceBox) { SelectedFaceIds.Add(Id); LastId = Id; LastElem = ENGonElement::Face; bPickedAny = true; }
+    }
+    if (EnumHasAnyFlags(Mask, ENGonSelectionMask::Edge))
+    {
+        TSet<int32> EdgeBox;
+        Picker.BoxPick(ENGonElement::Edge, View, ScreenRect, Topology, Positions, EdgeBox, bFullyContained);
+        for (const int32 Id : EdgeBox) { SelectedEdgeIds.Add(Id); LastId = Id; LastElem = ENGonElement::Edge; bPickedAny = true; }
+    }
+    if (EnumHasAnyFlags(Mask, ENGonSelectionMask::Vertex))
+    {
+        TSet<int32> VertBox;
+        Picker.BoxPick(ENGonElement::Vertex, View, ScreenRect, Topology, Positions, VertBox, bFullyContained);
+        for (const int32 Id : VertBox) { SelectedVertexIds.Add(Id); LastId = Id; LastElem = ENGonElement::Vertex; bPickedAny = true; }
+    }
+
+    if (bPickedAny)
+    {
+        SelectedElement = LastElem;
+        ActiveSelectedId = LastId;
+        GetSceneAccel(this).bBoneGizmoActive = false;
+    }
+    else if (!HasAnySelection())
+    {
+        ActiveSelectedId = INDEX_NONE;
+    }
+
+    SelectedIds = (SelectedElement == ENGonElement::Vertex) ? SelectedVertexIds
+        : (SelectedElement == ENGonElement::Edge) ? SelectedEdgeIds : SelectedFaceIds;
+
+    RebuildSoftSelection();
+    if (bHadFaces || !SelectedFaceIds.IsEmpty())
+    {
+        UpdateFaceHighlight();
+    }
+    DrawSelection();
+}
+
 void FNGonPreviewScene::ApplySelectionSet(ENGonElement Element, const TSet<int32>& Ids, bool bAdd)
 {
-    const bool bHadFaces = SelectedElement == ENGonElement::Face && !SelectedIds.IsEmpty();
-    if (!bAdd || SelectedElement != Element) SelectedIds.Reset();
+    const bool bHadFaces = !SelectedFaceIds.IsEmpty();
+    if (!bAdd)
+    {
+        SelectedVertexIds.Reset();
+        SelectedEdgeIds.Reset();
+        SelectedFaceIds.Reset();
+    }
+    TSet<int32>& TargetSet = (Element == ENGonElement::Vertex) ? SelectedVertexIds
+        : (Element == ENGonElement::Edge) ? SelectedEdgeIds : SelectedFaceIds;
+    for (const int32 Id : Ids) TargetSet.Add(Id);
+
     SelectedElement = Element;
-    for (const int32 Id : Ids) SelectedIds.Add(Id);
+    SelectedIds = TargetSet;
     if (!Ids.IsEmpty()) ActiveSelectedId = *Ids.CreateConstIterator();
-    else if (SelectedIds.IsEmpty()) ActiveSelectedId = INDEX_NONE;
-    if (!SelectedIds.IsEmpty())
+    else if (!HasAnySelection()) ActiveSelectedId = INDEX_NONE;
+    if (HasAnySelection())
     {
         GetSceneAccel(this).bBoneGizmoActive = false;
     }
     RebuildSoftSelection();
-    if (bHadFaces || (Element == ENGonElement::Face && !Ids.IsEmpty()))
+    if (bHadFaces || !SelectedFaceIds.IsEmpty())
     {
         UpdateFaceHighlight();
     }
@@ -1971,19 +2518,31 @@ bool FNGonPreviewScene::SelectEdgeLoop(int32 StartEdgeId, bool bAdd)
 
 void FNGonPreviewScene::ClearSelection()
 {
-    UpdateSelection(SelectedElement, INDEX_NONE, false);
+    const bool bHadFaces = !SelectedFaceIds.IsEmpty();
+    if (!HasAnySelection() && SelectedIds.IsEmpty()) return;
+    SelectedIds.Reset();
+    SelectedVertexIds.Reset();
+    SelectedEdgeIds.Reset();
+    SelectedFaceIds.Reset();
+    ActiveSelectedId = INDEX_NONE;
+    RebuildSoftSelection();
+    if (bHadFaces)
+    {
+        UpdateFaceHighlight();
+    }
+    DrawSelection();
 }
 
 bool FNGonPreviewScene::DeleteSelectedFaces()
 {
-    if (SelectedElement != ENGonElement::Face || SelectedIds.IsEmpty() ||
+    if (SelectedFaceIds.IsEmpty() ||
         Topology.Faces.Num() <= 1 || Positions.IsEmpty())
     {
         return false;
     }
 
     TSet<int32> ValidSelectedIds;
-    for (const int32 Id : SelectedIds)
+    for (const int32 Id : SelectedFaceIds)
     {
         if (Topology.Faces.Contains(Id))
         {
@@ -2082,38 +2641,33 @@ bool FNGonPreviewScene::ReplacePolygonMesh(
 
 void FNGonPreviewScene::UpdateSelection(ENGonElement Element, int32 Id, bool bAdd)
 {
-    if (Id == INDEX_NONE && (bAdd || SelectedIds.IsEmpty()))
+    if (Id == INDEX_NONE)
     {
-        return;
-    }
-    if (SelectedElement == Element && SelectedIds.Contains(Id) && (bAdd || SelectedIds.Num() == 1))
-    {
+        if (!bAdd && HasAnySelection()) ClearSelection();
         return;
     }
 
-    const bool bHadFaces = SelectedElement == ENGonElement::Face && !SelectedIds.IsEmpty();
-
-    if (!bAdd || SelectedElement != Element)
+    const bool bHadFaces = !SelectedFaceIds.IsEmpty();
+    if (!bAdd)
     {
-        SelectedIds.Reset();
+        SelectedVertexIds.Reset();
+        SelectedEdgeIds.Reset();
+        SelectedFaceIds.Reset();
     }
+    TSet<int32>& TargetSet = (Element == ENGonElement::Vertex) ? SelectedVertexIds
+        : (Element == ENGonElement::Edge) ? SelectedEdgeIds : SelectedFaceIds;
+    TargetSet.Add(Id);
+
     SelectedElement = Element;
-    if (Id != INDEX_NONE)
-    {
-        SelectedIds.Add(Id);
-        ActiveSelectedId = Id;
-    }
-    else if (SelectedIds.IsEmpty())
-    {
-        ActiveSelectedId = INDEX_NONE;
-    }
+    SelectedIds = TargetSet;
+    ActiveSelectedId = Id;
 
-    if (!SelectedIds.IsEmpty())
+    if (HasAnySelection())
     {
         GetSceneAccel(this).bBoneGizmoActive = false;
     }
     RebuildSoftSelection();
-    if (bHadFaces || (Element == ENGonElement::Face && Id != INDEX_NONE))
+    if (bHadFaces || !SelectedFaceIds.IsEmpty())
     {
         UpdateFaceHighlight();
     }
@@ -2124,14 +2678,14 @@ void FNGonPreviewScene::DrawSelection()
 {
     FNGonSceneAccel& Accel = GetSceneAccel(this);
     SelectedEdge->Clear();
+    SelectedVertex->Clear();
+    Accel.CachedSelectedVertexCount = 0;
 
-    if (SelectedElement == ENGonElement::Face && !SelectedIds.IsEmpty())
+    if (!SelectedFaceIds.IsEmpty())
     {
-        SelectedVertex->Clear();
-        Accel.CachedSelectedVertexCount = 0;
         TArray<FVector> Starts;
         TArray<FVector> Ends;
-        for (const int32 Id : SelectedIds)
+        for (const int32 Id : SelectedFaceIds)
         {
             if (const FNGonFace* Face = Topology.Faces.Find(Id))
             {
@@ -2144,17 +2698,19 @@ void FNGonPreviewScene::DrawSelection()
                 }
             }
         }
-        SelectedEdge->AddLines(Starts, Ends, SelectionColor, 2.6f, 2.5f);
+        if (!Starts.IsEmpty())
+        {
+            SelectedEdge->AddLines(Starts, Ends, SelectionColor, 2.6f, 2.5f);
+        }
     }
-    else if (SelectedElement == ENGonElement::Edge && !SelectedIds.IsEmpty())
+
+    if (!SelectedEdgeIds.IsEmpty())
     {
-        SelectedVertex->Clear();
-        Accel.CachedSelectedVertexCount = 0;
         TArray<FVector> Starts;
         TArray<FVector> Ends;
-        Starts.Reserve(SelectedIds.Num());
-        Ends.Reserve(SelectedIds.Num());
-        for (const int32 Id : SelectedIds)
+        Starts.Reserve(SelectedEdgeIds.Num());
+        Ends.Reserve(SelectedEdgeIds.Num());
+        for (const int32 Id : SelectedEdgeIds)
         {
             if (!Topology.Edges.IsValidIndex(Id)) continue;
             const FIntPoint Edge = Topology.Edges[Id];
@@ -2162,13 +2718,16 @@ void FNGonPreviewScene::DrawSelection()
             Starts.Add(Accel.GetDisplacedVertexPosition(Positions, Edge.X, 0.65f));
             Ends.Add(Accel.GetDisplacedVertexPosition(Positions, Edge.Y, 0.65f));
         }
-        SelectedEdge->AddLines(Starts, Ends, SelectionColor, 3.6f, 3.0f);
+        if (!Starts.IsEmpty())
+        {
+            SelectedEdge->AddLines(Starts, Ends, SelectionColor, 3.6f, 3.0f);
+        }
     }
-    else if (SelectedElement == ENGonElement::Vertex && !SelectedIds.IsEmpty())
+
+    if (!SelectedVertexIds.IsEmpty())
     {
-        SelectedVertex->Clear();
         int32 AddedSel = 0;
-        for (const int32 Id : SelectedIds)
+        for (const int32 Id : SelectedVertexIds)
         {
             if (Positions.IsValidIndex(Id))
             {
@@ -2182,11 +2741,6 @@ void FNGonPreviewScene::DrawSelection()
             }
         }
         Accel.CachedSelectedVertexCount = AddedSel;
-    }
-    else
-    {
-        SelectedVertex->Clear();
-        Accel.CachedSelectedVertexCount = 0;
     }
 }
 
@@ -2209,9 +2763,22 @@ FText FNGonPreviewScene::DescribeSelection() const
             FText::AsNumber(FMath::RoundToFloat(Rot.Pitch * 10.0f) / 10.0f),
             FText::AsNumber(FMath::RoundToFloat(Rot.Yaw * 10.0f) / 10.0f));
     }
-    if (SelectedIds.IsEmpty())
+    if (!HasAnySelection())
     {
         return LOCTEXT("NoSelection", "No selection");
+    }
+
+    const int32 NonEmptyKinds =
+        (!SelectedVertexIds.IsEmpty() ? 1 : 0) +
+        (!SelectedEdgeIds.IsEmpty() ? 1 : 0) +
+        (!SelectedFaceIds.IsEmpty() ? 1 : 0);
+    if (NonEmptyKinds > 1)
+    {
+        TArray<FString> Parts;
+        if (!SelectedFaceIds.IsEmpty())   Parts.Add(FString::Printf(TEXT("%d face%s"), SelectedFaceIds.Num(), SelectedFaceIds.Num() == 1 ? TEXT("") : TEXT("s")));
+        if (!SelectedEdgeIds.IsEmpty())   Parts.Add(FString::Printf(TEXT("%d edge%s"), SelectedEdgeIds.Num(), SelectedEdgeIds.Num() == 1 ? TEXT("") : TEXT("s")));
+        if (!SelectedVertexIds.IsEmpty()) Parts.Add(FString::Printf(TEXT("%d %s"), SelectedVertexIds.Num(), SelectedVertexIds.Num() == 1 ? TEXT("vertex") : TEXT("vertices")));
+        return FText::FromString(FString::Join(Parts, TEXT(", ")) + TEXT(" selected"));
     }
 
     if (SelectedIds.Num() > 1)

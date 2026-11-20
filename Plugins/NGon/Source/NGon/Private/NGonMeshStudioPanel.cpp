@@ -22,6 +22,10 @@ struct FNGonMeshStudioUIState
     float ExtrudeDistance = 25.0f;
     float InsetRatio = 0.25f;
     float ExtrudeScale = 1.0f;
+    float BevelWidth = 8.0f;
+    int32 BevelSegments = 2;
+    float BevelProfile = 0.5f;
+    bool bBevelClampOverlap = true;
     float SmoothStrength = 0.5f;
     float TaperAmount = 0.35f;
     float TwistAngleDeg = 45.0f;
@@ -291,6 +295,43 @@ TSharedRef<SWidget> SNGonPreview::MakeMeshStudioTab()
                             TAttribute<float>::CreateLambda([this]() { return GetStudioState(this).ExtrudeScale; }),
                             FOnFloatValueChanged::CreateLambda([this](float V) { GetStudioState(this).ExtrudeScale = V; }))
                     ]
+                    + SWrapBox::Slot()
+                    [
+                        MakeCompactParam(
+                            LOCTEXT("BevelWidthLbl", "Bvl W"),
+                            0.1f, 200.0f,
+                            TAttribute<float>::CreateLambda([this]() { return GetStudioState(this).BevelWidth; }),
+                            FOnFloatValueChanged::CreateLambda([this](float V) { GetStudioState(this).BevelWidth = V; }))
+                    ]
+                    + SWrapBox::Slot()
+                    [
+                        MakeCompactParam(
+                            LOCTEXT("BevelSegLbl", "Segs"),
+                            1.0f, 16.0f,
+                            TAttribute<float>::CreateLambda([this]() { return static_cast<float>(GetStudioState(this).BevelSegments); }),
+                            FOnFloatValueChanged::CreateLambda([this](float V) { GetStudioState(this).BevelSegments = FMath::Clamp(FMath::RoundToInt(V), 1, 16); }))
+                    ]
+                    + SWrapBox::Slot()
+                    [
+                        MakeCompactParam(
+                            LOCTEXT("BevelProfLbl", "Prof"),
+                            0.05f, 1.0f,
+                            TAttribute<float>::CreateLambda([this]() { return GetStudioState(this).BevelProfile; }),
+                            FOnFloatValueChanged::CreateLambda([this](float V) { GetStudioState(this).BevelProfile = V; }))
+                    ]
+                    + SWrapBox::Slot()
+                    [
+                        MakeActionChip(
+                            LOCTEXT("BevelClampBtn", "Clamp"),
+                            LOCTEXT("BevelClampTip", "Toggle Clamp Overlap safety for Bevel (prevents self-intersections)"),
+                            FOnClicked::CreateLambda([this]()
+                            {
+                                FNGonMeshStudioUIState& S = GetStudioState(this);
+                                S.bBevelClampOverlap = !S.bBevelClampOverlap;
+                                S.LastOutput = S.bBevelClampOverlap ? TEXT("Bevel Clamp Overlap: ON") : TEXT("Bevel Clamp Overlap: OFF");
+                                return FReply::Handled();
+                            }))
+                    ]
                 ]
                 + SVerticalBox::Slot()
                 .AutoHeight()
@@ -324,11 +365,16 @@ TSharedRef<SWidget> SNGonPreview::MakeMeshStudioTab()
                     [
                         MakeActionChip(
                             LOCTEXT("BevelBtn", "Bevel"),
-                            LOCTEXT("BevelTip", "Bevel selected face(s) using Inset ratio and Dist*0.35 height"),
+                            LOCTEXT("BevelTip", "Smart Bevel: bevels selected Edges, Vertices, or Face Boundaries with Width, Segments, Profile & Clamp Overlap"),
                             FOnClicked::CreateLambda([this, RunOp]()
                             {
                                 const FNGonMeshStudioUIState& S = GetStudioState(this);
-                                return RunOp(FNGonMeshAPI::BevelFaces(Viewport->Preview(), {}, S.InsetRatio, S.ExtrudeDistance * 0.35));
+                                FNGonBevelOptions Opts;
+                                Opts.Width = S.BevelWidth;
+                                Opts.Segments = S.BevelSegments;
+                                Opts.Profile = S.BevelProfile;
+                                Opts.bClampOverlap = S.bBevelClampOverlap;
+                                return RunOp(FNGonMeshAPI::BevelSelection(Viewport->Preview(), Opts));
                             }))
                     ]
                     + SWrapBox::Slot()

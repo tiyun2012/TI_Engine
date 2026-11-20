@@ -22,6 +22,8 @@
 #include "Rendering/SkeletalMeshLODModel.h"
 #include "Rendering/SkeletalMeshModel.h"
 #include "STiPaintEditor.h"
+#include "NGonUndoTree.h"
+#include "SNGonUndoTreePanel.h"
 #include "StaticMeshAttributes.h"
 #include "TiPaintDocument.h"
 #include "Widgets/Layout/SSplitter.h"
@@ -91,6 +93,14 @@ void SNGonPreview::Construct(const FArguments& InArgs)
 {
     SAssignNew(Viewport, SNGonViewport);
     SAssignNew(Painter, STiPaintEditor);
+    UndoSession = MakeShared<FNGonUndoSession>(TEXT("Main Window"));
+    NGon::Undo::RegisterSession(&Viewport->Preview(), UndoSession);
+    NGon::Undo::SetActiveSession(UndoSession);
+    SAssignNew(UndoTreePanel, SNGonUndoTreePanel, UndoSession);
+    if (Painter.IsValid())
+    {
+        Painter->GetDocument()->SetUndoSession(UndoSession);
+    }
     Painter->SetPaintedCallback([this](const TArray<FColor>& Pixels, int32 Width, int32 Height)
     {
         if (Viewport.IsValid())
@@ -99,6 +109,69 @@ void SNGonPreview::Construct(const FArguments& InArgs)
             Viewport->Invalidate();
         }
     });
+    Painter->SetPaint3DModeCallback([this](bool bEnabled)
+    {
+        if (Viewport.IsValid())
+        {
+            Viewport->SetPaint3DMode(bEnabled);
+        }
+    });
+    Viewport->SetPaint3DCallbacks(
+        [this](const FNGonSurfaceHit& Hit, bool bFirstPoint)
+        {
+            if (!Painter.IsValid() || !Hit.bHit) return;
+            TSharedRef<FTiPaintDocument> Doc = Painter->GetDocument();
+            if (!Doc->IsSubMeshVisible(Hit.SubMeshIndex))
+            {
+                return;
+            }
+            const float U = FMath::Clamp(Hit.UV.X, 0.0f, 1.0f);
+            const float V = FMath::Clamp(Hit.UV.Y, 0.0f, 1.0f);
+            const ETiPaintMode Mode = Doc->Brush().Mode;
+            if (bFirstPoint)
+            {
+                if (Mode == ETiPaintMode::Eyedropper)
+                {
+                    FTiPaintBrush B = Doc->Brush();
+                    B.Color = Doc->SampleCompositeColor(U, V);
+                    Doc->SetBrush(B);
+                    return;
+                }
+                if (Mode == ETiPaintMode::Fill)
+                {
+                    Doc->FloodFill(U, V);
+                    return;
+                }
+                Doc->BeginStroke(U, V);
+                LastPaint3DUV = FVector2f(U, V);
+                bHasLastPaint3DUV = true;
+            }
+            else if (Doc->IsStroking())
+            {
+                if (bHasLastPaint3DUV && FVector2f::DistSquared(FVector2f(U, V), LastPaint3DUV) > 0.0324f)
+                {
+                    Doc->AddStrokeDiscontinuousPoint(U, V);
+                }
+                else
+                {
+                    Doc->AddStrokePoint(U, V);
+                }
+                LastPaint3DUV = FVector2f(U, V);
+                bHasLastPaint3DUV = true;
+            }
+        },
+        [this]()
+        {
+            bHasLastPaint3DUV = false;
+            if (Painter.IsValid())
+            {
+                TSharedRef<FTiPaintDocument> Doc = Painter->GetDocument();
+                if (Doc->IsStroking())
+                {
+                    Doc->EndStroke();
+                }
+            }
+        });
 
     FNGonSkeletonTreeUIState& InitUIState = GetSkeletonTreeUIState(this);
     InitUIState.ViewportPtr = Viewport.Get();
@@ -230,9 +303,19 @@ void SNGonPreview::Construct(const FArguments& InArgs)
 SNGonPreview::~SNGonPreview()
 {
     NGon::RemoveSkeletonTreeUIState(this);
+    if (Viewport.IsValid())
+    {
+        Viewport->SetPaint3DCallbacks({}, {});
+    }
     if (Painter)
     {
         Painter->SetPaintedCallback({});
+        Painter->SetPaint3DModeCallback({});
+        Painter->GetDocument()->SetUndoSession(nullptr);
+    }
+    if (Viewport.IsValid())
+    {
+        NGon::Undo::UnregisterSession(&Viewport->Preview());
     }
     NGon::NotifyHostViewportClosed();
 }
@@ -321,7 +404,7 @@ void SNGonPreview::LoadStaticMesh(const FAssetData& Asset)
 
     bShowEdges = !bTriangleOnly;
     SelectionMode = Viewport.IsValid() ? Viewport->GetSelectionMode() : SelectionMode;
-    bShowVertices = (SelectionMode == ENGonElement::Vertex);
+    bShowVertices = Viewport.IsValid() ? Viewport->IsSelectionFlagEnabled(ENGonSelectionMask::Vertex) : (SelectionMode == ENGonElement::Vertex);
     TArray<UMaterialInterface*> Materials = BindPreviewMaterials(*Source, StaticMesh->GetStaticMaterials(), Data);
     ShowMesh(MoveTemp(Data), FText::FromName(Asset.AssetName), LOCTEXT("StaticMeshType", "Static Mesh"),
         ENGonViewportShading::Smooth, MoveTemp(Materials));
@@ -585,7 +668,7 @@ void SNGonPreview::LoadSkeletalMesh(const FAssetData& Asset)
     // Match native UE5 Skeletal Mesh Editor: smooth lit surface with mesh edges hidden by default (toggleable via Alt+9)
     bShowEdges = false;
     SelectionMode = Viewport.IsValid() ? Viewport->GetSelectionMode() : SelectionMode;
-    bShowVertices = (SelectionMode == ENGonElement::Vertex);
+    bShowVertices = Viewport.IsValid() ? Viewport->IsSelectionFlagEnabled(ENGonSelectionMask::Vertex) : (SelectionMode == ENGonElement::Vertex);
     SkelUIState.BoneDrawMode = 2; // Selected Bone Only (matching image_3b0306.jpg)
 
     // Use clean 3-point studio clay material for SkeletalMesh preview on UDynamicMeshComponent
@@ -694,7 +777,7 @@ bool SNGonPreview::TryLoadFbx(const FString& Filename, FText& Error)
 
     bShowEdges = !bTriangleOnly;
     SelectionMode = Viewport.IsValid() ? Viewport->GetSelectionMode() : SelectionMode;
-    bShowVertices = (SelectionMode == ENGonElement::Vertex);
+    bShowVertices = Viewport.IsValid() ? Viewport->IsSelectionFlagEnabled(ENGonSelectionMask::Vertex) : (SelectionMode == ENGonElement::Vertex);
     const FText TypeLabel = FbxSkeleton.Bones.IsEmpty()
         ? LOCTEXT("FbxType", "FBX Polygon Mesh")
         : LOCTEXT("FbxSkelType", "FBX Skeletal Polygon Mesh");
@@ -761,10 +844,30 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const
                 continue;
             }
             const UE::Geometry::FIndex3i UVIds = UVs->GetTriangle(TriangleId);
+            const UE::Geometry::FIndex3i TriVIds = Data.Mesh.GetTriangle(TriangleId);
+            const FVector3d FaceN = Data.Mesh.GetTriNormal(TriangleId);
+            const UE::Geometry::FDynamicMeshNormalOverlay* Normals = Data.Mesh.Attributes()->PrimaryNormals();
+            const bool bHasTriNormals = Normals && Normals->IsSetTriangle(TriangleId);
+            const UE::Geometry::FIndex3i NormIds = bHasTriNormals ? Normals->GetTriangle(TriangleId) : UE::Geometry::FIndex3i::Invalid();
             FTiPaintUVTriangle& Triangle = PaintTriangles.AddDefaulted_GetRef();
+            Triangle.FaceId = Data.Mesh.GetTriangleGroup(TriangleId);
+            if (const int32* FoundSub = Data.Topology.FaceToSubMesh.Find(Triangle.FaceId))
+            {
+                Triangle.SubMeshIndex = *FoundSub;
+            }
+            Triangle.bHas3D = true;
             for (int32 Corner = 0; Corner < 3; ++Corner)
             {
                 Triangle.UV[Corner] = UVs->IsElement(UVIds[Corner]) ? UVs->GetElement(UVIds[Corner]) : FVector2f::ZeroVector;
+                Triangle.Pos[Corner] = FVector3f(Data.Mesh.GetVertex(TriVIds[Corner]));
+                if (bHasTriNormals && Normals->IsElement(NormIds[Corner]))
+                {
+                    Triangle.Normal[Corner] = Normals->GetElement(NormIds[Corner]);
+                }
+                else
+                {
+                    Triangle.Normal[Corner] = FVector3f(FaceN);
+                }
             }
         }
     }
@@ -774,12 +877,34 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const
     bShowHeatmap = false;
     HeatBias = 0.0f;
     Bend = 0.0f;
+    TArray<FTiPaintSubMeshInfo> PaintSubMeshes;
+    PaintSubMeshes.Reserve(Data.Topology.SubMeshes.Num());
+    for (const FNGonSubMeshInfo& Sub : Data.Topology.SubMeshes)
+    {
+        FTiPaintSubMeshInfo Info;
+        Info.Name = Sub.Name.IsNone() ? FString::Printf(TEXT("SubMesh %d"), Sub.SubMeshIndex) : Sub.Name.ToString();
+        Info.TriangleCount = 0;
+        PaintSubMeshes.Add(MoveTemp(Info));
+    }
+    for (const FTiPaintUVTriangle& Tri : PaintTriangles)
+    {
+        if (PaintSubMeshes.IsValidIndex(Tri.SubMeshIndex))
+        {
+            ++PaintSubMeshes[Tri.SubMeshIndex].TriangleCount;
+        }
+    }
     NGon::SetActiveViewportUVMesh(Data, SourceName, InSourceType);
     Viewport->SetMesh(MoveTemp(Data), MoveTemp(Materials));
     Viewport->SetShadingMode(Shading);
+    if (UndoSession.IsValid())
+    {
+        UndoSession->ResetSession(SourceName.IsEmpty() ? TEXT("Main Window") : SourceName.ToString());
+        NGon::Undo::SetActiveSession(UndoSession);
+    }
     if (Painter.IsValid())
     {
-        Painter->ResetForMesh(PaintTriangles);
+        Painter->ResetForMesh(PaintTriangles, PaintSubMeshes);
+        Painter->GetDocument()->SetUndoSession(UndoSession);
     }
     if (Viewport.IsValid())
     {
@@ -792,6 +917,8 @@ void SNGonPreview::ShowMesh(FNGonMeshData&& Data, const FText& SourceName, const
     Viewport->Preview().SetShowEdges(bShowEdges);
     Viewport->Preview().SetShowVertices(bShowVertices);
     ApplySoftSelectionSettings();
+    ActiveMaterialSlotIndex = 0;
+    RebuildMaterialSlotsList();
 }
 
 void SNGonPreview::ShowError(const FText& Error)
@@ -813,6 +940,28 @@ void SNGonPreview::SetSelectionMode(ENGonElement Element)
         RebuildSkeletonTreeList();
     }
     Viewport->SetSelectionMode(Element);
+}
+
+void SNGonPreview::ToggleSelectionMode(ENGonElement Element)
+{
+    if (!Viewport.IsValid()) return;
+    const ENGonSelectionMask Flag = NGonElementToMask(Element);
+    const bool bWillEnable = !Viewport->IsSelectionFlagEnabled(Flag);
+    if (bWillEnable)
+    {
+        SelectionMode = Element;
+        if (Element == ENGonElement::Vertex)
+        {
+            bShowVertices = true;
+        }
+        if (SelectedBoneIndex != INDEX_NONE)
+        {
+            SelectedBoneIndex = INDEX_NONE;
+            NGon::SelectSceneBone(&Viewport->Preview(), INDEX_NONE, false);
+            RebuildSkeletonTreeList();
+        }
+    }
+    Viewport->ToggleSelectionFlag(Flag);
 }
 
 #undef LOCTEXT_NAMESPACE

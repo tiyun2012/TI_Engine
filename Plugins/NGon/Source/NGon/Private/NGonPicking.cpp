@@ -1,6 +1,7 @@
 #include "NGonPicking.h"
 
 #include "NGonTopology.h"
+#include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "SceneView.h"
 #include "Math/Box2D.h"
 
@@ -44,6 +45,83 @@ int32 FNGonPicker::PickFace(const FVector& Origin, const FVector& Direction) con
     const int32 Triangle = Spatial->FindNearestHitTriangle(
         FRay3d(Origin, Direction), IMeshSpatial::FQueryOptions());
     return Mesh->IsTriangle(Triangle) ? Mesh->GetTriangleGroup(Triangle) : INDEX_NONE;
+}
+
+FNGonSurfaceHit FNGonPicker::PickSurfaceHit(
+    const FSceneView& View, const FVector2D& Cursor, const FNGonTopology& Topology) const
+{
+    FNGonSurfaceHit Hit;
+    if (!Spatial || !Mesh)
+    {
+        return Hit;
+    }
+
+    EnsureSpatialBuilt();
+    FVector Origin;
+    FVector Direction;
+    View.DeprojectFVector2D(Cursor, Origin, Direction);
+    const FVector DirN = Direction.GetSafeNormal();
+    if (DirN.IsNearlyZero())
+    {
+        return Hit;
+    }
+
+    double HitT = 0.0;
+    int32 TriId = INDEX_NONE;
+    if (!Spatial->FindNearestHitTriangle(FRay3d(Origin, DirN), HitT, TriId) || !Mesh->IsTriangle(TriId))
+    {
+        return Hit;
+    }
+
+    const FIndex3i TriV = Mesh->GetTriangle(TriId);
+    const FVector P0 = Mesh->GetVertex(TriV.A);
+    const FVector P1 = Mesh->GetVertex(TriV.B);
+    const FVector P2 = Mesh->GetVertex(TriV.C);
+    const FVector HitPos = Origin + DirN * HitT;
+
+    // Barycentric coordinates via triangle sub-areas
+    const FVector V0 = P1 - P0;
+    const FVector V1 = P2 - P0;
+    const FVector V2 = HitPos - P0;
+    const double D00 = FVector::DotProduct(V0, V0);
+    const double D01 = FVector::DotProduct(V0, V1);
+    const double D11 = FVector::DotProduct(V1, V1);
+    const double D20 = FVector::DotProduct(V2, V0);
+    const double D21 = FVector::DotProduct(V2, V1);
+    const double Denom = D00 * D11 - D01 * D01;
+    double B1 = 0.0, B2 = 0.0;
+    if (FMath::Abs(Denom) > 1e-12)
+    {
+        B1 = (D11 * D20 - D01 * D21) / Denom;
+        B2 = (D00 * D21 - D01 * D20) / Denom;
+    }
+    B1 = FMath::Clamp(B1, 0.0, 1.0);
+    B2 = FMath::Clamp(B2, 0.0, 1.0 - B1);
+    const double B0 = FMath::Max(0.0, 1.0 - B1 - B2);
+
+    Hit.bHit = true;
+    Hit.TriangleId = TriId;
+    Hit.FaceId = Mesh->GetTriangleGroup(TriId);
+    if (const int32* FoundSub = Topology.FaceToSubMesh.Find(Hit.FaceId))
+    {
+        Hit.SubMeshIndex = *FoundSub;
+    }
+    Hit.WorldPos = HitPos;
+    Hit.WorldNormal = Mesh->GetTriNormal(TriId);
+
+    if (Mesh->HasAttributes() && Mesh->Attributes()->PrimaryUV())
+    {
+        const FDynamicMeshUVOverlay* UVs = Mesh->Attributes()->PrimaryUV();
+        if (UVs->IsSetTriangle(TriId))
+        {
+            const FIndex3i UVIds = UVs->GetTriangle(TriId);
+            const FVector2f UV0 = UVs->IsElement(UVIds.A) ? UVs->GetElement(UVIds.A) : FVector2f::ZeroVector;
+            const FVector2f UV1 = UVs->IsElement(UVIds.B) ? UVs->GetElement(UVIds.B) : FVector2f::ZeroVector;
+            const FVector2f UV2 = UVs->IsElement(UVIds.C) ? UVs->GetElement(UVIds.C) : FVector2f::ZeroVector;
+            Hit.UV = UV0 * static_cast<float>(B0) + UV1 * static_cast<float>(B1) + UV2 * static_cast<float>(B2);
+        }
+    }
+    return Hit;
 }
 
 int32 FNGonPicker::Pick(

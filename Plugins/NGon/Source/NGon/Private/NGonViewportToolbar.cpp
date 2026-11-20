@@ -583,38 +583,39 @@ TSharedRef<SWidget> SNGonPreview::MakeViewportOverlayHeader()
                 MakeVerticalDivider()
             ]
 
-            // 5. Component Mode Strip: [Vertex (1)] [Edge (2)] [Face (3)]
+            // 5. Component Mode Strip: independent toggles [Vertex (1)] [Edge (2)] [Face (3)]
+            //    Combine any subset (e.g. Face + Vertex) or disable all 3 to freeze selection
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
                 MakeIconToolButton(
                     ENGonTreeIconKind::CompVertex,
-                    LOCTEXT("CompVertexTip", "Vertex Component Selection Mode (1)"),
-                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Vertex; },
+                    LOCTEXT("CompVertexTip", "Toggle Vertex Selection (1) — combine with Edge/Face or turn all off to freeze selection"),
+                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->IsSelectionFlagEnabled(ENGonSelectionMask::Vertex); },
                     [this]()
                     {
-                        SetSelectionMode(ENGonElement::Vertex);
+                        ToggleSelectionMode(ENGonElement::Vertex);
                     })
             ]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
                 MakeIconToolButton(
                     ENGonTreeIconKind::CompEdge,
-                    LOCTEXT("CompEdgeTip", "Edge Component Selection Mode (2)"),
-                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Edge; },
+                    LOCTEXT("CompEdgeTip", "Toggle Edge Selection (2) — combine with Vertex/Face or turn all off to freeze selection"),
+                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->IsSelectionFlagEnabled(ENGonSelectionMask::Edge); },
                     [this]()
                     {
-                        SetSelectionMode(ENGonElement::Edge);
+                        ToggleSelectionMode(ENGonElement::Edge);
                     })
             ]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f, 0.0f)
             [
                 MakeIconToolButton(
                     ENGonTreeIconKind::CompFace,
-                    LOCTEXT("CompFaceTip", "Polygon Face Component Selection Mode (3)"),
-                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->GetSelectionMode() == ENGonElement::Face; },
+                    LOCTEXT("CompFaceTip", "Toggle Face Selection (3) — combine with Vertex/Edge or turn all off to freeze selection"),
+                    [this]() { return !NGon::IsBoneGizmoActive(&Viewport->Preview()) && Viewport->IsSelectionFlagEnabled(ENGonSelectionMask::Face); },
                     [this]()
                     {
-                        SetSelectionMode(ENGonElement::Face);
+                        ToggleSelectionMode(ENGonElement::Face);
                     })
             ]
 

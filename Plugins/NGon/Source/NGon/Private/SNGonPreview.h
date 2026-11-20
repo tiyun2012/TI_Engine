@@ -12,6 +12,8 @@ struct FNGonMeshData;
 class UMaterialInterface;
 class SVerticalBox;
 class STiPaintEditor;
+class FNGonUndoSession;
+class SNGonUndoTreePanel;
 
 enum class ENGonViewportShading : uint8
 {
@@ -28,6 +30,11 @@ public:
 
     void Construct(const FArguments& InArgs);
     void SetSelectionMode(ENGonElement Element);
+    void ToggleSelectionFlag(ENGonSelectionMask Flag);
+    void SetSelectionMask(ENGonSelectionMask Mask);
+    ENGonSelectionMask GetSelectionMask() const { return SelectionMask; }
+    bool IsSelectionFlagEnabled(ENGonSelectionMask Flag) const { return EnumHasAnyFlags(SelectionMask, Flag); }
+    bool IsSelectionFrozen() const { return SelectionMask == ENGonSelectionMask::None; }
     void SetGizmoMode(ENGonGizmoMode Mode);
     void SetShadingMode(ENGonViewportShading Mode);
     ENGonGizmoMode GetGizmoMode() const;
@@ -43,7 +50,12 @@ public:
     void FocusViewport();
     bool DeleteSelectedFaces();
     void SetPaintTexture(const TArray<FColor>& Pixels, int32 Width, int32 Height) { PreviewScene->SetPaintTexture(Pixels, Width, Height); }
-    int32 Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd);
+    void SetPaint3DMode(bool bEnabled);
+    bool IsPaint3DMode() const { return bPaint3DMode; }
+    void SetPaint3DCallbacks(TFunction<void(const FNGonSurfaceHit&, bool)> InOnPoint, TFunction<void()> InOnEnd);
+    void DispatchPaint3DPoint(const FNGonSurfaceHit& Hit, bool bFirstPoint);
+    void DispatchPaint3DEnd();
+    int32 Pick(const FSceneView& View, const FVector2D& Cursor, bool bAdd, ENGonElement* OutPickedElement = nullptr);
     void BoxSelect(const FSceneView& View, const FBox2D& ScreenRect, bool bAdd, bool bFullyContained);
     bool SelectEdgeLoop(int32 StartEdgeId, bool bAdd);
     FNGonPreviewScene& Preview() { return *PreviewScene; }
@@ -56,9 +68,13 @@ protected:
 private:
     TSharedPtr<FNGonPreviewScene> PreviewScene;
     ENGonElement SelectionMode = ENGonElement::Face;
+    ENGonSelectionMask SelectionMask = ENGonSelectionMask::Face;
     ENGonViewportShading ShadingMode = ENGonViewportShading::Faceted;
     bool bHeatmapVisible = false;
     bool bGridVisible = false;
+    bool bPaint3DMode = false;
+    TFunction<void(const FNGonSurfaceHit&, bool)> OnPaint3DPoint;
+    TFunction<void()> OnPaint3DEnd;
 };
 
 enum class ENGonToolShelfTab : uint8
@@ -86,7 +102,8 @@ enum class ENGonRightLowerTab : uint8
     Details,
     AssetDetails,
     PreviewSettings,
-    Painter
+    Painter,
+    History
 };
 
 struct FNGonBoneEntry
@@ -127,10 +144,12 @@ private:
         ENGonViewportShading Shading = ENGonViewportShading::Faceted, TArray<UMaterialInterface*> Materials = {});
     void ShowError(const FText& Error);
     void SetSelectionMode(ENGonElement Element);
+    void ToggleSelectionMode(ENGonElement Element);
     void SetActiveToolTab(ENGonToolShelfTab Tab);
     void ApplySoftSelectionSettings();
     void RebuildSkeletonTreeList();
     void RebuildMorphTargetList();
+    void RebuildMaterialSlotsList();
     FReply SelectVerticesNearSelectedBone();
 
     TSharedRef<SWidget> MakeTopCommandBar();
@@ -148,12 +167,16 @@ private:
     TSharedRef<SWidget> MakeAssetDetailsTab();
     TSharedRef<SWidget> MakePreviewSettingsTab();
     TSharedRef<SWidget> MakePainterTab();
+    TSharedRef<SWidget> MakeHistoryTab();
     TSharedRef<SWidget> MakeStatus();
 
     TSharedPtr<SNGonViewport> Viewport;
     TSharedPtr<SVerticalBox> SkeletonListBox;
     TSharedPtr<SVerticalBox> MorphListBox;
+    TSharedPtr<SVerticalBox> MaterialSlotsListBox;
     TSharedPtr<STiPaintEditor> Painter;
+    TSharedPtr<FNGonUndoSession> UndoSession;
+    TSharedPtr<SNGonUndoTreePanel> UndoTreePanel;
 
     FString StaticMeshAssetPath;
     FString SkeletalMeshAssetPath;
@@ -165,6 +188,7 @@ private:
     TArray<FNGonMorphEntry> MorphTargets;
     FString BoneSearchFilter;
     int32 SelectedBoneIndex = INDEX_NONE;
+    int32 ActiveMaterialSlotIndex = 0;
 
     ENGonElement SelectionMode = ENGonElement::Face;
     ENGonToolShelfTab ActiveToolTab = ENGonToolShelfTab::Model;
@@ -182,6 +206,8 @@ private:
     float SoftRadius = 100.0f;
     ENGonSoftTransformMode SoftMode = ENGonSoftTransformMode::Fixed;
     ENGonSoftMetric SoftMetric = ENGonSoftMetric::EdgeSurface;
+    FVector2f LastPaint3DUV = FVector2f::ZeroVector;
+    bool bHasLastPaint3DUV = false;
     ENGonSoftConnectivity SoftConnectivity = ENGonSoftConnectivity::SameIsland;
     float SoftSurfaceBlend = 0.5f;
 };
